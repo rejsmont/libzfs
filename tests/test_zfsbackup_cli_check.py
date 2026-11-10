@@ -19,6 +19,13 @@ anything else; the database, the pid file and the TLS directory are real.
 - ``TestSignals``       real SIGINT / SIGTERM during the collection.
 - ``TestWorkerOutcomes`` (S-7b) the daemon's worker status files: grading, refused
                         files, formats, `--output`, staleness (``TestWorkerStaleness``).
+- ``TestNagiosCap``     `--nagios` output capped at 4000 bytes: whole perfdata items, CRIT >
+                        WARN > OK stable, `omitted=N`, the exact-fit boundary, bytes not
+                        characters, a clipped status line, exit code, help texts.
+- ``TestRecursiveDescendants`` (A3) the expanded descendants of a recursive dataset end to
+                        end through a section-local fake `zfs`: child anchor entries, no
+                        child snapshot entry, a failed discovery as one WARN `descendants`
+                        entry, the ERROR on stderr only, unreadable anchors/pins as CRIT.
 
 Signal tests run the CLI in a subprocess in its own session and reset SIGINT to
 its Python handler first, so a pytest started from a shell that ignores SIGINT
@@ -31,6 +38,14 @@ certificate warning window 30 -> 3 days 5; `check` not quiet 1; `--output` mode
 factors validated after the ZFS work 3; Prometheus labels not escaped 1; a
 pid-file read error aborting the check 1; an expired certificate graded WARN 3;
 a daemon that is behind graded OK 8; the `--output` exit code back to the verdict (M4) 4.
+Nagios cap and A3 (this file's `TestNagiosCap` + `TestRecursiveDescendants`, 36 tests): limit
+4000 -> 8000 15; `omitted=N` never appended 16; no severity sort 5; OK first 7; alphabetical
+within a state 2; characters instead of bytes 5; `continue` for `break` 1; status line never
+clipped 4; no room reserved for `omitted` 8; item cost without its space 9; all-fit `<=` -> `<`
+1; the newline not budgeted 2; `omitted` off by one 14; no-perfdata line unclipped 1; outcome
+perfdata dropped 1; option help removed 1; A3: descendants not observed 9; failed discovery
+silent 3; child gets a snapshot entry 3; an unreadable anchor read as "none" 1; a failed
+discovery graded OK 3.
 """
 
 import contextlib
@@ -1993,3 +2008,493 @@ class TestWorkerStaleness:
         assert status_view.stale_after(300) == 24 * 3600
         assert status_view.stale_after(24 * 3600) == 4 * 24 * 3600
         assert status_view.stale_after(7 * 3600) == 28 * 3600
+
+
+# --------------------------------------------------------------------------
+# 9. the `--nagios` output cap (4000 bytes for the whole output)
+# --------------------------------------------------------------------------
+
+#: One perfdata item as `render_nagios` writes it: a single-quoted label (a
+#: quote doubled) and `age s;warn;crit;0` (lag) or `count;warn;crit;0` (outcome).
+PERF_ITEM = r"'(?:[^']|'')*'=\d+s?;\d*;\d*;0"
+OMITTED = r"omitted=(\d+)"
+LIMIT = check_view.NAGIOS_OUTPUT_LIMIT
+
+
+def lag(index, state=health.STATE_OK, *, subject=None, reason=None, peer="backup"):
+    """An anchor `LagEntry` for `tank/vm.<index>` with thresholds 7200/14400 s."""
+    return health.LagEntry(
+        "anchor", subject if subject is not None else f"tank/vm.{index:04d}", state,
+        reason if reason is not None else ("late" if state != health.STATE_OK else "fine"),
+        peer=peer, age_seconds=3600.0 + index, expected_seconds=3600.0,
+        warn_seconds=7200.0, crit_seconds=14400.0,
+    )
+
+
+def item_of(entry) -> str:
+    """The perfdata item of a `lag()` entry, written independently of the code under test."""
+    return f"'anchor:{entry.subject}@{entry.peer}'={entry.age_seconds:.0f}s;7200;14400;0"
+
+
+def nbytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def render(entries) -> str:
+    return check_view.render_nagios(health, entries)
+
+
+def split_nagios(out: str):
+    """-> (status line, perfdata items, N of `omitted=N` or None). Asserts the
+    perfdata section is whole items (the grammar) and nothing else."""
+    assert out.endswith("\n") and out.count("\n") == 1, repr(out[-80:])
+    status, sep, perf = out[:-1].partition(" | ")
+    if not sep:
+        return status, [], None
+    tail = re.search(rf"(?:^| ){OMITTED}$", perf)
+    body = perf[:tail.start()] if tail else perf
+    items = re.findall(PERF_ITEM, body)
+    assert " ".join(items) == body, f"not whole items: {body[-120:]!r}"
+    return status, items, int(tail.group(1)) if tail else None
+
+
+class TestNagiosCap:
+    @pytest.mark.parametrize("count", [300, 3000])
+    def test_the_whole_output_stays_within_4000_bytes(self, count):
+        entries = [lag(i) for i in range(count)]
+        out = render(entries)
+        assert LIMIT == 4000
+        assert nbytes(out) <= 4000
+        assert out.count("\n") == 1 and out.endswith("\n")
+        status, items, omitted = split_nagios(out)
+        assert status == f"ZFSBACKUP OK - {count} checks OK"
+        assert omitted == count - len(items) and 0 < len(items) < count
+        # the cap is used, not undershot: the next item would not have fitted
+        assert nbytes(out) + nbytes(item_of(entries[len(items)])) + 1 > 4000 + 10
+
+    @pytest.mark.parametrize("count", [300, 3000])
+    def test_every_state_mix_stays_within_the_cap(self, count):
+        entries = [lag(i, (health.STATE_CRIT, health.STATE_WARN, health.STATE_OK)[i % 3])
+                   for i in range(count)]
+        out = render(entries)
+        assert nbytes(out) <= 4000
+        status, items, omitted = split_nagios(out)
+        assert status.startswith("ZFSBACKUP CRIT - ") and "and " in status
+        assert omitted == count - len(items)
+
+    def test_a_small_set_is_untouched(self):
+        entries = [lag(i) for i in range(5)]
+        out = render(entries)
+        assert out == (
+            "ZFSBACKUP OK - 5 checks OK | " + " ".join(item_of(e) for e in entries) + "\n")
+        assert split_nagios(out)[2] is None
+
+    def test_items_are_whole_and_omitted_is_the_last_token(self):
+        out = render([lag(i) for i in range(500)])
+        status, items, omitted = split_nagios(out)
+        assert out.rstrip("\n").split(" ")[-1] == f"omitted={omitted}"
+        assert items == [item_of(lag(i)) for i in range(len(items))]       # no item cut or reordered
+        assert out.count("omitted=") == 1
+
+    def test_failing_entries_come_first_crit_then_warn_then_ok_stable(self):
+        entries = [lag(i) for i in range(3000)]
+        crit, warn = [2999, 100, 2000], [2500, 7, 1500]
+        for i in crit:
+            entries[i] = lag(i, health.STATE_CRIT)
+        for i in warn:
+            entries[i] = lag(i, health.STATE_WARN)
+        out = render(entries)
+        status, items, omitted = split_nagios(out)
+        # in the entries' own order within a state, the late ones included
+        assert items[:6] == [item_of(lag(i)) for i in (100, 2000, 2999, 7, 1500, 2500)]
+        assert items[6:12] == [item_of(lag(i)) for i in range(6)]          # then OK ones, in order
+        # the status line is the verdict's, in the entries' own order (not re-sorted)
+        assert status.startswith("ZFSBACKUP CRIT - WARN anchor: tank/vm.0007 (backup): late; "
+                                 "CRIT anchor: tank/vm.0100 (backup): late; ")
+        assert status.endswith("; and 3 more")
+        assert omitted == 3000 - len(items)
+
+    def test_the_order_within_a_state_is_the_entries_not_alphabetical(self):
+        names = ["tank/zeta", "tank/alpha", "tank/mid"]
+        entries = [lag(i) for i in range(400)]
+        for name in names:
+            entries.append(lag(0, health.STATE_CRIT, subject=name))
+        _, items, _ = split_nagios(render(entries))
+        assert items[:3] == [item_of(lag(0, subject=n)) for n in names]
+
+    def test_the_loop_stops_at_the_first_item_that_does_not_fit(self):
+        # three short WARN items (the status line names these), then two long
+        # ones, the second too long for what is left; the small OK ones after
+        # them would fit, but items are never taken out of order
+        short = [lag(i, health.STATE_WARN) for i in range(3)]
+        big = [lag(3, health.STATE_WARN, subject="b" * 1800),
+               lag(4, health.STATE_WARN, subject="c" * 2500)]
+        out = render(short + big + [lag(i) for i in range(5, 40)])
+        status, items, omitted = split_nagios(out)
+        assert items == [item_of(e) for e in short + big[:1]]
+        assert omitted == 36 and nbytes(out) <= 4000
+
+    def test_a_late_warn_beats_an_early_ok_when_only_a_few_fit(self):
+        entries = [lag(i) for i in range(3000)] + [lag(3000, health.STATE_WARN)]
+        _, items, omitted = split_nagios(render(entries))
+        assert items[0] == item_of(lag(3000)) and omitted > 0
+
+    def test_mixed_lag_and_outcome_entries(self):
+        outcome = [
+            check_view.OutcomeEntry(
+                "worker_send", f"tank/o{i}", health.STATE_CRIT if i == 120 else health.STATE_OK,
+                "send", peer="offsite", kind="send", consecutive_failures=5 if i == 120 else 0,
+                warn_failures=2.0, crit_failures=4.0)
+            for i in range(150)
+        ]
+        daemon = [health.CheckEntry("daemon", f"d{i}", health.STATE_OK, "fine") for i in range(10)]
+        entries = [lag(i) for i in range(150)] + outcome + daemon       # 300 perfdata items
+        out = render(entries)
+        assert nbytes(out) <= 4000
+        status, items, omitted = split_nagios(out)
+        assert items[0] == "'worker_send:tank/o120@offsite'=5;2;4;0"         # the CRIT outcome first
+        assert items[1] == item_of(lag(0))                                    # then OK ones in order
+        assert omitted == 300 - len(items)                                    # daemon entries have no perfdata
+        assert status.startswith("ZFSBACKUP CRIT - CRIT worker_send: tank/o120 (offsite)")
+
+    def test_an_entry_without_perfdata_never_counts_as_omitted(self):
+        entries = [health.CheckEntry("daemon", f"d{i}", health.STATE_OK, "fine") for i in range(400)]
+        assert render(entries) == "ZFSBACKUP OK - 400 checks OK\n"
+
+    def test_non_ascii_labels_are_counted_in_bytes(self):
+        entries = [lag(i, subject=f"tank/é漢字{i:04d}") for i in range(300)]
+        out = render(entries)
+        assert nbytes(out) <= 4000
+        assert len(out) < nbytes(out) - 300                  # a character count would have admitted more
+        assert nbytes(out) > 4000 - 120                      # ... and the byte budget is nearly used
+        _, items, omitted = split_nagios(out)
+        assert omitted == 300 - len(items)
+        out.encode("utf-8").decode("utf-8")
+
+    @pytest.mark.parametrize("pad", [0, 1, 2, 3])
+    def test_a_huge_status_line_is_clipped_with_omitted_still_present(self, pad):
+        # 3-byte characters at every alignment: the cut lands inside one for some `pad`
+        reason = "a" * pad + "漢" * 5000
+        entries = [lag(0, health.STATE_CRIT, reason=reason)] + [lag(i) for i in range(1, 51)]
+        out = render(entries)
+        assert nbytes(out) <= 4000
+        status, items, omitted = split_nagios(out)
+        assert status.endswith("...") and "�" not in out
+        assert status.startswith("ZFSBACKUP CRIT - CRIT anchor: tank/vm.0000 (backup): ")
+        full = f"ZFSBACKUP CRIT - CRIT anchor: tank/vm.0000 (backup): {reason}"
+        assert full.startswith(status[:-3])                               # a prefix, cut on a character
+        assert omitted == 51 - len(items) and omitted >= 1
+        assert out.rstrip("\n").split(" ")[-1] == f"omitted={omitted}"
+
+    def test_a_huge_status_line_without_perfdata_is_clipped_too(self):
+        entries = [health.CheckEntry("daemon", "process", health.STATE_CRIT, "é" * 9000)]
+        out = render(entries)
+        assert nbytes(out) <= 4000 and out.endswith("...\n") and out.count("\n") == 1
+        assert " | " not in out and "omitted" not in out
+
+    def test_a_long_status_line_that_still_fits_is_not_clipped(self):
+        reason = "x" * 1500
+        entries = [lag(0, health.STATE_CRIT, reason=reason)] + [lag(i) for i in range(1, 300)]
+        out = render(entries)
+        status, items, omitted = split_nagios(out)
+        assert reason in status and "..." not in status
+        assert nbytes(out) <= 4000 and omitted == 300 - len(items)
+
+    def test_the_exact_fit_boundary(self):
+        # Find how many OK items still fit with no `omitted=`, then pad the last
+        # label so the output is exactly 4000 bytes: still whole, nothing omitted.
+        for count in range(1, 200):                # bounded: it must stop well before 200
+            if split_nagios(render([lag(i) for i in range(count + 1)]))[2] is not None:
+                break
+        else:
+            pytest.fail("never reached the cap")
+        entries = [lag(i) for i in range(count)]
+        assert split_nagios(render(entries))[2] is None
+        slack = 4000 - nbytes(render(entries))
+        assert 0 <= slack < 80
+        entries[-1] = lag(count - 1, subject=entries[-1].subject + "p" * slack)
+        out = render(entries)
+        assert nbytes(out) == 4000                                 # the boundary, inclusive
+        status, items, omitted = split_nagios(out)
+        assert omitted is None and len(items) == count
+        # one more byte: the last item no longer fits and is reported, not cut
+        entries[-1] = lag(count - 1, subject=entries[-1].subject + "p")
+        out = render(entries)
+        status, items, omitted = split_nagios(out)
+        assert nbytes(out) <= 4000 and omitted == 1 and len(items) == count - 1
+        assert items == [item_of(lag(i)) for i in range(count - 1)]
+
+    def test_the_status_line_and_state_do_not_depend_on_the_cap(self):
+        entries = [lag(i, health.STATE_CRIT if i % 2 else health.STATE_OK) for i in range(1000)]
+        out = render(entries)
+        first = ("ZFSBACKUP CRIT - CRIT anchor: tank/vm.0001 (backup): late; "
+                 "CRIT anchor: tank/vm.0003 (backup): late; CRIT anchor: tank/vm.0005 (backup): late; "
+                 "and 497 more | ")
+        assert out.startswith(first)
+
+    def test_json_and_prometheus_are_not_capped(self, monkeypatch, healthy):
+        entries = [lag(i) for i in range(300)]
+        monkeypatch.setattr(check_view, "gather", lambda *a, **k: (health, entries))
+        data = json.loads(healthy.check("--json").stdout)
+        assert len(data["entries"]) == 300
+        text = healthy.check("--prometheus").stdout
+        assert nbytes(text) > 4000
+        assert text.count("zfsbackup_anchor_check_state{") == 300
+
+    def test_the_exit_code_is_the_verdict_not_the_cap(self, monkeypatch, healthy):
+        entries = [lag(0, health.STATE_CRIT)] + [lag(i) for i in range(1, 3000)]
+        monkeypatch.setattr(check_view, "gather", lambda *a, **k: (health, entries))
+        result = healthy.check("--nagios")
+        assert result.exit_code == 2
+        assert nbytes(result.stdout) <= 4000 and result.stdout.count("\n") == 1
+        assert result.stdout.startswith("ZFSBACKUP CRIT - CRIT anchor: tank/vm.0000")
+        assert split_nagios(result.stdout)[1][0] == item_of(lag(0))
+        entries[0] = lag(0, health.STATE_WARN)
+        assert healthy.check("--nagios").exit_code == 1
+        entries[0] = lag(0)
+        assert healthy.check("--nagios").exit_code == 0
+
+    def test_the_help_texts_state_the_cap(self, healthy):
+        text = " ".join(healthy.run("check", "--help").stdout.split())
+        assert "The whole output is capped at 4000 bytes (Nagios/NRPE limits)" in text
+        assert "perfdata of failing entries first, then OK ones, then omitted=N for the rest" in text
+        assert "at most 4000 bytes in all" in text
+        assert "the perfdata lists the most severe first and ends with omitted=N" in text
+        assert "--json and --prometheus list every entry" in text
+        doc = " ".join(check_view.render_nagios.__doc__.split())
+        assert "4000" in doc and "omitted=N" in doc
+
+
+# --------------------------------------------------------------------------
+# 10. A3: `check` grades the expanded descendants of a recursive dataset
+# --------------------------------------------------------------------------
+
+#: A fake `zfs` of this section's own (not `_fake_zfs_check.py`): the datasets
+#: of a tree, their snapshots and properties, the name-only recursive listing
+#: and the value-free marker read of the A3 discovery, and the one-property
+#: reads. `fail_names` / `fail_get` make the listing / a property read exit 1.
+RECURSIVE_FAKE = r'''
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKECHECK_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\n")
+with open(os.environ["FAKECHECK_SPEC"]) as handle:
+    spec = json.load(handle)
+tree = spec["datasets"]
+
+
+def flag(name):
+    return args[args.index(name) + 1] if name in args else None
+
+
+if args[:1] == ["list"] and flag("-o") == "name,type":
+    root = args[-1]
+    if "-r" in args and root in spec.get("fail_names", []):
+        sys.stderr.write(f"cannot open '{root}': pool I/O is currently suspended\n")
+        sys.exit(1)
+    for name, kind in tree.items():
+        if name == root or ("-r" in args and name.startswith(root + "/")):
+            print(f"{name}\t{kind}")
+    sys.exit(0)
+if args[:3] == ["get", "-H", "-o"] and flag("-o") == "name,property,source":
+    root, props = args[-1], args[-2].split(",")
+    for name in tree:
+        if name == root or name.startswith(root + "/"):
+            for prop in props:
+                if prop in spec.get("markers", {}).get(name, []):
+                    print(f"{name}\t{prop}\tlocal")
+    sys.exit(0)
+if args[:4] == ["list", "-H", "-t", "snapshot"]:
+    dataset = args[-1]
+    for name, txg in spec["snapshots"].get(dataset, []):
+        print("\t".join([f"{dataset}@{name}", "snapshot", str(txg), str(1000 + txg), "0", "-", "off", "none"]))
+    sys.exit(0)
+if args[:4] == ["get", "-H", "-o", "value"]:
+    prop, dataset = args[-2], args[-1]
+    if dataset in spec.get("fail_get", []) or f"{dataset}::{prop}" in spec.get("fail_get", []):
+        sys.stderr.write(f"cannot open '{dataset}': pool I/O is currently suspended\n")
+        sys.exit(1)
+    print(spec["props"].get(dataset, {}).get(prop, "-"))
+    sys.exit(0)
+sys.stderr.write(f"fake zfs (recursive check): unsupported command {args}\n")
+sys.exit(2)
+'''
+
+RECURSIVE_YAML = """\
+snapshot_prefix: "autosnap"
+check_interval: "5m"
+datasets:
+  - name: "tank/rec"
+    frequency: "1h"
+    recursive: true
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "offsite"
+destinations:
+  offsite:
+    url: "https://offsite:8080"
+"""
+
+CHILDREN = ("tank/rec/a", "tank/rec/b", "tank/rec/b/c")
+
+
+@pytest.fixture
+def rec_world(world, zfs, tmp_path):
+    """A recursive `tank/rec` with the descendants a, b, b/c, every dataset
+    snapshotted 10 minutes ago and anchored on it (all OK), behind a fake
+    `zfs` that has the A3 discovery calls."""
+    script = tmp_path / "recursive-fake-zfs.py"
+    script.write_text(RECURSIVE_FAKE)
+    (tmp_path / "zfs-check").write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(script))} \"$@\"\n")
+    zfs.spec.update(datasets={n: "filesystem" for n in ("tank/rec", *CHILDREN)}, markers={},
+                    fail_names=[], fail_get=[])
+    world.build(RECURSIVE_YAML, snapshot_age=600)
+    zfs.save()
+    world.spec = zfs.spec
+    world.anchor = lambda dataset, name: zfs.prop(dataset, ANCHOR_PROP, name)
+    names = {}
+    for dataset in ("tank/rec", *CHILDREN):
+        names[dataset] = zfs.snapshots(dataset, 600, 600 + 3600)
+        world.anchor(dataset, names[dataset][0])
+    world.names = names
+    return world
+
+
+def rec_entries(world, *flags):
+    return {(e["source"], e["subject"], e.get("peer")): e
+            for e in json.loads(world.check("--json", *flags).stdout)["entries"]}
+
+
+class TestRecursiveDescendants:
+    def test_a_child_has_an_anchor_entry_and_no_snapshot_entry(self, rec_world):
+        result = rec_world.check("--json")
+        assert result.exit_code == 0, (result.stdout, result.stderr)
+        entries = rec_entries(rec_world)
+        for child in CHILDREN:
+            entry = entries[("anchor", child, "offsite")]
+            assert entry["state"] == "OK" and entry["age_seconds"] == pytest.approx(600, abs=30)
+            # a child's expectation is the parent's (1h): thresholds 2h / 4h
+            assert (entry["warn_seconds"], entry["crit_seconds"]) == (7200, 14400)
+            assert ("snapshot", child, None) not in entries     # the parent's covers the `-r` snapshot
+        assert ("snapshot", "tank/rec", None) in entries
+        assert ("anchor", "tank/rec", "offsite") in entries
+        assert not [k for k in entries if k[0] == "descendants"]
+
+    def test_a_stale_child_anchor_is_graded_on_its_own_dataset_and_destination(self, rec_world):
+        # b is 3 h behind (WARN: between 2 h and 4 h), b/c 5 h behind (CRIT)
+        for dataset, hours in (("tank/rec/b", 3), ("tank/rec/b/c", 5)):
+            late = rec_world.zfs.snapshots(dataset, hours * 3600, hours * 3600 + 3600)
+            rec_world.anchor(dataset, late[0])
+        result = rec_world.check("--json")
+        assert result.exit_code == 1
+        entries = rec_entries(rec_world)
+        assert entries[("anchor", "tank/rec/b", "offsite")]["state"] == "WARN"
+        assert entries[("anchor", "tank/rec/b/c", "offsite")]["state"] == "CRIT"
+        assert "5h" in entries[("anchor", "tank/rec/b/c", "offsite")]["reason"]
+        assert entries[("anchor", "tank/rec/a", "offsite")]["state"] == "OK"
+        assert entries[("anchor", "tank/rec", "offsite")]["state"] == "OK"
+        assert json.loads(result.stdout)["state"] == "CRIT"
+
+    def test_prometheus_labels_a_child_by_dataset_and_destination(self, rec_world):
+        late = rec_world.zfs.snapshots("tank/rec/b", 3 * 3600, 4 * 3600)
+        rec_world.anchor("tank/rec/b", late[0])
+        result = rec_world.check("--prometheus")
+        assert result.exit_code == 1
+        parsed = Exposition(result.stdout)
+        for child, state in (("tank/rec/a", 0), ("tank/rec/b", 1), ("tank/rec/b/c", 0)):
+            assert parsed.one("zfsbackup_anchor_check_state", dataset=child, destination="offsite") == state
+        assert parsed.one("zfsbackup_anchor_age_seconds", dataset="tank/rec/b",
+                          destination="offsite") == pytest.approx(3 * 3600, abs=30)
+        assert not [s for s in parsed.samples if s[0] == "zfsbackup_snapshot_check_state"
+                    and s[1].get("dataset", "").startswith("tank/rec/")]
+
+    def test_nagios_carries_a_perfdata_item_per_child(self, rec_world):
+        late = rec_world.zfs.snapshots("tank/rec/b/c", 5 * 3600, 6 * 3600)
+        rec_world.anchor("tank/rec/b/c", late[0])
+        result = rec_world.check("--nagios")
+        assert result.exit_code == 2
+        status, items, omitted = split_nagios(result.stdout)
+        assert status.startswith("ZFSBACKUP CRIT - CRIT anchor: tank/rec/b/c (offsite): ")
+        assert omitted is None
+        labels = [i.split("'=")[0] + "'" for i in items]
+        assert labels[0] == "'anchor:tank/rec/b/c@offsite'"            # the failing one first
+        for child in CHILDREN:
+            assert f"'anchor:{child}@offsite'" in labels
+        assert "'snapshot:tank/rec/a'" not in labels
+
+    def test_a_failed_discovery_is_one_warn_entry_never_silence(self, rec_world):
+        rec_world.spec["fail_names"].append("tank/rec")
+        rec_world.zfs.save()
+        result = rec_world.check("--json")
+        assert result.exit_code == 1
+        entries = rec_entries(rec_world)
+        entry = entries[("descendants", "tank/rec", None)]
+        assert entry["state"] == "WARN"
+        assert "could not be listed" in entry["reason"] and "their copies are not checked" in entry["reason"]
+        assert "pool I/O is currently suspended" in entry["reason"]
+        assert not [k for k in entries if k[1].startswith("tank/rec/")]     # no child is invented
+        # the parent itself is still graded
+        assert entries[("snapshot", "tank/rec", None)]["state"] == "OK"
+        assert entries[("anchor", "tank/rec", "offsite")]["state"] == "OK"
+        assert json.loads(result.stdout)["state"] == "WARN"
+
+    def test_a_failed_discovery_in_the_other_formats(self, rec_world):
+        rec_world.spec["fail_names"].append("tank/rec")
+        rec_world.zfs.save()
+        text = rec_world.check()
+        assert text.exit_code == 1
+        assert re.search(r"^WARN descendants: tank/rec: the descendants of tank/rec could not be listed",
+                         text.stdout, re.M)
+        prom = Exposition(rec_world.check("--prometheus").stdout)
+        assert prom.one("zfsbackup_check_state", source="descendants", subject="tank/rec") == 1
+        nagios = rec_world.check("--nagios")
+        assert nagios.exit_code == 1
+        assert nagios.stdout.startswith(
+            "ZFSBACKUP WARN - WARN descendants: tank/rec: the descendants of tank/rec could not be listed")
+
+    def test_the_discovery_error_goes_to_stderr_and_never_into_machine_output(self, rec_world):
+        rec_world.spec["fail_names"].append("tank/rec")
+        rec_world.zfs.save()
+        for flag in ("--nagios", "--json", "--prometheus"):
+            result = rec_world.check(flag)
+            assert result.exit_code == 1, flag
+            assert "Cannot list the descendants of tank/rec" in result.stderr, (flag, result.stderr)
+            assert "Cannot list the descendants" not in result.stdout
+            assert "ERROR" not in result.stdout and "error" not in result.stdout.split("|")[0].lower()
+        # stdout stays a pure document
+        assert json.loads(rec_world.check("--json").stdout)["schema"] == 1
+        Exposition(rec_world.check("--prometheus").stdout)
+        assert rec_world.check("--nagios").stdout.count("\n") == 1
+
+    @pytest.mark.parametrize("failing", [
+        "tank/rec/a",                                   # every read of the child
+        f"tank/rec/a::{ANCHOR_PROP}",                   # just its anchor
+        "tank/rec/a::org.zfsbackup:inflight.offsite",   # just its send pin
+    ])
+    def test_an_unreadable_child_anchor_is_a_crit_error_not_not_sent_yet(self, rec_world, failing):
+        rec_world.spec["fail_get"].append(failing)
+        rec_world.zfs.save()
+        result = rec_world.check("--json")
+        assert result.exit_code == 1
+        entries = rec_entries(rec_world)
+        entry = entries[("anchor", "tank/rec/a", "offsite")]
+        assert entry["state"] == "CRIT" and entry["reason"].startswith("cannot read: ")
+        assert "the anchor or send pin could not be read" in entry["reason"]
+        assert entries[("anchor", "tank/rec/b", "offsite")]["state"] == "OK"
+        assert entries[("anchor", "tank/rec", "offsite")]["state"] == "OK"
+
+    def test_a_child_carrying_a_copy_marker_is_not_graded(self, rec_world):
+        # a received copy below the parent is not a source: no entry, no send
+        rec_world.spec["markers"] = {"tank/rec/b": ["org.zfsbackup:client_id"]}
+        rec_world.zfs.save()
+        entries = rec_entries(rec_world)
+        assert ("anchor", "tank/rec/a", "offsite") in entries
+        assert not [k for k in entries if k[1] in ("tank/rec/b", "tank/rec/b/c")]
+
+    def test_check_stays_read_only_over_the_recursive_tree(self, rec_world):
+        assert rec_world.check("--json").exit_code == 0
+        verbs = {call[0] for call in rec_world.zfs.calls}
+        assert verbs <= {"list", "get"}
+        assert not any(c[0] == "list" and "-r" in c and "snapshot" in c for c in rec_world.zfs.calls)

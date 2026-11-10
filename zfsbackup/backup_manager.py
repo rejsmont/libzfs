@@ -1254,6 +1254,21 @@ class DatasetManager:
             self._get_own_prop(dsi.dataset, f"{PROP_INFLIGHT_PREFIX}{destination}")
         )
 
+    def get_local_inflight(self, dsi: DatasetInfo, destination: str) -> Optional[Tuple[str, str]]:
+        """`get_own_inflight` that RAISES: the `(from, to)` pair of this
+        dataset's LOCAL `inflight.<destination>`, `None` when unset, inherited,
+        received or malformed, and `LocalAnchorUnreadable` when zfs fails (so
+        "could not read" is never reported as "not pinned"). For health
+        reporting (`health_collect`), where an unreadable value must be an
+        error, not a silent "no pin"."""
+        prop = f"{PROP_INFLIGHT_PREFIX}{destination}"
+        try:
+            value = zfs.get.value(dsi.dataset, prop, sources='local')
+        except Exception as e:
+            logger.debug(f"Failed to read local property {prop} from {dsi.name}: {e!r}")
+            raise LocalAnchorUnreadable(str(e) or repr(e)) from e
+        return _parse_inflight(value)
+
     def set_inflight(
         self, dsi: DatasetInfo, destination: str, from_name: Optional[str], to_name: str
     ) -> bool:

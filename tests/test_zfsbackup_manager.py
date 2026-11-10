@@ -339,6 +339,94 @@ class TestGetLocalAnchor:
         assert manager.get_local_anchor(dsi, 'offsite') is None
 
 
+class TestGetLocalInflight:
+    """`get_local_inflight` (A3): the `(from, to)` pair of this dataset's LOCAL `inflight.<destination>`,
+    the RAISING sibling of `get_own_inflight` (which swallows a failure as "no pin"). `health_collect`
+    reads it, so "the pin could not be read" is never reported as "nothing in flight"."""
+
+    PROP = 'org.zfsbackup:inflight.offsite'
+
+    def manager(self):
+        manager = DatasetManager(_make_config())
+        return manager, manager.datasets[0]
+
+    def test_it_reads_the_destination_property_with_the_local_source(self, mocker):
+        manager, dsi = self.manager()
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='autosnap_1,autosnap_2')
+        assert manager.get_local_inflight(dsi, 'offsite') == ('autosnap_1', 'autosnap_2')
+        value.assert_called_once_with(dsi.dataset, self.PROP, sources='local')
+
+    def test_a_full_send_has_an_empty_from(self, mocker):
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value=',autosnap_2')
+        assert manager.get_local_inflight(dsi, 'offsite') == ('', 'autosnap_2')
+
+    @pytest.mark.parametrize('value', [None, '', '-', 'no-comma-at-all', 'autosnap_1,'])
+    def test_unset_or_malformed_is_none(self, mocker, value):
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value=value)
+        assert manager.get_local_inflight(dsi, 'offsite') is None
+
+    def test_through_the_real_get_an_inherited_or_received_value_is_none(self, mock_subprocess):
+        """With `-s local` zfs prints nothing for a value that is inherited or received."""
+        manager, dsi = self.manager()
+        mock_subprocess.setup(stdout=[])
+        assert manager.get_local_inflight(dsi, 'offsite') is None
+        argv = mock_subprocess.call_args_list[0][0][0][1:]
+        assert argv[0] == 'get' and argv[argv.index('-s') + 1] == 'local'
+        assert argv[-2:] == [self.PROP, 'pool/data']
+
+    def test_through_the_real_get_a_local_value_is_read(self, mock_subprocess):
+        manager, dsi = self.manager()
+        mock_subprocess.setup(stdout=['autosnap_1,autosnap_2\n'])
+        assert manager.get_local_inflight(dsi, 'offsite') == ('autosnap_1', 'autosnap_2')
+
+    def test_a_failed_read_is_unreadable_not_none(self, mocker):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError('pool suspended'))
+        with pytest.raises(LocalAnchorUnreadable, match='pool suspended') as exc:
+            manager.get_local_inflight(dsi, 'offsite')
+        assert str(exc.value) == 'pool suspended'
+        assert isinstance(exc.value.__cause__, RuntimeError)
+
+    def test_a_failure_without_a_message_still_says_something(self, mocker):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError())
+        with pytest.raises(LocalAnchorUnreadable) as exc:
+            manager.get_local_inflight(dsi, 'offsite')
+        assert str(exc.value) != ''
+
+    def test_a_failed_zfs_through_the_real_get_is_unreadable(self, mock_subprocess):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        manager, dsi = self.manager()
+        mock_subprocess.setup(stdout=[], stderr='cannot open pool/data: pool I/O is currently suspended', returncode=1)
+        with pytest.raises(LocalAnchorUnreadable, match='suspended'):
+            manager.get_local_inflight(dsi, 'offsite')
+
+    def test_the_swallowing_reader_is_unchanged(self, mocker):
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError('pool suspended'))
+        assert manager.get_own_inflight(dsi, 'offsite') is None
+
+    def test_it_logs_the_failure_at_debug_only(self, mocker, caplog):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError('pool suspended'))
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            with pytest.raises(LocalAnchorUnreadable):
+                manager.get_local_inflight(dsi, 'offsite')
+        assert [r.levelname for r in caplog.records if self.PROP in r.getMessage()] == ['DEBUG']
+
+    def test_it_makes_no_write(self, mocker):
+        manager, dsi = self.manager()
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='a,b')
+        written = [mocker.patch(f'zfsbackup.backup_manager.zfs.{n}') for n in ('set', 'inherit')]
+        manager.get_local_inflight(dsi, 'offsite')
+        assert not any(w.called for w in written)
+
+
 class TestPropertyHelpers:
     def test_get_prop_returns_value(self, mocker):
         manager = DatasetManager(_make_config())

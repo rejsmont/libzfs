@@ -47,7 +47,8 @@ and never CRIT on its own (a stopped daemon is already the daemon entry's CRIT).
 In the JSON each such entry also carries `kind`, `consecutive_failures`,
 `last_attempt` and `last_success`; the Prometheus form adds
 `zfsbackup_worker_consecutive_failures`; `--nagios` adds a perfdata item per
-record (failures with the two thresholds).
+record (failures with the two thresholds; the whole `--nagios` output is capped,
+see `render_nagios`).
 
 Exit codes:
 
@@ -385,10 +386,61 @@ def _num(value: Optional[float]) -> str:
     return "" if value is None else f"{value:.0f}"
 
 
+#: The whole `--nagios` output (status line, perfdata and the newline) stays
+#: within this many bytes. Nagios Core cuts plugin output at 8 KiB and NRPE's
+#: default packet carries about 4 KiB, so 4000 leaves a margin under 4096 for
+#: the transport. A configuration with recursive datasets easily has hundreds
+#: of entries (~47 bytes of perfdata each), so the perfdata is capped, not the
+#: verdict.
+NAGIOS_OUTPUT_LIMIT = 4000
+
+
+def _nagios_perfdata(entries: List[Any], severity: Callable[[Any], int]) -> List[str]:
+    """One perfdata item per lag entry and per worker-outcome record, the most
+    severe entries first (CRIT, WARN, then OK) and, within a state, in the
+    order of `entries` (a stable sort)."""
+    items: List[Tuple[int, str]] = []
+    for e in entries:
+        if getattr(e, "age_seconds", None) is not None:
+            items.append((
+                severity(e),
+                f"'{_perf_label(e)}'={_num(e.age_seconds)}s;{_num(e.warn_seconds)};{_num(e.crit_seconds)};0",
+            ))
+        if isinstance(e, OutcomeEntry):
+            items.append((
+                severity(e),
+                f"'{_perf_label(e)}'={e.consecutive_failures};{e.warn_failures:g};{e.crit_failures:g};0",
+            ))
+    items.sort(key=lambda item: -item[0])
+    return [text for _, text in items]
+
+
+def _fit_bytes(text: str, limit: int) -> str:
+    """`text` cut at a character boundary to at most `limit` UTF-8 bytes (with
+    an ellipsis when something was cut)."""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    marker = "..."
+    room = max(limit - len(marker), 0)
+    return text.encode("utf-8")[:room].decode("utf-8", "ignore") + marker
+
+
 def render_nagios(health: Any, entries: List[Any]) -> str:
     """One line: `ZFSBACKUP <STATE> - <summary> | <perfdata>`. The summary names
-    the entries that are not OK (or counts them if all are); the perfdata is the
-    age of each lag entry with its warn/crit thresholds."""
+    the first three entries that are not OK, then `and N more` (or counts the
+    entries if all are OK); the perfdata is the age of each lag entry with its
+    warn/crit thresholds, and the failure count of each worker-outcome record.
+
+    The whole output is capped at `NAGIOS_OUTPUT_LIMIT` (4000) bytes, newline
+    included, because Nagios Core truncates plugin output at 8 KiB and NRPE's
+    default is about 4 KiB: a longer perfdata would be cut mid-item and
+    mis-parsed. Perfdata items are taken whole, the most severe first (CRIT,
+    WARN, then OK; in the entries' own order within a state), until the next
+    one would not fit; the rest is reported as one last item `omitted=N`, N
+    being the number of perfdata items left out (absent when none is). The
+    status line and the exit code (from the overall state) are never affected;
+    the status line is clipped only if it alone could not leave room for that
+    item. `--json` and `--prometheus` have no size limit and list every entry."""
     overall = health.overall_state(entries)
     bad = [e for e in entries if e.state != health.STATE_OK]
     if bad:
@@ -397,18 +449,32 @@ def render_nagios(health: Any, entries: List[Any]) -> str:
             shown += f"; and {len(bad) - 3} more"
     else:
         shown = f"{len(entries)} checks OK"
-    perf = [
-        f"'{_perf_label(e)}'={_num(e.age_seconds)}s;{_num(e.warn_seconds)};{_num(e.crit_seconds)};0"
-        for e in entries
-        if getattr(e, "age_seconds", None) is not None
-    ]
-    perf.extend(
-        f"'{_perf_label(e)}'={e.consecutive_failures};{e.warn_failures:g};{e.crit_failures:g};0"
-        for e in entries
-        if isinstance(e, OutcomeEntry)
-    )
+    perf = _nagios_perfdata(
+        entries, lambda e: health.STATE_VALUES.get(e.state, 2))
     line = f"{_NAGIOS_NAME} {overall} - {shown}"
-    return line + (" | " + " ".join(perf) if perf else "") + "\n"
+    if not perf:
+        return _fit_bytes(line, NAGIOS_OUTPUT_LIMIT - 1) + "\n"
+
+    def size(text: str) -> int:
+        return len(text.encode("utf-8"))
+
+    separator = " | "
+    budget = NAGIOS_OUTPUT_LIMIT - 1                     # the trailing newline
+    if size(line) + size(separator) + sum(size(p) + 1 for p in perf) - 1 <= budget:
+        return line + separator + " ".join(perf) + "\n"
+    # Not everything fits: always leave room for the `omitted=N` item.
+    reserve = size(f" omitted={len(perf)}")
+    line = _fit_bytes(line, budget - size(separator) - reserve + 1)
+    used = size(line) + size(separator) + reserve - 1    # line, " | " and `omitted=N`
+    kept: List[str] = []
+    for item in perf:
+        cost = size(item) + 1                            # the item and the space after it
+        if used + cost > budget:
+            break
+        kept.append(item)
+        used += cost
+    kept.append(f"omitted={len(perf) - len(kept)}")
+    return line + separator + " ".join(kept) + "\n"
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -506,7 +572,9 @@ def register(
             "Read-only: it runs only `zfs list`/`zfs get`, takes no lock "
             "and never signals the daemon.\n\n"
             "Output: text by default; --json; --prometheus (text exposition format); "
-            "--nagios (one plugin line). --output FILE writes that output to FILE "
+            "--nagios (one plugin line, at most 4000 bytes in all: with many entries the "
+            "perfdata lists the most severe first and ends with omitted=N; the verdict and the "
+            "exit code are unaffected; --json and --prometheus list every entry). --output FILE writes that output to FILE "
             "atomically instead of stdout (for node_exporter's textfile collector).\n\n"
             "Exit 0 healthy, 1 any WARN or CRIT, 78 the config database is unusable. "
             "With --output FILE: 0 whenever the file was written, whatever the verdict "
@@ -519,7 +587,9 @@ def register(
     @click.option("--prometheus", "as_prometheus", is_flag=True, default=False,
                   help="Prometheus text exposition format.")
     @click.option("--nagios", "as_nagios", is_flag=True, default=False,
-                  help="One Nagios-plugin line with perfdata; exit 0/1/2/3 (OK/WARN/CRIT/UNKNOWN).")
+                  help="One Nagios-plugin line with perfdata; exit 0/1/2/3 (OK/WARN/CRIT/UNKNOWN). "
+                       "The whole output is capped at 4000 bytes (Nagios/NRPE limits): perfdata of "
+                       "failing entries first, then OK ones, then omitted=N for the rest.")
     @click.option("--output", "-o", "output", default=None, metavar="FILE",
                   help="Write the output to FILE (atomically) instead of stdout.")
     @click.option("--warn-factor", type=float, default=2.0, show_default=True, metavar="N",

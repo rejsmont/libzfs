@@ -58,7 +58,7 @@ from zfsbackup.config import (
     Duration,
     RemoteDatasetConfig,
 )
-from zfsbackup.health import STATE_OK, evaluate
+from zfsbackup.health import STATE_CRIT, STATE_OK, STATE_WARN, evaluate
 from zfsbackup.health_collect import collect
 from _remote_support import snapshot_presence  # noqa: F401  (fixture)
 from test_zfsbackup_chain import DEST as CHAIN_DEST, DS as CHAIN_DS, S1, S2, S3, Rig as ChainRig, listing, sinfo
@@ -577,7 +577,8 @@ class TestA1MatrixDueCheck:
 
 @pytest.mark.unit
 class TestA1MatrixHealth:
-    """`health_collect._observe_local` reads `get_own_anchor` and `get_own_inflight`."""
+    """`health_collect._observe_local` reads the anchor and the pin as LOCAL values (`-s local`) of the
+    dataset itself; since A3 through the RAISING `get_local_anchor` / `get_local_inflight`."""
 
     @staticmethod
     def child_anchor(observations):
@@ -589,8 +590,17 @@ class TestA1MatrixHealth:
         old, new = two_snapshot_pair(zfs_world)
         give(zfs_world, source, ANCHOR, new)
         obs = self.child_anchor(collect(config(dataset(PARENT, recursive=True), dataset(CHILD))))
-        assert obs.error is None
         now = datetime.now(timezone.utc).timestamp()
+        if source == 'unreadable':
+            # A3: the raising read. "could not be read" is an error observation (CRIT "cannot read"),
+            # not "never sent" (the child shows no anchor, and no WARN "not yet sent" either)
+            assert obs.newest_ts is None
+            assert obs.error and 'the anchor or send pin could not be read' in obs.error
+            assert 'pool I/O is currently suspended' in obs.error
+            (entry,) = evaluate([obs], now)
+            assert entry.state == STATE_CRIT and entry.reason.startswith('cannot read: ')
+            return
+        assert obs.error is None
         if source == 'local':
             assert obs.newest_ts is not None and obs.detail == new
             (entry,) = evaluate([obs], now)
@@ -607,6 +617,8 @@ class TestA1MatrixHealth:
         obs = self.child_anchor(collect(config(dataset(PARENT, recursive=True), dataset(CHILD))))
         note = f'send in flight: {old} -> {new}'
         assert (note in (obs.detail or '')) == (source == 'local')
+        if source == 'unreadable':
+            assert obs.error and 'could not be read' in obs.error      # A3: not "no pin"
 
     def test_every_read_of_the_childs_own_values_is_local(self, zfs_world):
         old, new = two_snapshot_pair(zfs_world)
@@ -2513,3 +2525,130 @@ class TestA2PerChildSendMode:
 
         sender = Sender(cfg, manager, client_id='client1')
         assert sender.backup_dataset(child, child.config.remote[0]) is True
+
+
+# ---------------------------------------------------------------------------------------------
+# A3: `health_collect` observes the descendants (the inheriting fake: fast, real `zfs get` inheritance)
+# ---------------------------------------------------------------------------------------------
+
+SECOND = 'second'
+ANCHOR2 = f'{PROP_ANCHOR_PREFIX}{SECOND}'
+
+
+def two_destination_parent(name=PARENT, frequency='1h'):
+    return DatasetConfig(
+        name=name, frequency=Duration(frequency), recursive=True,
+        remote=[RemoteDatasetConfig(destination=DEST), RemoteDatasetConfig(destination=SECOND, frequency=Duration('6h'))],
+    )
+
+
+@pytest.mark.unit
+class TestA3Health:
+    """The descendants as `collect` sees them: one anchor observation per child and destination (the
+    PARENT's interval, no snapshot observation), a failed discovery one WARN `descendants` entry, an
+    unreadable anchor or pin an error observation for that destination only."""
+
+    NOW = lambda self: datetime.now(timezone.utc).timestamp()   # noqa: E731
+
+    @staticmethod
+    def of(observations, subject, source='anchor'):
+        return [o for o in observations if getattr(o, 'source', None) == source and o.subject == subject]
+
+    def test_the_child_anchor_is_the_childs_own_local_value_never_the_parents(self, zfs_world):
+        old, new = two_snapshot_pair(zfs_world)
+        zfs_world.set_prop(PARENT, ANCHOR, new)                 # the child inherits it
+        observations = collect(config(dataset(PARENT, recursive=True)))
+        (child,) = self.of(observations, CHILD)
+        assert child.newest_ts is None and child.error is None and child.detail is None
+        (entry,) = evaluate([child], self.NOW())
+        assert entry.state == STATE_WARN and entry.reason == 'not yet sent'
+        zfs_world.set_prop(CHILD, ANCHOR, new)
+        (child,) = self.of(collect(config(dataset(PARENT, recursive=True))), CHILD)
+        assert child.detail == new
+        assert evaluate([child], self.NOW())[0].state == STATE_OK
+
+    def test_a_child_has_anchor_observations_only_and_the_parents_interval(self, zfs_world):
+        two_snapshot_pair(zfs_world)
+        observations = collect(config(two_destination_parent()))
+        assert self.of(observations, CHILD, 'snapshot') == []
+        first, second = self.of(observations, CHILD)
+        assert (first.peer, second.peer) == (DEST, SECOND)
+        assert (first.expected_seconds, second.expected_seconds) == (3600, 6 * 3600)
+        parent = self.of(observations, PARENT)
+        assert [o.expected_seconds for o in parent] == [first.expected_seconds, second.expected_seconds]
+        assert self.of(observations, PARENT, 'snapshot') != []
+
+    @pytest.mark.parametrize('layout', ['local', 'received', 'inherited-from-above', 'local-source-dataset'])
+    def test_a_backup_copy_is_never_a_child(self, zfs_world, layout):
+        add_tree(zfs_world, 'pool', PARENT, CHILD, f'{PARENT}/copy', f'{PARENT}/copy/sub')
+        marker = 'org.zfsbackup:client_id'
+        if layout == 'local':
+            zfs_world.set_prop(f'{PARENT}/copy', marker, 'c')
+        elif layout == 'received':
+            zfs_world.received[(f'{PARENT}/copy', marker)] = 'c'
+        elif layout == 'local-source-dataset':
+            zfs_world.set_prop(f'{PARENT}/copy', 'org.zfsbackup:source_dataset', 'c')
+        else:
+            zfs_world.set_prop('pool', marker, 'c')
+        subjects = [o.subject for o in collect(config(dataset(PARENT, recursive=True)))
+                    if getattr(o, 'source', None) == 'anchor' and o.subject != PARENT]
+        assert subjects == ([] if layout == 'inherited-from-above' else [CHILD])
+
+    def test_a_failed_discovery_is_one_warn_entry_and_everything_else_is_still_observed(self, zfs_world):
+        two_snapshot_pair(zfs_world)
+        zfs_world.add('pool/plain', snaps=[stamp(timedelta(minutes=5))])
+        zfs_world.list_failures[PARENT] = 'cannot open: pool I/O is currently suspended'
+        cfg = config(dataset(PARENT, recursive=True), dataset('pool/plain'))
+        collected = collect(cfg)
+        (entry,) = [o for o in collected if not hasattr(o, 'expected_seconds')]
+        assert (entry.source, entry.subject, entry.state) == ('descendants', PARENT, STATE_WARN)
+        assert 'pool I/O is currently suspended' in entry.reason and 'their copies are not checked' in entry.reason
+        assert self.of(collected, 'pool/plain', 'snapshot') and self.of(collected, PARENT, 'snapshot')
+        assert self.of(collected, CHILD) == []
+        out = evaluate(collected, self.NOW())
+        assert [e.state for e in out if e.source == 'descendants'] == [STATE_WARN]
+
+    def test_the_entry_goes_when_the_listing_works_again(self, zfs_world):
+        two_snapshot_pair(zfs_world)
+        zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
+        cfg = config(dataset(PARENT, recursive=True))
+        assert [o.source for o in collect(cfg) if not hasattr(o, 'expected_seconds')] == ['descendants']
+        del zfs_world.list_failures[PARENT]
+        assert [o.source for o in collect(cfg) if not hasattr(o, 'expected_seconds')] == []
+        assert self.of(collect(cfg), CHILD) != []
+
+    def test_a_childs_failed_snapshot_listing_leaves_anchor_error_observations_only(self, zfs_world):
+        two_snapshot_pair(zfs_world)
+        zfs_world.snapshot_list_failures.add(CHILD)
+        collected = collect(config(two_destination_parent()))
+        assert self.of(collected, CHILD, 'snapshot') == []
+        errors = self.of(collected, CHILD)
+        assert [o.peer for o in errors] == [DEST, SECOND]
+        assert all(o.error and 'pool I/O is currently suspended' in o.error for o in errors)
+        assert [e.state for e in evaluate(errors, self.NOW())] == [STATE_CRIT, STATE_CRIT]
+        assert not self.of(collected, PARENT)[0].error
+
+    @pytest.mark.parametrize('prop', [ANCHOR, PIN])
+    def test_an_unreadable_anchor_or_pin_is_an_error_for_that_destination_only(self, zfs_world, prop):
+        old, new = two_snapshot_pair(zfs_world)
+        zfs_world.set_prop(CHILD, ANCHOR2, new)
+        zfs_world.unreadable.add((CHILD, prop))
+        collected = collect(config(two_destination_parent()))
+        first, second = self.of(collected, CHILD)
+        assert first.peer == DEST and first.error and 'could not be read' in first.error
+        assert second.error is None and second.detail == new
+        assert [e.state for e in evaluate([first, second], self.NOW())] == [STATE_CRIT, STATE_OK]
+        assert all(o.error is None for o in self.of(collected, PARENT))
+
+    def test_an_unreadable_anchor_of_a_configured_dataset_is_an_error_too(self, zfs_world):
+        old, new = two_snapshot_pair(zfs_world)
+        zfs_world.unreadable.add((PARENT, ANCHOR))
+        collected = collect(config(dataset(PARENT)))
+        (snapshot,) = self.of(collected, PARENT, 'snapshot')
+        (anchor,) = self.of(collected, PARENT)
+        assert snapshot.error is None and anchor.error and anchor.newest_ts is None
+
+    def test_collecting_only_reads(self, zfs_world):
+        two_snapshot_pair(zfs_world)
+        collect(config(two_destination_parent()))
+        assert zfs_world.writes == [] and {c[0] for c in zfs_world.calls} == {'list', 'get'}

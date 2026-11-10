@@ -21,6 +21,14 @@ What is observed, per enabled dataset (a disabled one is skipped):
   `max(dataset frequency, destination frequency, check_interval)`, with a `inflight` pin noted;
   with no anchor, the oldest managed snapshot decides how long that is
   tolerated (`health` module docstring);
+* for each enabled `recursive: true` dataset with destinations, every expanded
+  descendant (`DatasetManager.expand_recursive`; backup copies are never among
+  them) gets the same anchor observation per destination, against the PARENT's
+  expectation (a child's config is the parent's). A descendant has no snapshot
+  observation of its own: the parent's covers the `-r` snapshot. A parent whose
+  descendants cannot be listed is one WARN `descendants` entry, never silence.
+  An anchor or pin that cannot be READ (configured dataset or descendant) is an
+  error observation (CRIT), not "never sent";
 * when `remote_backup` is enabled, each received client dataset's newest snapshot
   against the largest frequency in that client's own config. The target is
   listed first, strictly: a target that cannot be listed or does not exist is a
@@ -39,7 +47,9 @@ from typing import List, Optional, Union
 
 import libzfseasy as zfs
 from libzfseasy.types import Dataset
-from zfsbackup.backup_manager import DatasetInfo, DatasetManager, SnapshotInfo
+from zfsbackup.backup_manager import (
+    DatasetInfo, DatasetManager, LocalAnchorUnreadable, SnapshotInfo,
+)
 from zfsbackup.config import BackupConfig
 from zfsbackup.health import (
     SOURCE_ANCHOR,
@@ -53,11 +63,13 @@ from zfsbackup.health import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['collect']
+__all__ = ['collect', 'SOURCE_DESCENDANTS']
 
 #: Subject and source of the dry-run verdict.
 _CONFIG_SOURCE = 'config'
 _DRY_RUN_SUBJECT = 'dry_run'
+#: Source of the entry for a recursive dataset whose descendants cannot be listed.
+SOURCE_DESCENDANTS = 'descendants'
 
 
 def collect(
@@ -93,6 +105,7 @@ def collect(
         ))
     for dsi in datasets:
         result.extend(_observe_local(manager, dsi, tolerance))
+    result.extend(_observe_descendants(manager, tolerance))
 
     rb = config.remote_backup
     if rb is not None and rb.enabled:
@@ -112,18 +125,30 @@ def _ts(snap: Optional[SnapshotInfo]) -> Optional[float]:
     return snap.timestamp.astimezone(timezone.utc).timestamp()
 
 
+def _error_text(exc: BaseException) -> str:
+    return str(exc) or type(exc).__name__
+
+
 def _observe_local(
     manager: DatasetManager, dsi: DatasetInfo, tolerance: float
 ) -> List[Union[Observation, CheckEntry]]:
+    """The observations of one configured dataset, or of one expanded
+    descendant of a recursive one (`dsi.expanded_from`): the descendant gets
+    ONLY its anchor observations (the parent's snapshot observation covers the
+    `-r` snapshot), but is listed all the same, for the anchor's presence and
+    the oldest managed snapshot (the grace of a copy that was never sent)."""
+    child = dsi.expanded_from is not None
     frequency = _dataset_interval(manager, dsi)
     try:
         snapshots = _list(manager, dsi)
     except Exception as exc:
-        error = str(exc) or type(exc).__name__
-        out: List[Union[Observation, CheckEntry]] = [Observation(
-            source=SOURCE_SNAPSHOT, subject=dsi.name, expected_seconds=frequency,
-            tolerance_seconds=tolerance, error=error,
-        )]
+        error = _error_text(exc)
+        out: List[Union[Observation, CheckEntry]] = []
+        if not child:
+            out.append(Observation(
+                source=SOURCE_SNAPSHOT, subject=dsi.name, expected_seconds=frequency,
+                tolerance_seconds=tolerance, error=error,
+            ))
         for remote in dsi.config.remote:
             out.append(Observation(
                 source=SOURCE_ANCHOR, subject=dsi.name, peer=remote.destination,
@@ -134,20 +159,33 @@ def _observe_local(
 
     newest = snapshots[0] if snapshots else None
     oldest = snapshots[-1] if snapshots else None
-    out = [Observation(
-        source=SOURCE_SNAPSHOT, subject=dsi.name, expected_seconds=frequency,
-        newest_ts=_ts(newest), oldest_ts=_ts(oldest), tolerance_seconds=tolerance,
-        detail=newest.name if newest is not None else None,
-    )]
+    out = []
+    if not child:
+        out.append(Observation(
+            source=SOURCE_SNAPSHOT, subject=dsi.name, expected_seconds=frequency,
+            newest_ts=_ts(newest), oldest_ts=_ts(oldest), tolerance_seconds=tolerance,
+            detail=newest.name if newest is not None else None,
+        ))
 
     for remote in dsi.config.remote:
         destination = remote.destination
-        anchor_name = manager.get_own_anchor(dsi, destination)
+        expected = _remote_expected(manager, dsi, remote)
+        # The RAISING reads: an unreadable anchor or pin is an error, never
+        # "not sent yet" (the swallowing `get_own_*` read as "no history").
+        try:
+            anchor_name = manager.get_local_anchor(dsi, destination)
+            pin = manager.get_local_inflight(dsi, destination)
+        except LocalAnchorUnreadable as exc:
+            out.append(Observation(
+                source=SOURCE_ANCHOR, subject=dsi.name, peer=destination,
+                expected_seconds=expected, tolerance_seconds=tolerance,
+                error=f'the anchor or send pin could not be read: {_error_text(exc)}',
+            ))
+            continue
         anchor = next((s for s in snapshots if s.name == anchor_name), None) if anchor_name else None
         notes = []
         if anchor_name and anchor is None:
             notes.append(f'anchor {anchor_name} is not among the local managed snapshots')
-        pin = manager.get_own_inflight(dsi, destination)
         if pin is not None:
             src, dst = pin
             notes.append(f'send in flight: {src or "(full)"} -> {dst}')
@@ -155,9 +193,38 @@ def _observe_local(
             notes.insert(0, anchor.name)
         out.append(Observation(
             source=SOURCE_ANCHOR, subject=dsi.name, peer=destination,
-            expected_seconds=_remote_expected(manager, dsi, remote),
+            expected_seconds=expected,
             newest_ts=_ts(anchor), oldest_ts=_ts(oldest), tolerance_seconds=tolerance,
             detail='; '.join(notes) if notes else None,
+        ))
+    return out
+
+
+def _observe_descendants(
+    manager: DatasetManager, tolerance: float
+) -> List[Union[Observation, CheckEntry]]:
+    """The expanded descendants of the recursive datasets
+    (`DatasetManager.expand_recursive`: name-only listing, untimed like every
+    source-side read, no daemon needed): one anchor observation per child and
+    destination. A parent whose discovery failed gets one WARN entry: its
+    children are unknown, which is not the same as healthy. Backup copies are
+    never among the children (`expand_recursive` refuses them)."""
+    try:
+        expansion = manager.expand_recursive()
+    except Exception as exc:  # it never raises; belt and braces
+        logger.debug('cannot expand the recursive datasets: %r', exc)
+        return [CheckEntry(
+            source=SOURCE_DESCENDANTS, subject='(recursive datasets)', state=STATE_WARN,
+            reason=f'the descendants of the recursive datasets could not be listed: {_error_text(exc)}',
+        )]
+    out: List[Union[Observation, CheckEntry]] = []
+    for child in expansion.children:
+        out.extend(_observe_local(manager, child, tolerance))
+    for parent, why in expansion.failed.items():
+        out.append(CheckEntry(
+            source=SOURCE_DESCENDANTS, subject=parent, state=STATE_WARN,
+            reason=f'the descendants of {parent} could not be listed: {why}; '
+                   f'their copies are not checked',
         ))
     return out
 

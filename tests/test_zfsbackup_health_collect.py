@@ -5,7 +5,10 @@ argv the collector causes (`zfs list ...`, `zfs get ...`) and can prove that not
 """
 
 import io
+import json
 import os
+import shlex
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,8 +18,10 @@ from zfsbackup.backup_manager import (
     PROP_ANCHOR_PREFIX, PROP_CLIENT_ID, PROP_CONFIG, PROP_INFLIGHT_PREFIX,
     SNAPSHOT_LIST_PROPERTIES, DatasetManager,
 )
+from pathlib import Path
+
 from zfsbackup.config import (
-    BackupConfig, DatasetConfig, Duration, RemoteDatasetConfig, RemoteServerConfig,
+    BackupConfig, DatasetConfig, Destination, Duration, RemoteDatasetConfig, RemoteServerConfig,
 )
 from zfsbackup.health import (
     CheckEntry, Observation, STATE_CRIT, STATE_OK, STATE_WARN, evaluate, overall_state,
@@ -88,6 +93,7 @@ class FakeZfsWorld:
         self.volumes = []
         self.list_fails = set()
         self.get_fails = set()
+        self.get_prop_fails = set()       # (dataset, property) pairs whose value read fails
         self.empty_targets = set()
         self.missing_targets = set()
         self.target_list_fails = set()
@@ -153,7 +159,7 @@ class FakeZfsWorld:
         if rest[rest.index('-o') + 1] != 'value':
             return self._get_rows(rest)
         prop, name = rest[-2], rest[-1]
-        if name in self.get_fails:
+        if name in self.get_fails or (name, prop) in self.get_prop_fails:
             return _Proc(b'', f"cannot open '{name}': dataset does not exist\n".encode(), 1)
         value = self.props.get((name, prop))
         return _Proc(f"{'-' if value is None else value}\n".encode(), b'', 0)
@@ -483,11 +489,16 @@ class TestAnchors:
         anchor = graded(config(ds('pool/data', '1h', remote())), world)[1]
         assert anchor.state == STATE_CRIT and 'clock behind' in anchor.reason
 
-    def test_a_property_read_failure_reads_as_no_anchor(self, world):
+    def test_a_property_read_failure_is_an_error_not_no_anchor(self, world):
+        """A3 (A1 review L2): an unreadable anchor is "cannot read", never "not yet sent"."""
         world.snaps['pool/data'] = [at(600)]
         world.get_fails.add('pool/data')
         _, anchor = collect(config(ds('pool/data', '1h', remote())))
-        assert anchor.newest_ts is None and anchor.error is None
+        assert anchor.newest_ts is None
+        assert anchor.error and 'the anchor or send pin could not be read' in anchor.error
+        assert 'dataset does not exist' in anchor.error
+        _, entry = graded(config(ds('pool/data', '1h', remote())), world)
+        assert entry.state == STATE_CRIT and entry.reason.startswith('cannot read: ')
 
     def test_a_dataset_without_remotes_has_no_anchor_observations(self, world):
         world.snaps['pool/data'] = [at(600)]
@@ -976,3 +987,526 @@ class TestReadOnly:
         entries = graded(self.busy_server(world), world)
         assert '"schema": 1' in health.to_json(entries, NOW)
         assert 'zfsbackup_check_success' in health.to_prometheus(entries, NOW)
+
+
+# ---------------------------------------------------------------------------------------------
+# A3: the descendants of recursive datasets, over the read-only check fake (`_fake_zfs_check.py`)
+# ---------------------------------------------------------------------------------------------
+
+FAKE_CHECK_ZFS = Path(__file__).resolve().parent / '_fake_zfs_check.py'
+ANCHOR_A = PROP_ANCHOR_PREFIX + 'a'
+ANCHOR_B = PROP_ANCHOR_PREFIX + 'b'
+INFLIGHT_B = PROP_INFLIGHT_PREFIX + 'b'
+RECURSIVE = 'pool/data'
+
+
+class CheckFake:
+    """The JSON-spec fake `zfs` of `_fake_zfs_check.py` as a real executable behind `ZFS_CMD` (read at
+    call time by libzfseasy). It answers the listings and reads `collect` makes, exits 2 on anything
+    else, and logs every argv, so a test can prove what was (not) asked."""
+
+    def __init__(self, directory: Path, monkeypatch):
+        self.spec_path = directory / 'check-spec.json'
+        self.log_path = directory / 'check-log.jsonl'
+        self.spec = {'snapshots': {}, 'props': {}, 'fail': [], 'datasets': {}, 'markers': {},
+                     'fail_names': [], 'fail_markers': [], 'fail_get': []}
+        self.log_path.write_text('')
+        wrapper = directory / 'zfs-check'
+        wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(FAKE_CHECK_ZFS))} "$@"\n')
+        wrapper.chmod(0o755)
+        self.save()
+        for key, value in {'ZFS_CMD': wrapper, 'ZPOOL_CMD': wrapper, 'FAKECHECK_SPEC': self.spec_path,
+                           'FAKECHECK_LOG': self.log_path}.items():
+            monkeypatch.setenv(key, str(value))
+
+    def save(self):
+        self.spec_path.write_text(json.dumps(self.spec))
+
+    def tree(self, *names, snapshots=True):
+        """`names` exist as filesystems (listed in this order, a parent before its children); each
+        with one managed snapshot 30 minutes old unless `snapshots=False`."""
+        for name in names:
+            self.spec['datasets'][name] = 'filesystem'
+            if snapshots:
+                self.snaps(name, 1800)
+        self.save()
+
+    def snaps(self, dataset, *ages):
+        """Managed snapshots `ages` seconds old; the youngest gets the highest `createtxg`."""
+        ordered = sorted(ages, reverse=True)
+        self.spec['snapshots'][dataset] = [[at(a), 100 + i] for i, a in enumerate(ordered)]
+        self.save()
+        return [at(a) for a in ordered]
+
+    def prop(self, dataset, key, value):
+        self.spec['props'].setdefault(dataset, {})[key] = value
+        self.save()
+
+    def marker(self, dataset, key=PROP_CLIENT_ID, source='local'):
+        self.spec['markers'].setdefault(dataset, {})[key] = source
+        self.save()
+
+    def fail(self, kind, *entries):
+        self.spec[kind].extend(entries)
+        self.save()
+
+    @property
+    def calls(self):
+        return [json.loads(line) for line in self.log_path.read_text().splitlines()]
+
+    def calls_of(self, sub):
+        return [c for c in self.calls if c[0] == sub]
+
+
+@pytest.fixture
+def check_zfs(tmp_path, monkeypatch):
+    return CheckFake(tmp_path, monkeypatch)
+
+
+def parent_ds(name=RECURSIVE, frequency='1h', *remotes, **kw):
+    return ds(name, frequency, *(remotes or (remote('a'), remote('b', '6h'))), recursive=True, **kw)
+
+
+def keys(items):
+    return [(o.source, o.subject, getattr(o, 'peer', None)) for o in items]
+
+
+@pytest.mark.subprocess
+class TestDescendantObservations:
+    def test_one_anchor_observation_per_child_and_destination_and_no_snapshot_observation(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x', f'{RECURSIVE}/x/y', f'{RECURSIVE}/z')
+        result = collect(config(parent_ds()))
+        assert keys(result) == [
+            ('snapshot', RECURSIVE, None), ('anchor', RECURSIVE, 'a'), ('anchor', RECURSIVE, 'b'),
+            ('anchor', f'{RECURSIVE}/x', 'a'), ('anchor', f'{RECURSIVE}/x', 'b'),
+            ('anchor', f'{RECURSIVE}/x/y', 'a'), ('anchor', f'{RECURSIVE}/x/y', 'b'),
+            ('anchor', f'{RECURSIVE}/z', 'a'), ('anchor', f'{RECURSIVE}/z', 'b'),
+        ]
+        assert all(isinstance(o, Observation) for o in result)
+
+    def test_the_observation_carries_the_parents_interval_and_the_childs_own_snapshot_times(self, check_zfs):
+        child = f'{RECURSIVE}/x'
+        check_zfs.tree(RECURSIVE)
+        check_zfs.tree(child, snapshots=False)
+        old, mid, new = check_zfs.snaps(child, 3 * HOUR, 2 * HOUR, HOUR)
+        check_zfs.prop(child, ANCHOR_A, mid)
+        # the parent: 1d, destination a: 2d, destination b: inherits 1d
+        result = collect(config(parent_ds(RECURSIVE, '1d', remote('a', '2d'), remote('b'))))
+        a, b = [o for o in result if o.subject == child]
+        assert (a.source, a.subject, a.peer) == ('anchor', child, 'a')
+        assert a.expected_seconds == 2 * DAY and b.expected_seconds == DAY
+        assert a.newest_ts == epoch_of(mid) and a.oldest_ts == epoch_of(old)
+        assert a.detail == mid and a.error is None
+        assert a.tolerance_seconds == 300
+        assert b.newest_ts is None and b.oldest_ts == epoch_of(old) and b.detail is None
+
+    def test_the_interval_is_floored_at_the_check_interval_like_the_parents(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        result = collect(config(parent_ds(RECURSIVE, '1m', remote('a')), check_interval=timedelta(minutes=20)))
+        parent, child = [o for o in result if o.source == 'anchor']
+        assert child.expected_seconds == parent.expected_seconds == 1200
+        assert child.tolerance_seconds == 1200
+
+    def test_a_child_has_no_snapshot_observation_of_its_own(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        result = collect(config(parent_ds()))
+        assert not [o for o in result if o.source == 'snapshot' and o.subject != RECURSIVE]
+        assert not by_source(graded(config(parent_ds()), check_zfs), 'received')
+
+    def test_children_follow_the_configured_datasets_in_config_order(self, check_zfs):
+        check_zfs.tree('pool/one', 'pool/one/c1', 'pool/plain', 'pool/two', 'pool/two/c2')
+        cfg = config(parent_ds('pool/one', '1h', remote('a')), ds('pool/plain'),
+                     parent_ds('pool/two', '1h', remote('a')))
+        assert keys(collect(cfg)) == [
+            ('snapshot', 'pool/one', None), ('anchor', 'pool/one', 'a'),
+            ('snapshot', 'pool/plain', None),
+            ('snapshot', 'pool/two', None), ('anchor', 'pool/two', 'a'),
+            ('anchor', 'pool/one/c1', 'a'), ('anchor', 'pool/two/c2', 'a'),
+        ]
+
+    def test_a_child_configured_explicitly_is_observed_once_by_its_own_entry(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x', f'{RECURSIVE}/y')
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('a')), ds(f'{RECURSIVE}/x', '2h', remote('a')))
+        result = collect(cfg)
+        assert keys(result).count(('anchor', f'{RECURSIVE}/x', 'a')) == 1
+        assert keys(result).count(('snapshot', f'{RECURSIVE}/x', None)) == 1
+        (own,) = [o for o in result if o.subject == f'{RECURSIVE}/x' and o.source == 'anchor']
+        assert own.expected_seconds == 2 * HOUR                 # its own configuration, not the parent's
+        (expanded,) = [o for o in result if o.subject == f'{RECURSIVE}/y']
+        assert expanded.expected_seconds == HOUR
+
+    def test_a_recursive_dataset_without_children_adds_nothing(self, check_zfs):
+        check_zfs.tree(RECURSIVE)
+        assert keys(collect(config(parent_ds()))) == [
+            ('snapshot', RECURSIVE, None), ('anchor', RECURSIVE, 'a'), ('anchor', RECURSIVE, 'b')]
+
+    @pytest.mark.parametrize('kw', [{'enabled': False}, {'remote': []}], ids=['disabled', 'no-remote'])
+    def test_a_recursive_dataset_that_sends_nothing_costs_no_expansion(self, check_zfs, kw):
+        import dataclasses
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        collect(config(dataclasses.replace(parent_ds(), **kw)))
+        assert not [c for c in check_zfs.calls_of('list') if '-r' in c and 'snapshot' not in c]
+        assert not check_zfs.calls_of('get') or kw == {'remote': []}
+
+    def test_a_config_without_recursive_datasets_asks_nothing_extra(self, check_zfs):
+        check_zfs.tree('pool/a')
+        collect(config(ds('pool/a', '1h', remote('a'))))
+        assert not [c for c in check_zfs.calls_of('list') if '-r' in c]
+        assert not [c for c in check_zfs.calls_of('get') if 'name,property,source' in c]
+
+    def test_the_expansion_is_the_read_only_name_listing_and_the_value_free_marker_read(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        collect(config(parent_ds()))
+        (names,) = [c for c in check_zfs.calls_of('list') if '-r' in c]
+        assert names[-1] == RECURSIVE and '-r' in names
+        assert names[names.index('-o') + 1] == 'name,type' and names[names.index('-t') + 1] == 'filesystem,volume'
+        (markers,) = [c for c in check_zfs.calls_of('get') if 'name,property,source' in c]
+        assert markers[markers.index('-s') + 1] == 'local,received,inherited' and '-r' in markers
+        assert markers[-2] == f'{PROP_CLIENT_ID},org.zfsbackup:source_dataset' and markers[-1] == RECURSIVE
+        assert set(c[0] for c in check_zfs.calls) <= {'list', 'get'}
+
+    def test_every_anchor_and_pin_read_is_local_only(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        collect(config(parent_ds()))
+        reads = [c for c in check_zfs.calls_of('get') if c[3] == 'value']
+        assert {c[-2] for c in reads} == {ANCHOR_A, ANCHOR_B, PROP_INFLIGHT_PREFIX + 'a', INFLIGHT_B}
+        assert {c[-1] for c in reads} == {RECURSIVE, f'{RECURSIVE}/x'}
+        assert all(c[4:6] == ['-s', 'local'] for c in reads)
+
+    def test_a_pin_is_noted_on_the_childs_observation(self, check_zfs):
+        child = f'{RECURSIVE}/x'
+        check_zfs.tree(RECURSIVE)
+        check_zfs.tree(child, snapshots=False)
+        old, new = check_zfs.snaps(child, 2 * HOUR, 600)
+        check_zfs.prop(child, ANCHOR_B, old)
+        check_zfs.prop(child, INFLIGHT_B, f'{old},{new}')
+        (b,) = [o for o in collect(config(parent_ds())) if o.subject == child and o.peer == 'b']
+        assert f'send in flight: {old} -> {new}' in b.detail and b.detail.startswith(old)
+
+    def test_the_whole_report_grades_and_serialises(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        entries = graded(config(parent_ds()), check_zfs)
+        assert '"schema": 1' in health.to_json(entries, NOW)
+        assert 'zfsbackup_anchor_check_state' in health.to_prometheus(entries, NOW)
+
+    def test_the_source_name_is_exported(self):
+        assert health_collect.SOURCE_DESCENDANTS == 'descendants'
+        assert 'SOURCE_DESCENDANTS' in health_collect.__all__
+
+
+@pytest.mark.subprocess
+class TestNeverSentChild:
+    def test_warn_while_young_then_crit_once_the_oldest_snapshot_passes_the_threshold(self, check_zfs):
+        child = f'{RECURSIVE}/x'
+        check_zfs.tree(RECURSIVE)
+        check_zfs.tree(child, snapshots=False)
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('a')))
+        check_zfs.snaps(child, 30 * 60, 60)
+        (young,) = [e for e in graded(cfg, check_zfs) if e.subject == child]
+        assert young.state == STATE_WARN and young.reason == 'not yet sent'
+        check_zfs.snaps(child, 4 * HOUR - 1, 60)
+        (almost,) = [e for e in graded(cfg, check_zfs) if e.subject == child]
+        assert almost.state == STATE_WARN
+        check_zfs.snaps(child, 4 * HOUR, 60)
+        (old,) = [e for e in graded(cfg, check_zfs) if e.subject == child]
+        assert old.state == STATE_CRIT and 'not yet sent' in old.reason
+
+    def test_the_grace_is_the_childs_own_oldest_snapshot_not_the_parents(self, check_zfs):
+        child = f'{RECURSIVE}/x'
+        check_zfs.tree(child, snapshots=False)
+        check_zfs.snaps(RECURSIVE, 10 * HOUR, 60)           # an old parent
+        check_zfs.snaps(child, 600)                          # a child that only just appeared
+        entries = graded(config(parent_ds(RECURSIVE, '1h', remote('a'))), check_zfs)
+        (c,) = [e for e in entries if e.subject == child]
+        (p,) = [e for e in entries if e.source == 'anchor' and e.subject == RECURSIVE]
+        assert c.state == STATE_WARN and p.state == STATE_CRIT
+
+    def test_a_child_without_any_managed_snapshot_is_warn(self, check_zfs):
+        child = f'{RECURSIVE}/x'
+        check_zfs.tree(RECURSIVE)
+        check_zfs.tree(child, snapshots=False)
+        (c,) = [e for e in graded(config(parent_ds(RECURSIVE, '1h', remote('a'))), check_zfs) if e.subject == child]
+        assert c.state == STATE_WARN and 'no managed snapshot to send' in c.reason
+
+    def test_a_sent_child_is_ok_and_goes_stale_by_its_anchor(self, check_zfs):
+        child = f'{RECURSIVE}/x'
+        check_zfs.tree(RECURSIVE)
+        check_zfs.tree(child, snapshots=False)
+        old, new = check_zfs.snaps(child, 6 * HOUR, 600)
+        check_zfs.prop(child, ANCHOR_A, new)
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('a')))
+        (ok,) = [e for e in graded(cfg, check_zfs) if e.subject == child]
+        assert ok.state == STATE_OK
+        check_zfs.prop(child, ANCHOR_A, old)
+        (stale,) = [e for e in graded(cfg, check_zfs) if e.subject == child]
+        assert stale.state == STATE_CRIT
+
+    def test_the_parents_own_anchor_is_never_borrowed_by_a_child(self, check_zfs):
+        """The child's anchor is read `-s local`: a parent anchor naming a snapshot the child also
+        holds (the recursive snapshot) says nothing about the child."""
+        child = f'{RECURSIVE}/x'
+        snap = at(600)
+        check_zfs.tree(RECURSIVE, child, snapshots=False)
+        check_zfs.snaps(RECURSIVE, 600)
+        check_zfs.snaps(child, 600)
+        check_zfs.prop(RECURSIVE, ANCHOR_A, snap)
+        entries = graded(config(parent_ds(RECURSIVE, '1h', remote('a'))), check_zfs)
+        (p,) = [e for e in entries if e.source == 'anchor' and e.subject == RECURSIVE]
+        (c,) = [e for e in entries if e.subject == child]
+        assert p.state == STATE_OK and c.state == STATE_WARN
+        assert c.reason == 'not yet sent'
+
+
+@pytest.mark.subprocess
+class TestDescendantDiscoveryFailure:
+    def test_a_failed_listing_is_one_warn_entry_that_survives_evaluate(self, check_zfs):
+        check_zfs.tree('pool/bad', 'pool/bad/c', 'pool/good', 'pool/good/c1', 'pool/plain')
+        check_zfs.fail('fail_names', 'pool/bad')
+        cfg = config(parent_ds('pool/bad', '1h', remote('a')), parent_ds('pool/good', '1h', remote('a')),
+                     ds('pool/plain', '1h', remote('a')))
+        collected = collect(cfg)
+        (entry,) = [o for o in collected if isinstance(o, CheckEntry)]
+        assert (entry.source, entry.subject, entry.state) == ('descendants', 'pool/bad', STATE_WARN)
+        assert entry.reason.startswith('the descendants of pool/bad could not be listed: ')
+        assert 'pool I/O is currently suspended' in entry.reason
+        assert entry.reason.endswith('; their copies are not checked')
+        graded_ = evaluate(collected, NOW)
+        assert [e for e in graded_ if e.source == 'descendants'] == [entry]
+        assert [e for e in graded_ if e is entry][0].state == STATE_WARN
+        assert overall_state(graded_) == STATE_WARN
+
+    def test_the_other_parents_children_and_the_configured_datasets_are_still_observed(self, check_zfs):
+        check_zfs.tree('pool/bad', 'pool/bad/c', 'pool/good', 'pool/good/c1', 'pool/plain')
+        check_zfs.fail('fail_names', 'pool/bad')
+        cfg = config(parent_ds('pool/bad', '1h', remote('a')), parent_ds('pool/good', '1h', remote('a')),
+                     ds('pool/plain', '1h', remote('a')))
+        assert keys(collect(cfg)) == [
+            ('snapshot', 'pool/bad', None), ('anchor', 'pool/bad', 'a'),      # the parent itself is unaffected
+            ('snapshot', 'pool/good', None), ('anchor', 'pool/good', 'a'),
+            ('snapshot', 'pool/plain', None), ('anchor', 'pool/plain', 'a'),
+            ('anchor', 'pool/good/c1', 'a'),
+            ('descendants', 'pool/bad', None),
+        ]
+
+    def test_a_failed_marker_read_is_a_failed_expansion_too(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        check_zfs.fail('fail_markers', RECURSIVE)
+        collected = collect(config(parent_ds()))
+        (entry,) = [o for o in collected if isinstance(o, CheckEntry)]
+        assert entry.state == STATE_WARN and 'backup-copy markers' in entry.reason
+        assert not [o for o in collected if getattr(o, 'subject', '') == f'{RECURSIVE}/x']   # never expanded without it
+
+    def test_every_failed_parent_gets_its_own_entry(self, check_zfs):
+        check_zfs.tree('pool/a', 'pool/b')
+        check_zfs.fail('fail_names', 'pool/a', 'pool/b')
+        collected = collect(config(parent_ds('pool/a', '1h', remote('x')), parent_ds('pool/b', '1h', remote('x'))))
+        assert [(e.source, e.subject) for e in collected if isinstance(e, CheckEntry)] == [
+            ('descendants', 'pool/a'), ('descendants', 'pool/b')]
+
+    def test_it_is_a_warn_never_a_crit_and_never_silence(self, check_zfs):
+        check_zfs.tree(RECURSIVE)
+        check_zfs.fail('fail_names', RECURSIVE)
+        entries = graded(config(parent_ds()), check_zfs)
+        assert [e.state for e in entries if e.source == 'descendants'] == [STATE_WARN]
+
+    def test_expand_recursive_raising_is_one_recursive_datasets_entry(self, mocker, check_zfs):
+        check_zfs.tree('pool/plain')
+        cfg = config(ds('pool/plain', '1h', remote('a')), parent_ds())
+        manager = DatasetManager(cfg)
+        mocker.patch.object(manager, 'expand_recursive', side_effect=RuntimeError('boom'))
+        collected = collect(cfg, manager=manager)
+        (entry,) = [o for o in collected if isinstance(o, CheckEntry)]
+        assert (entry.source, entry.subject, entry.state) == ('descendants', '(recursive datasets)', STATE_WARN)
+        assert entry.reason == 'the descendants of the recursive datasets could not be listed: boom'
+        assert ('snapshot', 'pool/plain', None) in keys(collected)          # the rest is still observed
+        assert evaluate(collected, NOW)[-1] is entry
+
+    def test_an_exception_without_a_message_still_names_itself(self, mocker, check_zfs):
+        cfg = config(parent_ds())
+        manager = DatasetManager(cfg)
+        mocker.patch.object(manager, 'expand_recursive', side_effect=KeyError())
+        (entry,) = [o for o in collect(cfg, manager=manager) if isinstance(o, CheckEntry)]
+        assert entry.reason.endswith(': KeyError')
+
+    def test_the_received_observations_still_follow_a_failed_expansion(self, check_zfs):
+        check_zfs.tree('pool/backups', 'pool/backups/c', RECURSIVE)
+        check_zfs.tree('pool/backups/c/x', snapshots=False)
+        check_zfs.snaps('pool/backups/c/x', 60)
+        check_zfs.prop('pool/backups/c/x', PROP_CLIENT_ID, 'c')
+        check_zfs.prop('pool/backups/c/x', PROP_CONFIG, client_ds().to_property())
+        check_zfs.fail('fail_names', RECURSIVE)
+        cfg = server_config(parent_ds(RECURSIVE, '1h', remote('a')))
+        collected = collect(cfg)
+        assert [(getattr(o, 'source'), o.subject) for o in collected] == [
+            ('snapshot', RECURSIVE), ('anchor', RECURSIVE), ('descendants', RECURSIVE),
+            ('received', 'pool/backups/c/x')]
+
+
+@pytest.mark.subprocess
+class TestBackupCopiesAreNotChildren:
+    def setup_tree(self, fake):
+        fake.tree(RECURSIVE, f'{RECURSIVE}/ok', f'{RECURSIVE}/copy', f'{RECURSIVE}/copy/c1',
+                  f'{RECURSIVE}/copyx')
+
+    def subjects(self, cfg):
+        return [o.subject for o in collect(cfg) if o.source == 'anchor' and o.subject != RECURSIVE]
+
+    @pytest.mark.parametrize('source', ['local', 'received'])
+    @pytest.mark.parametrize('key', [PROP_CLIENT_ID, 'org.zfsbackup:source_dataset'])
+    def test_a_marker_on_a_descendant_removes_it_and_its_subtree(self, check_zfs, key, source):
+        self.setup_tree(check_zfs)
+        check_zfs.marker(f'{RECURSIVE}/copy', key, source)
+        assert self.subjects(config(parent_ds(RECURSIVE, '1h', remote('a')))) == [
+            f'{RECURSIVE}/ok', f'{RECURSIVE}/copyx']
+
+    def test_an_inherited_marker_makes_each_descendant_a_copy(self, check_zfs):
+        """A marker on an ancestor ABOVE the recursive parent is inherited by the parent and everything
+        below it: the parent is inside a copy and no child is observed."""
+        check_zfs.tree('pool', RECURSIVE, f'{RECURSIVE}/a', f'{RECURSIVE}/b')
+        check_zfs.marker('pool')
+        assert self.subjects(config(parent_ds(RECURSIVE, '1h', remote('a')))) == []
+
+    def test_an_inherited_marker_below_the_parent_hides_the_subtree_but_not_its_siblings(self, check_zfs):
+        self.setup_tree(check_zfs)
+        check_zfs.marker(f'{RECURSIVE}/copy')                 # `copy/c1` inherits it
+        assert f'{RECURSIVE}/copy/c1' not in self.subjects(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+
+    def test_a_copy_costs_no_snapshot_listing(self, check_zfs):
+        self.setup_tree(check_zfs)
+        check_zfs.marker(f'{RECURSIVE}/copy', PROP_CLIENT_ID, 'received')
+        collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        listed = {c[-1] for c in check_zfs.calls_of('list') if 'snapshot' in c}
+        assert listed == {RECURSIVE, f'{RECURSIVE}/ok', f'{RECURSIVE}/copyx'}
+        assert not [c for c in check_zfs.calls if c[-1].startswith(f'{RECURSIVE}/copy/') or c[-1] == f'{RECURSIVE}/copy']
+
+    def test_a_local_destination_target_below_the_parent_is_no_source(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/ok', f'{RECURSIVE}/copies', f'{RECURSIVE}/copies/client/x')
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('loc')),
+                     destinations={'loc': Destination(url=f'zfs:{RECURSIVE}/copies')})
+        assert self.subjects(cfg) == [f'{RECURSIVE}/ok']
+
+    @pytest.mark.parametrize('enabled', [True, False])
+    def test_the_server_target_below_the_parent_is_no_source_enabled_or_not(self, check_zfs, enabled):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/ok', f'{RECURSIVE}/srv', f'{RECURSIVE}/srv/c/x')
+        cfg = server_config(parent_ds(RECURSIVE, '1h', remote('a')), enabled=enabled, target=f'{RECURSIVE}/srv')
+        subjects = [o.subject for o in collect(cfg) if o.source == 'anchor' and o.subject != RECURSIVE]
+        assert subjects == [f'{RECURSIVE}/ok']
+
+    def test_the_target_itself_is_excluded_with_a_trailing_slash(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/ok', f'{RECURSIVE}/copies')
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('loc')),
+                     destinations={'loc': Destination(url=f'zfs:{RECURSIVE}/copies/')})
+        assert self.subjects(cfg) == [f'{RECURSIVE}/ok']
+
+    def test_a_target_lookalike_is_a_source(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/copiesx')
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('loc')),
+                     destinations={'loc': Destination(url=f'zfs:{RECURSIVE}/copies')})
+        assert self.subjects(cfg) == [f'{RECURSIVE}/copiesx']
+
+
+@pytest.mark.subprocess
+class TestChildListingFailure:
+    def test_a_child_whose_snapshot_listing_fails_has_only_anchor_error_observations(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/bad', f'{RECURSIVE}/good')
+        check_zfs.fail('fail', f'{RECURSIVE}/bad')
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('a'), remote('b', '6h')))
+        collected = collect(cfg)
+        bad = [o for o in collected if o.subject == f'{RECURSIVE}/bad']
+        assert [(o.source, o.peer) for o in bad] == [('anchor', 'a'), ('anchor', 'b')]     # no snapshot observation
+        assert all(o.error and 'does not exist' in o.error for o in bad)
+        assert [o.expected_seconds for o in bad] == [HOUR, 6 * HOUR]
+        assert all(o.newest_ts is None and o.oldest_ts is None for o in bad)
+        good = [o for o in collected if o.subject == f'{RECURSIVE}/good']
+        assert len(good) == 2 and all(o.error is None for o in good)
+
+    def test_it_grades_crit_cannot_read_and_does_not_hide_its_siblings(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/bad', f'{RECURSIVE}/good')
+        check_zfs.fail('fail', f'{RECURSIVE}/bad')
+        entries = graded(config(parent_ds(RECURSIVE, '1h', remote('a'))), check_zfs)
+        bad = [e for e in entries if e.subject == f'{RECURSIVE}/bad']
+        assert [(e.state, e.reason.startswith('cannot read: ')) for e in bad] == [(STATE_CRIT, True)]
+        assert [e.state for e in entries if e.subject == f'{RECURSIVE}/good'] == [STATE_WARN]
+
+    def test_a_failed_child_reads_no_property(self, check_zfs):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/bad')
+        check_zfs.fail('fail', f'{RECURSIVE}/bad')
+        collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        assert not [c for c in check_zfs.calls_of('get') if c[-1] == f'{RECURSIVE}/bad']
+
+
+@pytest.mark.subprocess
+class TestUnreadableAnchorOrPin:
+    CHILD = f'{RECURSIVE}/x'
+
+    def test_an_unreadable_anchor_is_an_error_for_that_destination_only(self, check_zfs):
+        check_zfs.tree(RECURSIVE, self.CHILD)
+        old, new = check_zfs.snaps(self.CHILD, 2 * HOUR, 600)
+        check_zfs.prop(self.CHILD, ANCHOR_B, new)
+        check_zfs.fail('fail_get', f'{self.CHILD}::{ANCHOR_A}')
+        collected = collect(config(parent_ds()))
+        a, b = [o for o in collected if o.subject == self.CHILD]
+        assert (a.peer, b.peer) == ('a', 'b')
+        assert a.error == ('the anchor or send pin could not be read: ' + a.error.split(': ', 1)[1])
+        assert 'pool I/O is currently suspended' in a.error
+        assert a.newest_ts is None and a.oldest_ts is None and a.detail is None
+        assert a.expected_seconds == HOUR and b.expected_seconds == 6 * HOUR
+        assert b.error is None and b.newest_ts == epoch_of(new)
+        entries = evaluate(collected, NOW)
+        ea, eb = [e for e in entries if e.subject == self.CHILD]
+        assert ea.state == STATE_CRIT and ea.reason.startswith('cannot read: the anchor or send pin')
+        assert eb.state == STATE_OK
+
+    def test_an_unreadable_pin_is_an_error_too_even_with_a_readable_anchor(self, check_zfs):
+        check_zfs.tree(RECURSIVE, self.CHILD)
+        old, new = check_zfs.snaps(self.CHILD, 2 * HOUR, 600)
+        check_zfs.prop(self.CHILD, ANCHOR_B, new)
+        check_zfs.fail('fail_get', f'{self.CHILD}::{INFLIGHT_B}')
+        a, b = [o for o in collect(config(parent_ds())) if o.subject == self.CHILD]
+        assert b.error and 'the anchor or send pin could not be read' in b.error
+        assert b.newest_ts is None            # the readable anchor is not graded on its own: the pin is unknown
+        assert a.error is None
+
+    def test_an_unreadable_dataset_makes_every_destination_an_error_but_not_the_other_children(self, check_zfs):
+        other = f'{RECURSIVE}/other'
+        check_zfs.tree(RECURSIVE, self.CHILD, other)
+        check_zfs.fail('fail_get', self.CHILD)
+        collected = collect(config(parent_ds()))
+        assert [bool(o.error) for o in collected if o.subject == self.CHILD] == [True, True]
+        assert [bool(o.error) for o in collected if o.subject == other] == [False, False]
+        assert [bool(o.error) for o in collected if o.subject == RECURSIVE] == [False] * 3
+
+    def test_the_unreadable_anchor_is_not_never_sent(self, check_zfs):
+        check_zfs.tree(RECURSIVE, self.CHILD)
+        cfg = config(parent_ds(RECURSIVE, '1h', remote('a')))
+        (never,) = [e for e in graded(cfg, check_zfs) if e.subject == self.CHILD]
+        check_zfs.fail('fail_get', self.CHILD)
+        (unread,) = [e for e in graded(cfg, check_zfs) if e.subject == self.CHILD]
+        assert never.state == STATE_WARN and never.reason == 'not yet sent'
+        assert unread.state == STATE_CRIT and unread.reason != never.reason
+
+    def test_a_configured_dataset_is_graded_the_same_way(self, check_zfs):
+        check_zfs.tree('pool/plain')
+        old, new = check_zfs.snaps('pool/plain', 2 * HOUR, 600)
+        check_zfs.prop('pool/plain', ANCHOR_B, new)
+        check_zfs.fail('fail_get', f'pool/plain::{ANCHOR_A}')
+        collected = collect(config(ds('pool/plain', '1h', remote('a'), remote('b'))))
+        snapshot, a, b = collected
+        assert snapshot.source == 'snapshot' and snapshot.error is None        # its snapshot observation is intact
+        assert a.error and 'the anchor or send pin could not be read' in a.error and a.newest_ts is None
+        assert b.error is None and b.newest_ts == epoch_of(new)
+        assert [e.state for e in evaluate(collected, NOW)] == [STATE_OK, STATE_CRIT, STATE_OK]
+
+    def test_an_unreadable_pin_on_a_configured_dataset(self, check_zfs):
+        check_zfs.tree('pool/plain')
+        check_zfs.fail('fail_get', f'pool/plain::{INFLIGHT_B}')
+        _, _a, b = collect(config(ds('pool/plain', '1h', remote('a'), remote('b'))))
+        assert b.error and 'send pin' in b.error
+
+    def test_the_other_destinations_error_does_not_stop_the_dataset_loop(self, check_zfs):
+        check_zfs.tree('pool/one', 'pool/two')
+        check_zfs.fail('fail_get', 'pool/one')
+        collected = collect(config(ds('pool/one', '1h', remote('a')), ds('pool/two', '1h', remote('a'))))
+        assert [(o.source, o.subject, bool(o.error)) for o in collected] == [
+            ('snapshot', 'pool/one', False), ('anchor', 'pool/one', True),
+            ('snapshot', 'pool/two', False), ('anchor', 'pool/two', False)]
