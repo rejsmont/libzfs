@@ -11,11 +11,11 @@ Sections:
 - ``TestOverlapTable`` -- the decision table, through `validate_config`;
 - ``TestComponentsNotStringPrefix`` -- the comparison is by path component
   (the mutation that compares strings fails these);
-- ``TestNoCheckWithoutAnEnabledTarget`` -- `remote_backup` absent, disabled,
-  or with no target;
+- ``TestOnlyAnUnsetTargetImposesNothing`` -- `remote_backup` absent or with no
+  target (a DISABLED receiver still counts: its former copies stay on disk);
 - ``TestWording`` -- what the operator is told;
-- ``TestThroughTheCli`` -- `import` exits 1 and writes nothing; `set
-  remote_backup.enabled true` over an overlapping dataset is refused;
+- ``TestThroughTheCli`` -- `import` exits 1 and writes nothing, for a disabled receiver too;
+  `set remote_backup.target_dataset` onto a dataset is refused;
 - ``TestThroughTheDaemon`` -- `--test-config` and startup reject it (a database
   that was edited behind the CLI's back, or written before C0), and a
   non-overlapping real config is accepted.
@@ -28,8 +28,10 @@ in this file plus `test_zfsbackup_reload.py::TestRejection` and the render
 round-trip/through-the-database tests): comparing by STRING prefix instead of
 path components, at/below arm 6, ancestor arm 4; the recursive-ancestor arm
 removed 8; the "at or below" arm removed 20; the check skipped for a disabled
-dataset 3; the check applied although `remote_backup` is disabled 6 failed and 2
-errors; the call removed from `validate_config` 28.
+dataset 3; the call removed from `validate_config` 28. The target counting although
+`remote_backup` is disabled (a former server): the check gated on `enabled` again fails
+`TestOnlyAnUnsetTargetImposesNothing` and the disabled-receiver tests (re-counted in the
+second pass of A2, see `test_zfsbackup_recursive_sends.py`).
 """
 
 import logging
@@ -152,20 +154,55 @@ class TestComponentsNotStringPrefix:
 
 
 @pytest.mark.unit
-class TestNoCheckWithoutAnEnabledTarget:
+class TestOnlyAnUnsetTargetImposesNothing:
+    """The target counts whenever `remote_backup.target_dataset` is set, ENABLED OR NOT: a host that
+    stopped being a server still has other clients' received copies under it, which a snapshot, a prune
+    or a recursive send must never touch."""
+
     def test_remote_backup_absent(self):
         validate_config(config(("tank/backups", True, True), target=None))
 
     @pytest.mark.parametrize("name, recursive", [
         ("tank/backups", False), ("tank/backups/a", False), ("tank", True),
     ])
-    def test_remote_backup_disabled(self, name, recursive):
-        validate_config(config((name, recursive, True), target="tank/backups", enabled=False))
+    def test_a_disabled_receiver_refuses_the_same_datasets_with_a_note(self, name, recursive):
+        message = refused(config((name, recursive, True), target="tank/backups", enabled=False))
+        assert "remote_backup is disabled, but the target still counts" in message
+        assert "Remove or move remote_backup.target_dataset" in message
 
-    def test_enabling_it_is_what_turns_the_check_on(self):
-        overlapping = [("tank/backups/a", False, True)]
-        validate_config(config(*overlapping, enabled=False))
-        assert refused(config(*overlapping, enabled=True))
+    @pytest.mark.parametrize("name, recursive", [
+        ("tank/backups", False), ("tank/backups/a", False), ("tank", True),
+    ])
+    def test_the_note_appears_only_when_it_is_disabled(self, name, recursive):
+        enabled = refused(config((name, recursive, True), target="tank/backups", enabled=True))
+        disabled = refused(config((name, recursive, True), target="tank/backups", enabled=False))
+        assert "remote_backup is disabled" not in enabled
+        assert disabled.startswith(enabled.rstrip()), "the same refusal, plus the note"
+
+    def test_enabled_and_disabled_refuse_exactly_the_same_datasets(self):
+        for name, recursive in [("tank/backups", False), ("tank/backups/a", False), ("tank", True),
+                                ("tank/b", True), ("tank/backups-old", False), ("tank", False)]:
+            outcomes = []
+            for enabled in (True, False):
+                try:
+                    validate_config(config((name, recursive, True), target="tank/backups", enabled=enabled))
+                    outcomes.append(False)
+                except ValueError:
+                    outcomes.append(True)
+            assert outcomes[0] == outcomes[1], (name, recursive)
+
+    def test_a_disabled_receiver_with_a_non_overlapping_dataset_is_accepted(self):
+        validate_config(config("tank/data", ("tank/backup", True, True), target="tank/backups", enabled=False))
+
+    def test_a_disabled_dataset_over_a_disabled_target_is_refused_too(self):
+        refused(config(("tank/backups/a", False, False), target="tank/backups", enabled=False))
+
+    def test_a_local_destination_equal_inside_or_above_a_disabled_remote_target_is_still_accepted(self):
+        # `_require_disjoint_receive_targets` and `shared_receive_target` still need the receiver enabled
+        for local in ("tank/backups", "tank/backups/vault", "tank"):
+            cfg = config("other/data", target="tank/backups", enabled=False)
+            cfg.destinations = {"local": Destination(url=f"zfs:{local}")}
+            validate_config(cfg)
 
     @pytest.mark.parametrize("target", ["", None])
     def test_no_target_means_nothing_to_overlap(self, target):
@@ -347,17 +384,32 @@ class TestThroughTheCli:
         result = Cli()("import", source, "-c", db)
         assert result.exit_code == 0, result.stderr
 
-    def test_a_disabled_receiver_may_overlap_but_enabling_it_is_refused(self, tmp_path, db):
-        run = Cli()
+    def test_a_disabled_receiver_over_an_overlapping_dataset_is_refused_at_import(self, tmp_path, db):
         source = tmp_path / "off.yaml"
         source.write_text(yaml_text([("tank/backups/a", False)], enabled="false"))
+        result = Cli()("import", source, "-c", db)
+        assert result.exit_code == 1, result.stderr
+        assert "remote_backup is disabled, but the target still counts" in result.stderr
+        assert not db.exists()
+
+    def test_a_disabled_receiver_beside_unrelated_datasets_imports_and_can_be_enabled(self, tmp_path, db):
+        run = Cli()
+        source = tmp_path / "off.yaml"
+        source.write_text(yaml_text([("tank/data", False)], enabled="false"))
+        assert run("import", source, "-c", db).exit_code == 0
+        dispose_all()
+        assert run("set", "remote_backup.enabled", "true", "-c", db).exit_code == 0
+
+    def test_a_dataset_moved_onto_a_disabled_target_is_refused(self, tmp_path, db):
+        run = Cli()
+        source = tmp_path / "off.yaml"
+        source.write_text(yaml_text([("tank/data", False)], enabled="false"))
         assert run("import", source, "-c", db).exit_code == 0
         dispose_all()
         before, gen = db_state(db), generation(db)
-
-        result = run("set", "remote_backup.enabled", "true", "-c", db)
+        result = run("rename", "dataset", "tank/data", "tank/backups/data", "-c", db)
         assert result.exit_code == 1, result.stderr
-        assert "received" in result.stderr
+        assert "remote_backup is disabled, but the target still counts" in result.stderr
         dispose_all()
         assert db_state(db) == before and generation(db) == gen
 
@@ -382,17 +434,17 @@ class TestThroughTheCli:
 
 @pytest.fixture
 def overlapping_db(tmp_path):
-    """A real database that holds an ENABLED receiver over a configured dataset:
-    imported with the receiver disabled (allowed), then switched on behind the
-    CLI's back -- the state a database written before C0 can be in."""
+    """A real database that holds an ENABLED receiver over a configured dataset: imported without the
+    overlap (the import refuses it, even for a disabled receiver), then the dataset is renamed onto the
+    target behind the CLI's back -- the state a database written before C0 can be in."""
     path = tmp_path / "daemon" / "config.db"
-    source = tmp_path / "off.yaml"
-    source.write_text(yaml_text([("tank/backups/a", False), ("tank/data", False)], enabled="false"))
+    source = tmp_path / "ok.yaml"
+    source.write_text(yaml_text([("tank/other", False), ("tank/data", False)]))
     resolved = resolve_config_path(str(path))
     import_yaml(source, resolved)
     dispose_all()
     conn = sqlite3.connect(str(path))
-    conn.execute("UPDATE remote_server SET enabled = 1")
+    conn.execute("UPDATE datasets SET name = 'tank/backups/a' WHERE name = 'tank/other'")
     conn.commit()
     conn.close()
     return path

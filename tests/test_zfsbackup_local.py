@@ -2877,3 +2877,124 @@ class TestWorkerSeedsTheSkipCountsBySender:
         wrig.run()
         wrig.rbm.seed_token_skips.assert_not_called()
         wrig.lbm.seed_token_skips.assert_not_called()
+
+
+# ---------------------------------------------------------------------------------------------
+# A2: a copy whose snapshots could never exist (full name over 255 characters)
+# ---------------------------------------------------------------------------------------------
+
+
+class TestNegotiateNameTooLong:
+    """`<target>/<client>/<dataset>@<snapshot>` over ZFS's 255 characters is refused in `_negotiate`
+    before anything is asked of or written to zfs: ERROR once per episode, `NegotiationFailed`."""
+
+    SNAP = LISTING[0].name                                   # 23 characters
+
+    @staticmethod
+    def dsi_with_copy_length(rig, copy_length):
+        name = 'pool/' + 'a' * (copy_length - len(BASE) - 1 - len('pool/'))
+        dsi = rig.dsi_for(name)
+        assert len(f'{BASE}/{name}') == copy_length
+        return dsi
+
+    def fits(self, rig):
+        return self.dsi_with_copy_length(rig, 255 - 1 - len(self.SNAP))
+
+    def too_long(self, rig):
+        return self.dsi_with_copy_length(rig, 255 - len(self.SNAP))
+
+    def test_exactly_255_is_negotiated(self, rig):
+        assert rig.negotiate(dsi=self.fits(rig)) is None
+        assert rig.host.of('create'), 'it went on to create the ancestors'
+
+    def test_256_is_refused_before_any_zfs_command(self, rig, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.local'):
+            with pytest.raises(NegotiationFailed, match='256-character name'):
+                rig.negotiate(dsi=self.too_long(rig))
+        assert rig.host.events == [], 'not even an existence check, let alone a write'
+        (error,) = messages(caplog, logging.ERROR)
+        assert 'nothing is sent' in error and 'shorten the dataset name' in error
+
+    def over_by_one(self):
+        """The listing plus one snapshot whose name is a character longer than the others."""
+        return [SimpleNamespace(name=self.SNAP + 'x')] + LISTING
+
+    def test_the_longest_snapshot_name_decides(self, rig):
+        with pytest.raises(NegotiationFailed):
+            rig.negotiate(dsi=self.fits(rig), snaps=self.over_by_one())
+        assert rig.host.events == []
+
+    def test_one_error_per_episode_and_a_new_one_after_a_success(self, rig, caplog):
+        dsi = self.fits(rig)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.local'):
+            for _ in range(3):
+                with pytest.raises(NegotiationFailed):
+                    rig.negotiate(dsi=dsi, snaps=self.over_by_one())
+            assert len(messages(caplog, logging.ERROR)) == 1
+            assert rig.negotiate(dsi=dsi) is None                 # the same pair negotiates: episode over
+            with pytest.raises(NegotiationFailed):
+                rig.negotiate(dsi=dsi, snaps=self.over_by_one())
+        assert len(messages(caplog, logging.ERROR)) == 2
+
+    def test_through_backup_dataset_nothing_is_written_and_the_problem_is_reported(self, rig):
+        dsi = self.too_long(rig)
+        assert rig.mgr.backup_dataset(dsi, RemoteDatasetConfig(destination=DEST)) is False
+        assert not rig.host.of('create') and not rig.host.of('set') and not rig.host.of('start-receive')
+        assert '256-character' in rig.mgr.last_problem(dsi.name, DEST)
+
+
+
+# ---------------------------------------------------------------------------------------------
+# A2: `copy_confirmed` on the local manager (what the parent-first rule of recursive datasets reads)
+# ---------------------------------------------------------------------------------------------
+
+
+class TestCopyConfirmedLocal:
+    """The copy under the local target is CONFIRMED in this incarnation when a negotiate found it and the
+    call returned True, or a stream committed. No anchor is evidence, and a dry run confirms nothing."""
+
+    def backup(self, rig):
+        return rig.mgr.backup_dataset(rig.dsi, RemoteDatasetConfig(destination=DEST))
+
+    def confirmed(self, rig):
+        return rig.mgr.copy_confirmed(DS, DEST)
+
+    def test_nothing_is_confirmed_at_first(self, rig):
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.confirmed(rig) is False
+
+    def test_an_existing_up_to_date_copy_confirms_without_a_stream(self, rig, sends):
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.backup(rig) is True and sends.calls == []
+        assert self.confirmed(rig) is True
+
+    def test_a_first_full_send_that_commits_confirms(self, rig, sends, streams):
+        commits(rig, streams, S3)
+        assert self.backup(rig) is True
+        assert self.confirmed(rig) is True
+
+    def test_a_committed_stream_confirms_even_if_the_chain_then_fails(self, rig, sends, streams):
+        rig.owned_copy(copy_rows(S1))
+        commits(rig, streams, S2)
+        rig.host.receives.append(streams.receive(rc=1, stderr='cannot receive: no space', events=rig.host.events))
+        assert self.backup(rig) is False
+        assert self.confirmed(rig) is True
+
+    def test_a_failing_first_receive_confirms_nothing(self, rig, sends, streams):
+        rig.host.receives.append(streams.receive(rc=1, stderr='cannot receive: no space', events=rig.host.events))
+        assert self.backup(rig) is False
+        assert self.confirmed(rig) is False
+
+    def test_a_dry_run_confirms_nothing(self, mocker, streams, snapshot_presence):
+        rig = LocalRig(mocker, dry_run=True)
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.backup(rig) is True
+        assert self.confirmed(rig) is False
+
+    def test_a_copy_that_has_gone_unsets_the_confirmation(self, rig, sends, streams):
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.backup(rig) is True and self.confirmed(rig) is True
+        del rig.host.datasets[COPY]                                   # the copy was lost
+        rig.host.receives.append(streams.receive(rc=1, stderr='cannot receive: boom', events=rig.host.events))
+        assert self.backup(rig) is False
+        assert self.confirmed(rig) is False

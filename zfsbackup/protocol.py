@@ -38,6 +38,11 @@ PROTOCOL_HEADER = 'X-Zfsbackup-Protocol'
 #: The `reason` of the server's 426 body.
 PROTOCOL_REFUSAL_REASON = 'protocol'
 
+#: The `reason` of a 400 from `negotiate` for a snapshot name that would be
+#: over ZFS's 255-character limit once the server's copy path is prefixed to it
+#: (additive: an older client logs the `error` text like any other 400).
+NAME_TOO_LONG_REASON = 'name_too_long'
+
 _VERSION_RE = re.compile(r'[0-9]{1,6}')
 
 

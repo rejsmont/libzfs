@@ -31,6 +31,7 @@ import websocket
 
 import libzfseasy as zfs  # noqa: F401 -- tests patch `zfsbackup.remote.zfs.*` (the shared libzfseasy module)
 from zfsbackup import identity as ident
+from zfsbackup import receiver
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
 from zfsbackup.chain import (  # noqa: F401 -- re-exported: the names tests and callers import from here
     ChainSender, NegotiationFailed, RESUME_TOKEN_SKIP_ERROR_AFTER, TOKEN_SKIP_NOTE,
@@ -43,7 +44,7 @@ from zfsbackup.identity import (
     is_pin_mismatch, is_tls_alert_rejection, load_identity, pinned_session,
 )
 from zfsbackup.protocol import (
-    PROTOCOL_VERSION, SUPPORTED_PROTOCOLS, protocol_headers,
+    NAME_TOO_LONG_REASON, PROTOCOL_VERSION, SUPPORTED_PROTOCOLS, protocol_headers,
 )
 
 
@@ -920,7 +921,16 @@ class RemoteBackupManager(ChainSender):
             if resp.status_code >= 400:
                 # The server's own explanation (a 400 says what is wrong with
                 # the request) instead of a bare "400 Client Error".
-                reason = _json_body(resp).get('error')
+                body = _json_body(resp)
+                reason = body.get('error')
+                if reason and body.get('reason') == NAME_TOO_LONG_REASON:
+                    # Decided by the server before it wrote anything: the
+                    # same every cycle, so ERROR once per episode.
+                    self._log_refusal_once(
+                        (dsi.name, destination),
+                        f"server refused {dsi.name}: {reason}; nothing is sent",
+                    )
+                    raise NegotiationFailed(f"HTTP {resp.status_code}: {reason}")
                 if reason:
                     logger.error(
                         f"Negotiation failed for {dsi.name} at {base_url}: "
@@ -928,10 +938,28 @@ class RemoteBackupManager(ChainSender):
                     )
                     raise NegotiationFailed(f"HTTP {resp.status_code}: {reason}")
             resp.raise_for_status()
-            self._refusal_logged.pop((dsi.name, destination), None)
-            self._refusal_logged.pop((f"{dsi.name} [unsettled]", destination), None)
             self._negotiate_zfs_ok(dsi, destination)
             body = resp.json()
+            # An old server has no name-length check: the copy's name is
+            # known from its answer, so a snapshot that could never exist
+            # there is refused before the first stream (same ERROR-once
+            # handling as the server's own 400). A server that names no copy
+            # cannot be checked.
+            copy = body.get('server_dataset')
+            too_long = (
+                receiver.copy_snapshot_name_problem(copy, [s.name for s in snapshots])
+                if isinstance(copy, str) and copy else None
+            )
+            if too_long is not None:
+                self._log_refusal_once(
+                    (dsi.name, destination),
+                    f"{dsi.name} -> {destination}: {too_long}; nothing is sent",
+                )
+                raise NegotiationFailed(too_long)
+            # Only now is the episode over (the check above keeps its entry, so
+            # a standing refusal is logged once, not every cycle).
+            self._refusal_logged.pop((dsi.name, destination), None)
+            self._refusal_logged.pop((f"{dsi.name} [unsettled]", destination), None)
             self._server_info[(dsi.name, destination)] = (
                 body.get('server_copy'), body.get('server_dataset')
             )

@@ -1,9 +1,11 @@
-"""Sender rework, Track A, item A0: characterization of two current gaps, as strict xfails.
+"""Sender rework, Track A: the A0 characterization (now plain tests), the A1 matrix, the A2 tests.
 
-Plan: `docs/sender_rework_plan.md` (Track A). Each test below states the DESIRED behaviour. A test
-for an item that has not landed is marked `xfail(strict=True)`; when the named item lands it turns
-into an XPASS, which strict mode makes a hard failure -- the fixing change then deletes the marker.
-A1 has landed (its tests are plain, and `TestA1OwnAnchorMatrix` is its matrix); A2 has not.
+Plan: `docs/sender_rework_plan.md` (Track A). A0 wrote each test as the DESIRED behaviour, marked
+`xfail(strict=True)` until its item landed; A1 and A2 have landed and no marker is left. The A1 tests
+are `TestA1*`; the A2 ones are `TestExpand*` (`DatasetManager.expand_recursive`) and `TestA2*` (the
+remote worker: depth order, R-2, status keys, the cap warning). The copy-name-length refusal of A2 is
+tested where its pieces live: `test_zfsbackup_receiver.py` (the helper), `test_zfsbackup_local.py`,
+`test_zfsbackup_api_negotiate.py` and `test_zfsbackup_remote.py`.
 
 * A1 (the inherited anchor; LANDED: the due check and `health_collect` now read `get_own_anchor` /
   `get_own_inflight`, `_record_step` / `_settle_up_to_date` the raising `get_local_anchor`, all
@@ -16,10 +18,10 @@ A1 has landed (its tests are plain, and `TestA1OwnAnchorMatrix` is its matrix); 
       snapshots (a recursive snapshot gives both the same name) and says "not due yet";
     - `health_collect._observe_local` (zfsbackup/health_collect.py:145-150) grades the child as
       freshly sent.
-* A2 (recursive sends). `recursive: true` makes the snapshot worker run `zfs snapshot -r`
-  (backup_manager.py:1547), but `DatasetManager._get_datasets` (backup_manager.py:616-621) builds
-  only configured entries and `RemoteBackupWorker._get_datasets` (workers.py:1248-1262) adds
-  nothing, so no descendant is ever sent.
+* A2 (recursive sends; LANDED). `recursive: true` makes the snapshot worker run `zfs snapshot -r`
+  (backup_manager.py:1547). Before A2 `DatasetManager._get_datasets` built only configured entries and
+  `RemoteBackupWorker._get_datasets` added nothing, so no descendant was ever sent; now
+  `DatasetManager.expand_recursive` names them and the remote worker appends them.
 
 The ZFS world is faked one level below libzfseasy, at `subprocess.Popen`, so the INHERITANCE IS
 REAL AT THE `zfs get` LEVEL: `zfs get -H -o value -s local <prop> <ds>` prints nothing for a
@@ -30,20 +32,24 @@ parent's value. No method of `DatasetManager` is patched. Nothing here reaches a
 import io
 import logging
 import os
+import re
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set, Tuple
 
 import pytest
 
+import libzfseasy as libzfseasy_module
 from _snapshot_support import list_row
 from libzfseasy.zfs import ZFSTimeoutError
 from zfsbackup.backup_manager import (
     PROP_ANCHOR_PREFIX,
     PROP_INFLIGHT_PREFIX,
     SNAPSHOT_LIST_PROPERTIES,
+    DatasetInfo,
     DatasetManager,
 )
-from zfsbackup.chain import _ANCHOR_FAILED, _OK, ChainSender, _SendStream
+from zfsbackup.chain import _ANCHOR_FAILED, _FAILED, _OK, ChainSender, _SendStream
 from zfsbackup.config import (
     BackupConfig,
     DatasetConfig,
@@ -53,6 +59,8 @@ from zfsbackup.config import (
 )
 from zfsbackup.health import STATE_OK, evaluate
 from zfsbackup.health_collect import collect
+from _remote_support import snapshot_presence  # noqa: F401  (fixture)
+from test_zfsbackup_chain import DEST as CHAIN_DEST, DS as CHAIN_DS, S1, S2, S3, Rig as ChainRig, listing, sinfo
 from zfsbackup.stopflag import StopFlag
 from zfsbackup.workers import ExitReason, RemoteBackupWorker
 
@@ -99,6 +107,17 @@ class InheritingZfs:
     * `received[(name, prop)]` -- a property whose value was RECEIVED (source `received`; it wins
       over an inherited value, as in ZFS)
     * `unreadable` -- `(name, prop)` pairs whose `zfs get` fails (exit 1, a pool error)
+    * `list_failures[root]` -- the stderr of a `zfs list ... <root>` that fails (exit 1); remove
+      the entry to make it work again (A2: a failing discovery, then its recovery)
+    * `list_extra[root]` -- raw `(name, type)` rows a recursive listing of `root` prints before
+      the datasets (names a real `zfs list -r` never prints for `root`: siblings,
+      snapshots, hostile bytes), to prove the reader's own scope check
+    * `copy_read_failures[root]` -- the stderr of the value-free recursive `zfs get -H -o
+      name,property,source -s local,received,inherited -r ... all <root>` (the backup-copy read of
+      A2) when it fails; the fake answers it with `local`, `received` and `inherited from <ds>` rows
+    * `snapshot_list_failures` -- datasets whose snapshot listing (`zfs list -t snapshot`) fails
+    * `encryption[name]` -- the `encryption` property of a dataset's snapshots (default `off`;
+      anything else reads as encrypted with its key `available`)
 
     `zfs get -H -o value [-s SOURCES] <prop> <ds>` prints the effective value (local, else
     received, else the nearest ancestor's, source `inherited`) or `-` when unset; with `-s` it
@@ -118,6 +137,11 @@ class InheritingZfs:
         self.props: Dict[Tuple[str, str], str] = {}
         self.received: Dict[Tuple[str, str], str] = {}
         self.unreadable: Set[Tuple[str, str]] = set()
+        self.list_failures: Dict[str, str] = {}
+        self.list_extra: Dict[str, List[Tuple[str, str]]] = {}
+        self.copy_read_failures: Dict[str, str] = {}
+        self.snapshot_list_failures: Set[str] = set()
+        self.encryption: Dict[str, str] = {}
         self.allow_writes = False
         self.writes: List[Tuple[str, ...]] = []
         self.calls: List[List[str]] = []
@@ -141,6 +165,8 @@ class InheritingZfs:
         self.calls.append(rest)
         if rest[:4] == ['get', '-H', '-o', 'value']:
             return self._get_value(rest)
+        if rest[:4] == ['get', '-H', '-o', 'name,property,source']:
+            return self._get_sources(rest)
         if rest[:1] == ['list']:
             return self._list(rest)
         if self.allow_writes and rest[:1] == ['set']:
@@ -176,7 +202,7 @@ class InheritingZfs:
             if snap not in self.snaps.get(dataset, []):
                 return _Proc(b'', f"cannot open '{name}': dataset does not exist\n".encode(), 1)
             cells = dict(zip(['name', 'type'] + list(SNAPSHOT_LIST_PROPERTIES),
-                             list_row(snap, dataset).rstrip('\n').split('\t')))
+                             self._snapshot_row(snap, dataset).rstrip('\n').split('\t')))
             return _Proc(f"{cells[prop]}\n".encode())
         if name not in self.datasets:
             return _Proc(b'', f"cannot open '{name}': dataset does not exist\n".encode(), 1)
@@ -187,26 +213,84 @@ class InheritingZfs:
             return _Proc()                                  # a source filter that excludes it: nothing
         return _Proc(f"{'-' if value is None else value}\n".encode())
 
+    def _source_of(self, name, prop):
+        """The source string zfs prints for a user property of `name`: `local`, `received`,
+        `inherited from <ancestor>` (the nearest one that has it), or None when nobody sets it."""
+        if (name, prop) in self.props:
+            return 'local'
+        if (name, prop) in self.received:
+            return 'received'
+        parent = name.rpartition('/')[0]
+        while parent:
+            if (parent, prop) in self.props or (parent, prop) in self.received:
+                return f'inherited from {parent}'
+            parent = parent.rpartition('/')[0]
+        return None
+
+    def _get_sources(self, rest):
+        """`zfs get -H -o name,property,source -s <sources> [-r] -t <types> all <root>`: one row per
+        user property (`props`, `received`, and what the datasets inherit) whose source is among
+        `sources` (`inherited` matches `inherited from X`), the root and with `-r` every dataset
+        below it, a dataset's rows together; no value is printed."""
+        root = rest[-1]
+        assert rest[-2] == 'all', rest
+        wanted = rest[rest.index('-s') + 1].split(',')
+        if root in self.copy_read_failures:
+            return _Proc(b'', self.copy_read_failures[root].encode() + b'\n', 1)
+        if root not in self.datasets:
+            return _Proc(b'', f"cannot open '{root}': dataset does not exist\n".encode(), 1)
+        names = [root] + ([n for n in self.datasets if n.startswith(root + '/')] if '-r' in rest else [])
+        known = sorted({prop for (_, prop) in list(self.props) + list(self.received)})
+        lines = []
+        for n in names:
+            for prop in known:
+                source = self._source_of(n, prop)
+                if source is not None and source.split(' ')[0] in wanted:
+                    lines.append(f"{n}\t{prop}\t{source}\n")
+        return _Proc(''.join(lines).encode())
+
+    def name_sources_reads(self, root=None):
+        """The backup-copy reads asked for (`get -H -o name,property,source ...`), of `root` if given."""
+        return [a for a in self.calls if a[:4] == ['get', '-H', '-o', 'name,property,source']
+                and (root is None or a[-1] == root)]
+
+    def _snapshot_row(self, snap, dataset):
+        encryption = self.encryption.get(dataset, 'off')
+        return list_row(snap, dataset, encryption=encryption,
+                        keystatus='-' if encryption == 'off' else 'available')
+
+    def name_lists(self, root=None):
+        """The name enumerations asked for (`zfs list -r -t filesystem,volume`), of `root` if given."""
+        return [a for a in self.calls if a[:1] == ['list'] and '-r' in a and 'snapshot' not in a
+                and (root is None or a[-1] == root)]
+
     def _list(self, rest):
         root = rest[-1]
         columns = rest[rest.index('-o') + 1].split(',')
         types = rest[rest.index('-t') + 1] if '-t' in rest else 'filesystem,volume'
+        if root in self.list_failures:
+            return _Proc(b'', self.list_failures[root].encode() + b'\n', 1)
         if root not in self.datasets:
             return _Proc(b'', f"cannot open '{root}': dataset does not exist\n".encode(), 1)
         if types == 'snapshot':
+            if root in self.snapshot_list_failures:
+                return _Proc(b'', f"cannot open '{root}': pool I/O is currently suspended\n".encode(), 1)
             known = ['name', 'type'] + list(SNAPSHOT_LIST_PROPERTIES)
             lines = []
             for snap in self.snaps.get(root, []):
-                cells = dict(zip(known, list_row(snap, root).rstrip('\n').split('\t')))
+                cells = dict(zip(known, self._snapshot_row(snap, root).rstrip('\n').split('\t')))
                 lines.append('\t'.join(cells.get(c, '-') for c in columns))
             return _Proc(''.join(line + '\n' for line in lines).encode())
         wanted = types.split(',')
         names = [root] + (
             [n for n in self.datasets if n.startswith(root + '/')] if '-r' in rest else []
         )
-        lines = ['\t'.join({'name': n, 'type': self.datasets[n]}.get(c, '-') for c in columns)
-                 for n in names if self.datasets[n] in wanted]
-        return _Proc(''.join(line + '\n' for line in lines).encode())
+        rows = [(n, self.datasets[n]) for n in names if self.datasets[n] in wanted]
+        if '-r' in rest:
+            # BEFORE the real rows: the reader distrusts the row in front of an out-of-scope one
+            rows = self.list_extra.get(root, []) + rows
+        lines = ['\t'.join({'name': n, 'type': t}.get(c, '-') for c in columns) for n, t in rows]
+        return _Proc(''.join(line + '\n' for line in lines).encode('utf-8', 'surrogateescape'))
 
 
 @pytest.fixture
@@ -235,17 +319,33 @@ def dataset(name, **kw) -> DatasetConfig:
 
 
 class RecordingSender:
-    """Stands in for `RemoteBackupManager`: records `backup_dataset` and reports success."""
+    """Stands in for `RemoteBackupManager`: records `backup_dataset` and reports success.
 
-    def __init__(self):
+    Given a `world`, a success also does what a real acknowledged send does: the dataset's LOCAL
+    `anchor.<destination>` is set to its newest snapshot (what R-2 reads as "this pair has been
+    sent"). Without one it reports success and leaves no trace (`backup_dataset` also returns True
+    for a dataset with nothing to send)."""
+
+    def __init__(self, world=None):
+        self.world = world
         self.attempts: List[Tuple[str, str]] = []
+        self.confirmed: Set[Tuple[str, str]] = set()
 
     def begin_cycle(self):
         pass
 
     def backup_dataset(self, dsi, remote_cfg, should_stop=None):
         self.attempts.append((dsi.name, remote_cfg.destination))
+        self._acknowledged(dsi.name, remote_cfg.destination)
+        self.confirmed.add((dsi.name, remote_cfg.destination))
         return True
+
+    def copy_confirmed(self, dataset, destination):
+        return (dataset, destination) in self.confirmed
+
+    def _acknowledged(self, dataset, destination):
+        if self.world is not None and self.world.snaps.get(dataset):
+            self.world.set_prop(dataset, f'{PROP_ANCHOR_PREFIX}{destination}', self.world.snaps[dataset][-1])
 
     def last_problem(self, dataset, destination):
         return None
@@ -359,15 +459,14 @@ class TestDescendantsOfARecursiveDataset:
     It has a child filesystem and a child zvol, neither configured. The snapshot worker already
     snapshots them (`zfs snapshot -r`, backup_manager.py:1547).
 
-    Path: `RemoteBackupWorker.run` -> `_get_datasets` (workers.py:1248-1262) ->
-    `DatasetManager.datasets` (backup_manager.py:616-621), which lists configured entries only,
-    so `_send_to_destinations` is called for the parent alone.
-    Desired: one `backup_dataset` attempt per child x destination, after the parent."""
+    Path: `RemoteBackupWorker.run` -> `_get_datasets` -> `DatasetManager.expand_recursive`.
+    Before A2 only the configured parent was attempted. Now: one `backup_dataset` attempt per
+    child x destination, after the parent."""
 
     @staticmethod
-    def one_cycle(cfg, mocker):
+    def one_cycle(cfg, mocker, world=None):
         worker = RemoteBackupWorker(cfg, StopFlag())
-        sender = RecordingSender()
+        sender = RecordingSender(world)
         mocker.patch.object(worker, '_before_loop',
                             side_effect=lambda *a: setattr(worker, '_remote_manager', sender))
         mocker.patch.object(worker, '_wait', return_value=ExitReason.STOP)   # exactly one cycle
@@ -380,21 +479,9 @@ class TestDescendantsOfARecursiveDataset:
         world.add(f'{PARENT}/fs', 'filesystem', snaps=[snap])
         world.add(f'{PARENT}/vol', 'volume', snaps=[snap])
 
-    def test_only_the_configured_parent_is_attempted_today(self, zfs_world, mocker):
-        # Documents the current behaviour (and guards the harness): when A2 lands this assertion
-        # is deleted together with the xfail below.
-        self.tree(zfs_world)
-        sender = self.one_cycle(config(dataset(PARENT, recursive=True)), mocker)
-        assert sender.attempts == [(PARENT, DEST)]
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="A2: descendants of a recursive dataset are never sent "
-               "(workers.py:1248-1262, backup_manager.py:616-621)",
-    )
     def test_each_descendant_is_sent_to_each_destination_after_its_parent(self, zfs_world, mocker):
         self.tree(zfs_world)
-        sender = self.one_cycle(config(dataset(PARENT, recursive=True)), mocker)
+        sender = self.one_cycle(config(dataset(PARENT, recursive=True)), mocker, zfs_world)
 
         assert sender.attempts[:1] == [(PARENT, DEST)], 'the parent goes first'
         assert sorted(sender.attempts[1:]) == [(f'{PARENT}/fs', DEST), (f'{PARENT}/vol', DEST)]
@@ -702,3 +789,1721 @@ class TestA1ProtectionOnlyWidens:
         assert manager.get_own_anchor(child, DEST) is None            # not its own history ...
         assert manager.get_anchors(child, own_properties_last=own_properties_last) == {old}   # ... but kept
         assert manager.get_anchor(child, DEST) == old
+
+
+# =============================================================================================
+# A2: `DatasetManager.expand_recursive`
+# =============================================================================================
+
+import base64  # noqa: E402
+import dataclasses  # noqa: E402
+import json  # noqa: E402
+
+from zfsbackup.backup_manager import Expansion  # noqa: E402
+from zfsbackup.config import RemoteServerConfig, RetentionRule  # noqa: E402
+
+BACKUP_LOGGER = 'zfsbackup.backup_manager'
+WORKER_LOGGER = 'zfsbackup.workers'
+
+
+def rdataset(name, destinations=(DEST,), **kw) -> DatasetConfig:
+    """A dataset config sending to every destination in `destinations` (1h frequency)."""
+    kw.setdefault('frequency', Duration('1h'))
+    return DatasetConfig(
+        name=name, remote=[RemoteDatasetConfig(destination=d) for d in destinations], **kw
+    )
+
+
+def add_tree(world: InheritingZfs, *names, snaps=True, dstype='filesystem') -> None:
+    """Add every name (the parents implied by `a/b/c` need their own entry), each with one snapshot."""
+    snap = stamp(timedelta(minutes=10))
+    for name in names:
+        world.add(name, dstype, snaps=[snap] if snaps else [])
+
+
+def expand(cfg, should_stop=None):
+    manager = DatasetManager(cfg)
+    return manager, manager.expand_recursive(should_stop)
+
+
+def child_names(expansion) -> List[str]:
+    return [c.name for c in expansion.children]
+
+
+def records_at(caplog, level, logger=BACKUP_LOGGER):
+    return [r.getMessage() for r in caplog.records if r.name == logger and r.levelno == level]
+
+
+def decode(prop: str) -> dict:
+    return json.loads(base64.b64decode(prop))
+
+
+@pytest.mark.unit
+class TestExpandTrees:
+    """What is listed, and how: kinds, depth, the exact command."""
+
+    def test_filesystems_and_volumes_below_the_parent_become_children(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/fs')
+        add_tree(zfs_world, f'{PARENT}/vol', dstype='volume')
+        manager, exp = expand(config(dataset(PARENT, recursive=True)))
+
+        assert isinstance(exp, Expansion) and exp.failed == {}
+        assert sorted(child_names(exp)) == [f'{PARENT}/fs', f'{PARENT}/vol']
+        assert PARENT not in child_names(exp), 'the parent is a configured pair, not a child'
+        assert all(c.expanded_from == PARENT for c in exp.children)
+
+    def test_a_deep_tree_is_expanded_to_every_level(self, zfs_world):
+        names = [f'{PARENT}/a', f'{PARENT}/a/b', f'{PARENT}/a/b/c', f'{PARENT}/a/b/c/d', f'{PARENT}/e']
+        add_tree(zfs_world, PARENT, *names)
+        _, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert sorted(child_names(exp)) == sorted(names)
+        listed = child_names(exp)
+        for name in names:                       # zfs prints a parent before its descendants
+            parent = name.rpartition('/')[0]
+            assert parent == PARENT or listed.index(parent) < listed.index(name)
+
+    def test_a_dataset_that_is_not_configured_recursive_has_no_children(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        _, exp = expand(config(dataset(PARENT)))
+        assert exp == Expansion([], {})
+        assert zfs_world.calls == [], 'nothing is asked of zfs when no dataset is a recursive root'
+
+    @pytest.mark.parametrize('kw', [
+        pytest.param(dict(enabled=False), id='disabled'),
+        pytest.param(dict(remote=[]), id='no-remote'),
+    ])
+    def test_a_recursive_dataset_that_is_disabled_or_has_no_remote_is_no_root(self, zfs_world, kw):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        cfg = dataset(PARENT, recursive=True)
+        cfg = dataclasses.replace(cfg, **kw)
+        _, exp = expand(config(cfg))
+        assert exp == Expansion([], {}) and zfs_world.calls == []
+
+    def test_the_listing_is_one_untimed_name_only_command_per_root(self, zfs_world, mocker):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', f'{PARENT}/a/b')
+        timeout = mocker.spy(libzfseasy_module, 'timeout')
+        expand(config(dataset(PARENT, recursive=True)))
+        call, _copy_read = zfs_world.calls
+        assert call[0] == 'list' and call[-1] == PARENT
+        assert '-r' in call and call[call.index('-t') + 1] == 'filesystem,volume'
+        assert call[call.index('-o') + 1] == 'name,type', 'names and types only: no property to forge'
+        assert timeout.call_count == 0, 'a source dataset is never read under a timeout'
+
+    def test_the_backup_copy_read_is_one_value_free_local_recursive_get_per_root(self, zfs_world, mocker):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', 'pool/other', 'pool/other/b')
+        timeout = mocker.spy(libzfseasy_module, 'timeout')
+        expand(config(dataset(PARENT, recursive=True), dataset('pool/other', recursive=True)))
+        assert zfs_world.name_sources_reads() == [
+            ['get', '-H', '-o', 'name,property,source', '-s', 'local,received,inherited', '-r', '-t',
+             'filesystem,volume', 'all', root]
+            for root in (PARENT, 'pool/other')], 'name, property and source only: no value is ever read'
+        assert [c[0] for c in zfs_world.calls] == ['list', 'get', 'list', 'get'], 'the listing first, then the read'
+        assert timeout.call_count == 0
+
+    def test_children_carry_no_snapshots_until_listed(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        manager, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert [d.name for d in manager.datasets] == [PARENT], 'the manager keeps configured datasets only'
+        assert exp.children[0].snapshots == []
+
+    def test_expanding_twice_gives_equal_results(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', f'{PARENT}/b')
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        first, second = manager.expand_recursive(), manager.expand_recursive()
+        assert child_names(first) == child_names(second)
+        assert [d.name for d in manager.datasets] == [PARENT]
+
+
+@pytest.mark.unit
+class TestExpandOwnership:
+    """Which configured ancestor a name belongs to; explicit configuration, R-1."""
+
+    def test_the_nearest_enabled_recursive_root_with_remote_wins(self, zfs_world):
+        mid = f'{PARENT}/mid'
+        add_tree(zfs_world, PARENT, f'{PARENT}/top', mid, f'{mid}/x', f'{mid}/x/y')
+        cfg = config(
+            rdataset(PARENT, recursive=True),
+            rdataset(mid, ['other'], recursive=True),
+            destinations={DEST: Destination(url='https://h:8443'), 'other': Destination(url='https://o:8443')},
+        )
+        _, exp = expand(cfg)
+        owners = {c.name: c.expanded_from for c in exp.children}
+        assert owners == {f'{PARENT}/top': PARENT, f'{mid}/x': mid, f'{mid}/x/y': mid}
+        by_name = {c.name: c for c in exp.children}
+        assert [r.destination for r in by_name[f'{mid}/x'].config.remote] == ['other']
+        assert [r.destination for r in by_name[f'{PARENT}/top'].config.remote] == [DEST]
+        assert len(child_names(exp)) == len(set(child_names(exp))), 'a pair is unique by dataset'
+
+    def test_each_root_is_listed_once_and_its_nested_root_lists_its_own_subtree(self, zfs_world):
+        mid = f'{PARENT}/mid'
+        add_tree(zfs_world, PARENT, mid, f'{mid}/x')
+        expand(config(rdataset(PARENT, recursive=True), rdataset(mid, recursive=True)))
+        assert [c[-1] for c in zfs_world.name_lists()] == [PARENT, mid]
+
+    def test_an_enabled_recursive_descendant_without_remote_ends_the_walk(self, zfs_world):
+        # `remote: []` on a recursive entry means "snapshot locally, send nothing": its subtree is
+        # not the outer parent's to send.
+        mid = f'{PARENT}/mid'
+        add_tree(zfs_world, PARENT, f'{PARENT}/top', mid, f'{mid}/x', f'{mid}/x/y')
+        cfg = config(rdataset(PARENT, recursive=True), DatasetConfig(name=mid, recursive=True))
+        _, exp = expand(cfg)
+        assert child_names(exp) == [f'{PARENT}/top']
+
+    def test_an_enabled_non_recursive_descendant_without_remote_is_passed_through(self, zfs_world):
+        mid = f'{PARENT}/mid'
+        add_tree(zfs_world, PARENT, mid, f'{mid}/x')
+        cfg = config(rdataset(PARENT, recursive=True), DatasetConfig(name=mid))
+        _, exp = expand(cfg)
+        assert {c.name: c.expanded_from for c in exp.children} == {f'{mid}/x': PARENT}
+
+    def test_an_explicitly_configured_descendant_is_not_expanded(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', f'{PARENT}/b')
+        _, exp = expand(config(rdataset(PARENT, recursive=True), dataset(f'{PARENT}/a')))
+        assert child_names(exp) == [f'{PARENT}/b']
+
+    def test_a_configured_non_recursive_descendants_children_expand_from_the_recursive_ancestor(
+        self, zfs_world,
+    ):
+        a = f'{PARENT}/a'
+        add_tree(zfs_world, PARENT, a, f'{a}/x', f'{a}/x/y')
+        cfg = config(
+            rdataset(PARENT, ['other', DEST], recursive=True),
+            rdataset(a, [DEST]),                           # enabled, NOT recursive, its own remote
+            destinations={DEST: Destination(url='https://h:8443'), 'other': Destination(url='https://o:8443')},
+        )
+        _, exp = expand(cfg)
+        by_name = {c.name: c for c in exp.children}
+        assert sorted(by_name) == [f'{a}/x', f'{a}/x/y'], 'a itself is explicit, so not expanded'
+        for child in by_name.values():
+            assert child.expanded_from == PARENT
+            # the ancestor's destinations and frequency, not the explicit entry's
+            assert [r.destination for r in child.config.remote] == ['other', DEST]
+
+    def test_a_disabled_descendant_excludes_its_whole_subtree(self, zfs_world):
+        off, ok = f'{PARENT}/off', f'{PARENT}/ok'
+        add_tree(zfs_world, PARENT, off, f'{off}/x', f'{off}/x/y', f'{off}/z', ok, f'{ok}/w')
+        cfg = config(rdataset(PARENT, recursive=True), dataclasses.replace(dataset(off), enabled=False))
+        _, exp = expand(cfg)
+        assert sorted(child_names(exp)) == [ok, f'{ok}/w']
+
+    def test_a_disabled_recursive_descendant_excludes_its_subtree_too(self, zfs_world):
+        off = f'{PARENT}/off'
+        add_tree(zfs_world, PARENT, off, f'{off}/x')
+        cfg = config(rdataset(PARENT, recursive=True), dataclasses.replace(dataset(off, recursive=True), enabled=False))
+        _, exp = expand(cfg)
+        assert child_names(exp) == []
+
+    def test_an_enabled_root_below_a_disabled_descendant_still_expands_its_own_subtree(self, zfs_world):
+        # Explicit configuration wins: the enabled recursive entry is its own root even inside an
+        # excluded subtree; what the disabled entry excludes is what only the outer root would add.
+        off, inner = f'{PARENT}/off', f'{PARENT}/off/inner'
+        add_tree(zfs_world, PARENT, off, f'{off}/x', inner, f'{inner}/leaf')
+        cfg = config(
+            rdataset(PARENT, recursive=True),
+            dataclasses.replace(dataset(off), enabled=False),
+            rdataset(inner, recursive=True),
+        )
+        _, exp = expand(cfg)
+        assert {c.name: c.expanded_from for c in exp.children} == {f'{inner}/leaf': inner}
+
+    def test_a_configured_dataset_is_excluded_even_when_listed_by_two_roots(self, zfs_world):
+        mid = f'{PARENT}/mid'
+        add_tree(zfs_world, PARENT, mid, f'{mid}/x')
+        _, exp = expand(config(rdataset(PARENT, recursive=True), rdataset(mid, recursive=True)))
+        assert child_names(exp) == [f'{mid}/x'], 'mid is configured; x is mid\'s, once'
+
+
+@pytest.mark.unit
+class TestExpandSkippedNames:
+    def test_names_out_of_scope_or_with_snapshot_or_bookmark_marks_are_skipped(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/good')
+        zfs_world.list_extra[PARENT] = [
+            (f'{PARENT}2/lookalike', 'filesystem'),        # shares the parent's prefix, not its subtree
+            ('pool/other/x', 'filesystem'),
+            (f'{PARENT}/s@snap', 'filesystem'),
+            (f'{PARENT}/b#mark', 'filesystem'),
+            (f'{PARENT}/r%recv', 'filesystem'),
+        ]
+        _, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert child_names(exp) == [f'{PARENT}/good']
+        assert exp.failed == {}
+
+    def test_a_name_listed_twice_is_never_two_children(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/good', f'{PARENT}/other')
+        zfs_world.list_extra[PARENT] = [(f'{PARENT}/good', 'filesystem'), (PARENT, 'filesystem')]
+        _, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert child_names(exp).count(f'{PARENT}/good') <= 1      # the reader fails closed on a duplicate
+        assert PARENT not in child_names(exp) and f'{PARENT}/other' in child_names(exp)
+
+    def test_a_name_libzfseasy_cannot_represent_is_skipped(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, f'{PARENT}/good')
+        zfs_world.list_extra[PARENT] = [(f'{PARENT}/bad\x01name', 'filesystem'), (f'{PARENT}/caf\u00e9', 'filesystem'), (f'{PARENT}/new\tline', 'filesystem')]
+        with caplog.at_level(logging.WARNING):
+            _, exp = expand(config(dataset(PARENT, recursive=True)))
+        # ascii() messages, and no surrogate in the fake's output: a lone surrogate in a failure report
+        # (or in a captured log line) takes an xdist worker down
+        assert ascii(child_names(exp)) == ascii([f'{PARENT}/good']), ascii(child_names(exp))
+        assert exp.failed == {}, ascii(exp.failed)
+
+    def test_a_non_filesystem_row_is_not_a_child(self, zfs_world):
+        add_tree(zfs_world, PARENT)
+        zfs_world.list_extra[PARENT] = [(f'{PARENT}/snapshot-typed', 'snapshot')]
+        _, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert child_names(exp) == []
+
+
+@pytest.mark.unit
+class TestExpandReceiveTargets:
+    """A name at or below a receive target is never a source (validation refuses such a config; this
+    is the defence in depth): one ERROR per root and target and episode, and its subtree is skipped."""
+
+    TARGET_DS = f'{PARENT}/bk'
+
+    def tree(self, world):
+        add_tree(world, PARENT, f'{PARENT}/ok', self.TARGET_DS, f'{self.TARGET_DS}/c1',
+                 f'{self.TARGET_DS}/c1/x', f'{PARENT}/bkx')
+
+    def server_config(self, **kw):
+        return config(rdataset(PARENT, recursive=True),
+                      remote_backup=RemoteServerConfig(target_dataset=self.TARGET_DS + kw.pop('slash', ''), **kw))
+
+    def local_config(self, name='vault', url=None):
+        dests = {DEST: Destination(url='https://h:8443'), name: Destination(url=url or f'zfs:{self.TARGET_DS}')}
+        return config(rdataset(PARENT, recursive=True), destinations=dests)
+
+    @pytest.mark.parametrize('flavour', ['server', 'server-trailing-slash', 'local'])
+    def test_the_target_and_everything_below_it_is_skipped_with_one_error(self, zfs_world, caplog, flavour):
+        self.tree(zfs_world)
+        cfg = {'server': lambda: self.server_config(),
+               'server-trailing-slash': lambda: self.server_config(slash='/'),
+               'local': lambda: self.local_config()}[flavour]()
+        manager = DatasetManager(cfg)
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            exp = manager.expand_recursive()
+        assert sorted(child_names(exp)) == [f'{PARENT}/bkx', f'{PARENT}/ok'], 'the lookalike name is no target'
+        (error,) = records_at(caplog, logging.ERROR)
+        assert self.TARGET_DS in error and 'receives copies' in error and PARENT in error
+
+    def test_the_error_is_once_per_episode_and_comes_back_with_a_new_one(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        manager = DatasetManager(self.server_config())
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            for _ in range(3):
+                manager.expand_recursive()
+            assert len(records_at(caplog, logging.ERROR)) == 1
+            for name in [n for n in zfs_world.datasets if n == self.TARGET_DS or n.startswith(self.TARGET_DS + '/')]:
+                del zfs_world.datasets[name]               # the offending datasets are gone: episode over
+            manager.expand_recursive()
+            assert len(records_at(caplog, logging.ERROR)) == 1
+            zfs_world.add(self.TARGET_DS)                  # and back
+            manager.expand_recursive()
+        assert len(records_at(caplog, logging.ERROR)) == 2
+
+    def test_a_disabled_server_target_is_still_a_receive_target(self, zfs_world, caplog):
+        # a former server still holds other clients' received copies there
+        self.tree(zfs_world)
+        manager = DatasetManager(self.server_config(enabled=False))
+        with caplog.at_level(logging.ERROR, logger=BACKUP_LOGGER):
+            exp = manager.expand_recursive()
+        assert sorted(child_names(exp)) == [f'{PARENT}/bkx', f'{PARENT}/ok']
+        (error,) = records_at(caplog, logging.ERROR)
+        assert self.TARGET_DS in error and 'receives copies' in error
+
+    def test_a_target_elsewhere_changes_nothing(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        cfg = self.local_config(url='zfs:other/vault')
+        with caplog.at_level(logging.ERROR, logger=BACKUP_LOGGER):
+            exp = DatasetManager(cfg).expand_recursive()
+        assert len(exp.children) == 5 and records_at(caplog, logging.ERROR) == []
+
+    def test_one_error_per_target_when_there_are_two(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        zfs_world.add(f'{PARENT}/vault2')
+        cfg = config(rdataset(PARENT, recursive=True),
+                     destinations={DEST: Destination(url='https://h:8443'),
+                                   'a': Destination(url=f'zfs:{self.TARGET_DS}'),
+                                   'b': Destination(url=f'zfs:{PARENT}/vault2')},
+                     )
+        with caplog.at_level(logging.ERROR, logger=BACKUP_LOGGER):
+            DatasetManager(cfg).expand_recursive()
+        assert len(records_at(caplog, logging.ERROR)) == 2
+
+
+@pytest.mark.unit
+class TestExpandBackupCopies:
+    """A dataset with a LOCAL `org.zfsbackup:client_id` or `source_dataset` is a backup copy: it and its
+    whole subtree are never sources (one value-free `zfs get -r -s local` per parent, name/property/source)."""
+
+    CID, SRC = 'org.zfsbackup:client_id', 'org.zfsbackup:source_dataset'
+    COPY = f'{PARENT}/copy'
+
+    def tree(self, world):
+        add_tree(world, PARENT, f'{PARENT}/ok', self.COPY, f'{self.COPY}/c1', f'{self.COPY}/c1/x', f'{PARENT}/copyx')
+
+    def errors(self, caplog):
+        return records_at(caplog, logging.ERROR)
+
+    @pytest.mark.parametrize('prop', [CID, SRC])
+    def test_a_local_copy_marker_skips_it_and_its_whole_subtree_with_one_error(self, zfs_world, caplog, prop):
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, prop, 'whatever')
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            exp = manager.expand_recursive()
+        assert sorted(child_names(exp)) == [f'{PARENT}/copyx', f'{PARENT}/ok'], 'a prefix lookalike is no copy'
+        (error,) = self.errors(caplog)
+        assert self.COPY in error and 'backup copy' in error and f'zfs inherit {self.CID} {self.COPY}' in error
+
+    def test_the_marker_deep_in_the_tree_skips_its_subtree_only(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        zfs_world.set_prop(f'{self.COPY}/c1', self.CID, 'x')
+        exp = DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()
+        assert sorted(child_names(exp)) == sorted([f'{PARENT}/ok', self.COPY, f'{PARENT}/copyx'])
+
+    def test_one_error_per_topmost_copy_root_however_many_nested_markers(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        for name in (self.COPY, f'{self.COPY}/c1', f'{self.COPY}/c1/x'):
+            zfs_world.set_prop(name, self.CID, 'x')
+        zfs_world.set_prop(f'{PARENT}/ok', self.SRC, 'y')                   # a second, separate copy root
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            for _ in range(3):
+                exp = manager.expand_recursive()
+        assert sorted(child_names(exp)) == [f'{PARENT}/copyx']
+        assert len(self.errors(caplog)) == 2
+        assert any(f'{self.COPY} carries' in e for e in self.errors(caplog))
+        assert not any(f'{self.COPY}/c1 carries' in e for e in self.errors(caplog))
+
+    def test_a_copy_root_equal_to_the_parent_skips_every_child(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        zfs_world.set_prop(PARENT, self.CID, 'x')
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            exp = manager.expand_recursive()
+        assert exp.children == [] and exp.failed == {}
+        (error,) = self.errors(caplog)
+        assert error.startswith(f'{PARENT} carries')
+
+    def test_other_zfsbackup_properties_do_not_make_a_copy(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        for prop in ('org.zfsbackup:config', 'org.zfsbackup:anchor.off', 'org.zfsbackup:inflight.off',
+                     'org.zfsbackup:client_idx', 'com.example:client_id'):
+            zfs_world.set_prop(f'{PARENT}/ok', prop, 'v')
+        with caplog.at_level(logging.ERROR, logger=BACKUP_LOGGER):
+            exp = DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()
+        assert len(exp.children) == 5 and self.errors(caplog) == []
+
+    def test_the_read_asks_for_local_received_and_inherited_and_no_value(self, zfs_world):
+        self.tree(zfs_world)
+        DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()
+        assert zfs_world.name_sources_reads() == [
+            ['get', '-H', '-o', 'name,property,source', '-s', 'local,received,inherited', '-r', '-t',
+             'filesystem,volume', 'all', PARENT]]
+
+    def test_a_replica_with_received_markers_is_never_sent(self, zfs_world, caplog):
+        # what `zfs send -R | zfs receive` leaves: the markers are RECEIVED, and `zfs inherit` cannot clear them
+        self.tree(zfs_world)
+        for prop in (self.CID, self.SRC):
+            zfs_world.received[(self.COPY, prop)] = 'orig'
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            for _ in range(2):
+                exp = manager.expand_recursive()
+        assert sorted(child_names(exp)) == [f'{PARENT}/copyx', f'{PARENT}/ok']
+        (error,) = self.errors(caplog)
+        assert f'{self.COPY} carries a received' in error and 'zfs inherit` (`zfs inherit -S`' in error
+        assert f'zfs rename {self.COPY}' in error
+
+    def test_a_marker_the_child_only_inherits_from_the_copy_root_names_the_copy_root_once(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, self.CID, 'x')                  # c1, x inherit it
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            exp = manager.expand_recursive()
+        assert sorted(child_names(exp)) == [f'{PARENT}/copyx', f'{PARENT}/ok']
+        (error,) = self.errors(caplog)
+        assert error.startswith(f'{self.COPY} carries a local')
+
+    def test_a_parent_inside_a_copy_inherits_the_marker_and_sends_no_descendant(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        zfs_world.add('pool')
+        zfs_world.set_prop('pool', self.CID, 'x')                     # above the parent: the parent inherits it
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            exp = manager.expand_recursive()
+        assert exp.children == [] and exp.failed == {}
+        (error,) = self.errors(caplog)
+        assert error.startswith(f'{PARENT} itself is inside a backup copy') and 'inherits' in error
+        assert 'none of its descendants is sent' in error
+
+    def test_a_received_marker_above_the_parent_counts_too(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        zfs_world.add('pool')
+        zfs_world.received[('pool', self.SRC)] = 'x'
+        with caplog.at_level(logging.ERROR, logger=BACKUP_LOGGER):
+            exp = DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()
+        assert exp.children == [] and len(self.errors(caplog)) == 1
+
+    def test_copy_roots_maps_each_name_to_its_source_and_local_or_received_beats_inherited(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.set_prop(PARENT, self.CID, 'x')                       # local on the parent; children inherit it
+        zfs_world.set_prop(self.COPY, self.SRC, 'y')                    # local on a child, which also inherits
+        zfs_world.received[(f'{PARENT}/ok', self.SRC)] = 'z'
+        roots = DatasetManager._copy_roots(PARENT)
+        assert roots[PARENT] == 'local' and roots[self.COPY] == 'local' and roots[f'{PARENT}/ok'] == 'received'
+        assert roots[f'{self.COPY}/c1'] == f'inherited from {PARENT}'
+        assert roots[f'{self.COPY}/c1/x'] == f'inherited from {PARENT}'
+
+    def test_copy_roots_ignores_every_other_property(self, zfs_world):
+        self.tree(zfs_world)
+        for prop in ('org.zfsbackup:config', 'org.zfsbackup:anchor.off', 'com.example:client_id'):
+            zfs_world.set_prop(self.COPY, prop, 'v')
+            zfs_world.received[(f'{PARENT}/ok', prop)] = 'v'
+        assert DatasetManager._copy_roots(PARENT) == {}
+
+    @pytest.mark.parametrize('source, needles', [
+        ('local', ['carries a local', 'zfs inherit org.zfsbackup:client_id pool/data/copy', 'zfs rename']),
+        ('received', ['carries a received', 'is not removed by `zfs inherit`', 'move the copy out of pool/data']),
+        ('inherited from pool', ['itself is inside a backup copy', 'inherits', 'from pool', 'none of its descendants is sent',
+                                 'works only for local values']),
+    ])
+    def test_the_three_wordings(self, source, needles):
+        message = DatasetManager._copy_root_message(PARENT, self.COPY if source != 'inherited from pool' else PARENT, source)
+        for needle in needles:
+            assert needle in message, (needle, message)
+        others = {'local': 'received', 'received': 'local'}
+        if source in others:
+            assert f'carries a {others[source]}' not in message
+
+    def test_the_episode_ends_when_the_marker_goes_and_a_new_one_is_announced(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            zfs_world.set_prop(self.COPY, self.CID, 'x')
+            manager.expand_recursive()
+            assert len(self.errors(caplog)) == 1
+            del zfs_world.props[(self.COPY, self.CID)]
+            exp = manager.expand_recursive()
+            assert self.COPY in child_names(exp), 'cleared: it is a source again'
+            zfs_world.set_prop(self.COPY, self.CID, 'x')
+            manager.expand_recursive()
+        assert len(self.errors(caplog)) == 2
+
+    def test_a_failing_copy_read_fails_the_parents_expansion(self, zfs_world, caplog):
+        self.tree(zfs_world)
+        zfs_world.copy_read_failures[PARENT] = 'pool I/O is currently suspended'
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            for _ in range(3):
+                exp = manager.expand_recursive()
+            assert exp.children == [] and list(exp.failed) == [PARENT]
+            assert 'i/o is currently suspended' in exp.failed[PARENT].lower()
+            (error,) = self.errors(caplog)
+            assert 'Cannot list the descendants' in error
+            del zfs_world.copy_read_failures[PARENT]
+            exp = manager.expand_recursive()
+        assert exp.failed == {} and len(exp.children) == 5, 'never expanded without the read, always with it'
+        (info,) = records_at(caplog, logging.INFO)
+        assert 'listed again' in info
+
+    def test_the_read_follows_the_listing_so_a_failed_listing_never_reads(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.list_failures[PARENT] = 'boom'
+        DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()
+        assert zfs_world.name_sources_reads() == []
+
+    def test_one_failing_parent_does_not_stop_the_next_one(self, zfs_world):
+        self.tree(zfs_world)
+        add_tree(zfs_world, 'pool/other', 'pool/other/b')
+        zfs_world.copy_read_failures[PARENT] = 'boom'
+        exp = DatasetManager(config(dataset(PARENT, recursive=True), dataset('pool/other', recursive=True))).expand_recursive()
+        assert child_names(exp) == ['pool/other/b'] and list(exp.failed) == [PARENT]
+
+
+@pytest.mark.unit
+class TestExpandedConfigIsOwnedByTheChild:
+    """Each child owns copies of the parent's `retention_rules` and `remote` (mutable dataclasses)."""
+
+    def make(self, world):
+        add_tree(world, PARENT, A, f'{PARENT}/b')
+        parent = DatasetConfig(
+            name=PARENT, recursive=True, frequency=Duration('1h'),
+            retention_rules=[RetentionRule(Duration('1h'), Duration('2d'))],
+            remote=[RemoteDatasetConfig(destination=DEST, retention_rules=[RetentionRule(Duration('1d'), Duration('9d'))])])
+        _, exp = expand(config(parent))
+        return parent, {c.name: c for c in exp.children}
+
+    def test_the_lists_and_their_elements_are_not_shared(self, zfs_world):
+        parent, kids = self.make(zfs_world)
+        a, b = kids[A], kids[f'{PARENT}/b']
+        assert a.config.retention_rules == parent.retention_rules and a.config.remote == parent.remote
+        for mine, theirs in ((a.config.retention_rules, parent.retention_rules),
+                             (a.config.remote, parent.remote),
+                             (a.config.remote[0].retention_rules, parent.remote[0].retention_rules),
+                             (a.config.retention_rules, b.config.retention_rules)):
+            assert mine is not theirs and mine[0] is not theirs[0]
+
+    def test_changing_a_child_leaves_the_parent_and_its_siblings_alone(self, zfs_world):
+        parent, kids = self.make(zfs_world)
+        a, b = kids[A], kids[f'{PARENT}/b']
+        a.config.retention_rules.append(RetentionRule(Duration('2d'), Duration('3d')))
+        a.config.retention_rules[0].keep_for = Duration('99d')
+        a.config.remote.append(RemoteDatasetConfig(destination='x'))
+        a.config.remote[0].retention_rules.clear()
+        a.config.remote[0].frequency = Duration('5m')
+        assert len(parent.retention_rules) == 1 and parent.retention_rules[0].keep_for == Duration('2d')
+        assert [r.destination for r in parent.remote] == [DEST] and len(parent.remote[0].retention_rules) == 1
+        assert parent.remote[0].frequency is None
+        assert len(b.config.retention_rules) == 1 and len(b.config.remote[0].retention_rules) == 1
+
+
+@pytest.mark.unit
+class TestExpandDiscoveryFailure:
+    def test_a_failing_listing_is_reported_in_failed_and_nothing_is_raised(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        zfs_world.list_failures[PARENT] = 'cannot open: pool I/O is currently suspended'
+        manager, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert exp.children == []
+        assert list(exp.failed) == [PARENT] and 'pool I/O is currently suspended' in exp.failed[PARENT]
+        assert [d.name for d in manager.datasets] == [PARENT], 'the parent itself is unaffected'
+
+    def test_error_once_per_episode_info_on_recovery_and_a_new_episode(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
+            for _ in range(3):
+                assert manager.expand_recursive().failed
+            (error,) = records_at(caplog, logging.ERROR)
+            assert PARENT in error and 'not sent until this passes' in error
+            assert records_at(caplog, logging.INFO) == []
+
+            del zfs_world.list_failures[PARENT]
+            exp = manager.expand_recursive()
+            assert child_names(exp) == [f'{PARENT}/a'] and exp.failed == {}
+            (info,) = records_at(caplog, logging.INFO)
+            assert PARENT in info and 'listed again' in info
+            manager.expand_recursive()
+            assert len(records_at(caplog, logging.INFO)) == 1, 'INFO once'
+
+            zfs_world.list_failures[PARENT] = 'again'
+            manager.expand_recursive()
+        assert len(records_at(caplog, logging.ERROR)) == 2, 'a new episode is announced again'
+
+    def test_one_failing_parent_does_not_hide_another_ones_children(self, zfs_world):
+        other = 'pool/other'
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', other, f'{other}/b')
+        zfs_world.list_failures[PARENT] = 'boom'
+        _, exp = expand(config(dataset(PARENT, recursive=True), dataset(other, recursive=True)))
+        assert child_names(exp) == [f'{other}/b'] and list(exp.failed) == [PARENT]
+
+    def test_a_missing_parent_is_a_failed_discovery_not_an_empty_one(self, zfs_world):
+        _, exp = expand(config(dataset(PARENT, recursive=True)))        # the world has no PARENT at all
+        assert exp.children == [] and list(exp.failed) == [PARENT]
+
+    def test_should_stop_true_from_the_start_lists_nothing(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        _, exp = expand(config(dataset(PARENT, recursive=True)), should_stop=lambda: True)
+        assert exp == Expansion([], {}) and zfs_world.calls == []
+
+    def test_should_stop_during_the_expansion_gives_a_partial_result(self, zfs_world):
+        other = 'pool/other'
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', other, f'{other}/b')
+        asked = []
+        def stop_after_first():
+            asked.append(1)
+            return len(asked) > 1
+        _, exp = expand(config(dataset(PARENT, recursive=True), dataset(other, recursive=True)), stop_after_first)
+        assert child_names(exp) == [f'{PARENT}/a'] and exp.failed == {}
+        assert [c[-1] for c in zfs_world.name_lists()] == [PARENT], 'checked before each parent'
+
+    def test_a_stopped_pass_does_not_forget_a_failing_parent(self, zfs_world, caplog):
+        other = 'pool/other'
+        add_tree(zfs_world, other, f'{other}/b')
+        zfs_world.list_failures[PARENT] = 'boom'
+        zfs_world.add(PARENT)
+        manager = DatasetManager(config(dataset(PARENT, recursive=True), dataset(other, recursive=True)))
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            manager.expand_recursive()
+            manager.expand_recursive(should_stop=lambda: True)        # reaches nobody
+            manager.expand_recursive()
+        assert len(records_at(caplog, logging.ERROR)) == 1
+
+
+@pytest.mark.unit
+class TestExpandStampedConfig:
+    """`dataclasses.replace(parent_cfg, name=child, recursive=False)`, per destination."""
+
+    @staticmethod
+    def parent_config():
+        rules = [RetentionRule(Duration('1h'), Duration('2d')), RetentionRule(Duration('1d'), Duration('30d'))]
+        override = [RetentionRule(Duration('1d'), Duration('365d'))]
+        return DatasetConfig(
+            name=PARENT, recursive=True, frequency=Duration('30m'), retention_rules=rules,
+            remote=[RemoteDatasetConfig(destination='off', retention_rules=override),
+                    RemoteDatasetConfig(destination='second', frequency=Duration('6h'), raw=True)],
+        )
+
+    def make(self, world):
+        add_tree(world, PARENT, f'{PARENT}/a', f'{PARENT}/a/b')
+        parent = self.parent_config()
+        cfg = config(parent, destinations={'off': Destination(url='https://h:8443'),
+                                           'second': Destination(url='https://s:8443')})
+        _, exp = expand(cfg)
+        return parent, {c.name: c for c in exp.children}
+
+    def test_the_child_config_is_the_parents_with_its_own_name_and_no_recursion(self, zfs_world):
+        parent, children = self.make(zfs_world)
+        for name, child in children.items():
+            assert child.config == dataclasses.replace(parent, name=name, recursive=False)
+            assert child.config.name == name and child.config.recursive is False and child.config.enabled
+        assert parent.recursive is True and parent.name == PARENT, 'the parent is untouched'
+
+    def test_the_property_stamped_for_each_destination(self, zfs_world):
+        parent, children = self.make(zfs_world)
+        child = children[f'{PARENT}/a/b']
+        off, second = decode(child.config.to_property('off')), decode(child.config.to_property('second'))
+        assert off['name'] == second['name'] == f'{PARENT}/a/b'
+        assert off['recursive'] is False and second['recursive'] is False
+        assert off['frequency'] == second['frequency'] == 1800.0
+        # the destination's own override replaces the dataset-level set; the other inherits it
+        assert off['retention_rules'] == [{'age': 86400.0, 'keep_for': 365 * 86400.0}]
+        assert second['retention_rules'] == [{'age': 3600.0, 'keep_for': 2 * 86400.0},
+                                             {'age': 86400.0, 'keep_for': 30 * 86400.0}]
+        assert off['remote'] == second['remote'] == [{'destination': 'off', 'frequency': None},
+                                                      {'destination': 'second', 'frequency': 21600.0}]
+
+    def test_each_destinations_frequency_and_raw_are_the_parents(self, zfs_world):
+        _, children = self.make(zfs_world)
+        remotes = children[f'{PARENT}/a'].config.remote
+        assert [(r.destination, r.frequency, r.raw) for r in remotes] == [
+            ('off', None, None), ('second', Duration('6h'), True)]
+
+    def test_the_stamp_equals_what_a_configured_child_with_the_same_settings_would_carry(self, zfs_world):
+        parent, children = self.make(zfs_world)
+        twin = dataclasses.replace(parent, name=f'{PARENT}/a', recursive=False)
+        for dest in ('off', 'second', None):
+            assert children[f'{PARENT}/a'].config.to_property(dest) == twin.to_property(dest)
+
+
+@pytest.mark.unit
+class TestExpandedChildrenAreOrdinary:
+    def test_a_clone_is_an_ordinary_child_and_origin_is_not_read(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/orig', f'{PARENT}/clone')
+        _, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert sorted(child_names(exp)) == [f'{PARENT}/clone', f'{PARENT}/orig']
+        assert [c[0] for c in zfs_world.calls] == ['list', 'get'], 'the listing and the value-free copy read only'
+        assert 'origin' not in ' '.join(' '.join(c) for c in zfs_world.calls)
+
+    def test_a_child_without_snapshots_is_still_a_child(self, zfs_world):
+        add_tree(zfs_world, PARENT)
+        add_tree(zfs_world, f'{PARENT}/new', snaps=False)
+        manager, exp = expand(config(dataset(PARENT, recursive=True)))
+        assert child_names(exp) == [f'{PARENT}/new']
+        assert manager.list_snapshots(exp.children[0]) == []
+
+    def test_a_vanished_child_is_simply_not_listed_again(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', f'{PARENT}/b')
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        assert sorted(child_names(manager.expand_recursive())) == [f'{PARENT}/a', f'{PARENT}/b']
+        del zfs_world.datasets[f'{PARENT}/b']
+        assert child_names(manager.expand_recursive()) == [f'{PARENT}/a']
+
+    def test_a_renamed_child_appears_under_its_new_name_only(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        manager = DatasetManager(config(dataset(PARENT, recursive=True)))
+        manager.expand_recursive()
+        zfs_world.datasets[f'{PARENT}/a2'] = zfs_world.datasets.pop(f'{PARENT}/a')
+        zfs_world.snaps[f'{PARENT}/a2'] = zfs_world.snaps.pop(f'{PARENT}/a')
+        exp = manager.expand_recursive()
+        assert child_names(exp) == [f'{PARENT}/a2']
+        assert exp.children[0].expanded_from == PARENT
+
+
+# =============================================================================================
+# A2: the remote worker
+# =============================================================================================
+
+from zfsbackup import health  # noqa: E402
+from zfsbackup.health import StatusWriter, ensure_status_dir  # noqa: E402
+from zfsbackup.workers import PruningWorker, SnapshotWorker  # noqa: E402
+
+
+class ScriptedSender(RecordingSender):
+    """`RecordingSender` whose answer per `(dataset, destination)` is scripted (default: success)
+    and may be changed between cycles; `raises` makes a pair's `backup_dataset` raise. With a
+    `world`, a success leaves the anchor a real send leaves."""
+
+    def __init__(self, world=None):
+        super().__init__(world)
+        self.outcomes: Dict[Tuple[str, str], bool] = {}
+        self.raises: Set[Tuple[str, str]] = set()
+        #: (`confirmed`, from `RecordingSender`: the pairs a real sender has confirmed,
+        #: `ChainSender.copy_confirmed`)
+        #: pairs whose True does NOT confirm (nothing to send, a copy that is not there ...)
+        self.unconfirmed_success: Set[Tuple[str, str]] = set()
+        self.confirm_calls: List[Tuple[str, str]] = []
+        self.confirm_raises = False
+
+    def backup_dataset(self, dsi, remote_cfg, should_stop=None):
+        key = (dsi.name, remote_cfg.destination)
+        self.attempts.append(key)
+        if key in self.raises:
+            raise RuntimeError('boom')
+        done = self.outcomes.get(key, True)
+        if done:
+            self._acknowledged(*key)
+            if key not in self.unconfirmed_success:
+                self.confirmed.add(key)
+        return done
+
+    def copy_confirmed(self, dataset, destination):
+        self.confirm_calls.append((dataset, destination))
+        if self.confirm_raises:
+            raise RuntimeError('boom')
+        return (dataset, destination) in self.confirmed
+
+
+@pytest.fixture
+def sdir(tmp_path):
+    (tmp_path / 'config.db').write_bytes(b'')
+    directory = tmp_path / 'config.db.status'
+    ensure_status_dir(directory)
+    return directory
+
+
+def make_worker(cfg, sender=None, status_dir=None, local=None):
+    """A `RemoteBackupWorker` over `sender` (and `local` for `zfs:` destinations), its status
+    writer open when `status_dir` is given -- everything `run()` sets up before the first cycle."""
+    worker = RemoteBackupWorker(cfg, StopFlag(), status_dir=status_dir)
+    worker._remote_manager = sender if sender is not None else ScriptedSender()
+    worker._local_manager = local
+    worker._status = worker._open_status(cfg, logging.getLogger('test'))
+    return worker
+
+
+def cycle(worker, manager):
+    """One pass of `BaseWorker.run`'s loop (list, retain, process every dataset), -> the list."""
+    datasets = worker._get_datasets(manager)
+    if worker._status is not None:
+        keep = worker._status_keys(datasets)
+        if keep is not None:
+            worker._status.retain(keep)
+    for dsi in datasets:
+        worker._process_dataset(manager, dsi)
+    return datasets
+
+
+def status_record(worker, dataset, destination, kind=health.KIND_SEND):
+    """The record the worker's status writer holds for the pair (a lookup over `records`), or None."""
+    return next((r for r in worker._status.records
+                 if (r.kind, r.dataset, r.destination) == (kind, dataset, destination)), None)
+
+
+def worker_warnings(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == WORKER_LOGGER and r.levelno == logging.WARNING]
+
+
+A, AB = f'{PARENT}/a', f'{PARENT}/a/b'
+
+
+@pytest.mark.unit
+class TestA2ListAndOrder:
+    def test_children_join_the_list_after_their_parent_by_depth_then_config_order(self, zfs_world):
+        add_tree(zfs_world, PARENT, A, AB, f'{PARENT}/c', 'pool/other', 'pool/other/z')
+        cfg = config(rdataset(PARENT, recursive=True), rdataset('pool/other'))
+        manager = DatasetManager(cfg)
+        datasets = make_worker(cfg)._get_datasets(manager)
+        depths = [d.name.count('/') for d in datasets]
+        assert depths == sorted(depths)
+        assert [d.name for d in datasets][:2] == [PARENT, 'pool/other'], 'config order within a depth'
+        assert [d.name for d in datasets if d.name.count('/') == 2] == [A, f'{PARENT}/c'], 'listing order'
+        assert datasets[-1].name == AB
+        names = [d.name for d in datasets]
+        for name in names:
+            for other in names:
+                if name.startswith(other + '/'):
+                    assert names.index(other) < names.index(name), 'an ancestor is always before its descendant'
+        by_name = {d.name: d for d in datasets}
+        assert by_name[PARENT].expanded_from is None and by_name[AB].expanded_from == PARENT
+        assert by_name['pool/other'].expanded_from is None
+        assert 'pool/other/z' not in names, 'pool/other is not recursive'
+
+    def test_a_cycle_attempts_every_pair_parents_first(self, zfs_world):
+        add_tree(zfs_world, PARENT, A, AB, f'{PARENT}/c')
+        sender = ScriptedSender(zfs_world)
+        cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
+                     destinations={'off': Destination(url='https://h:8443'),
+                                   'second': Destination(url='https://s:8443')})
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert sender.attempts == [
+            (PARENT, 'off'), (PARENT, 'second'), (A, 'off'), (A, 'second'),
+            (f'{PARENT}/c', 'off'), (f'{PARENT}/c', 'second'), (AB, 'off'), (AB, 'second')]
+
+    def test_through_run_one_cycle_attempts_the_children(self, zfs_world, mocker):
+        # The same through `BaseWorker.run` (the A0 scenario) with a two-level tree.
+        add_tree(zfs_world, PARENT, A, AB)
+        sender = TestDescendantsOfARecursiveDataset.one_cycle(
+            config(dataset(PARENT, recursive=True)), mocker, zfs_world)
+        assert sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)]
+
+    def test_the_snapshot_and_pruning_workers_never_see_a_child(self, zfs_world, mocker):
+        add_tree(zfs_world, PARENT, A, AB, 'pool/other')
+        cfg = config(rdataset(PARENT, recursive=True), dataset('pool/other'))
+        for cls in (SnapshotWorker, PruningWorker):
+            worker = cls(cfg, StopFlag())
+            seen = []
+            mocker.patch.object(worker, '_before_loop')
+            mocker.patch.object(worker, '_process_dataset', side_effect=lambda m, d: seen.append(d.name))
+            mocker.patch.object(worker, '_wait', return_value=ExitReason.STOP)
+            worker.run()
+            assert seen == [PARENT, 'pool/other'], cls.__name__
+            assert all(getattr(d, 'expanded_from', None) is None for d in worker._get_datasets(DatasetManager(cfg)))
+        assert zfs_world.name_lists() == [], 'only the remote worker enumerates descendants'
+
+    def test_the_manager_itself_never_holds_a_child(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        cycle(make_worker(cfg), manager)
+        assert [d.name for d in manager.datasets] == [PARENT]
+
+    def test_a_failed_discovery_still_sends_the_parent(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, A)
+        zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
+        sender = ScriptedSender(zfs_world)
+        cfg = config(rdataset(PARENT, recursive=True))
+        worker = make_worker(cfg, sender)
+        with caplog.at_level(logging.INFO, logger=BACKUP_LOGGER):
+            cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST)]
+        assert list(worker._expansion_failed) == [PARENT]
+        assert len(records_at(caplog, logging.ERROR)) == 1
+
+    def test_an_expansion_that_raises_is_logged_and_the_parent_is_still_sent(self, zfs_world, mocker, caplog):
+        add_tree(zfs_world, PARENT, A)
+        sender = ScriptedSender(zfs_world)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        mocker.patch.object(manager, 'expand_recursive', side_effect=RuntimeError('boom'))
+        with caplog.at_level(logging.ERROR, logger=WORKER_LOGGER):
+            cycle(make_worker(cfg, sender), manager)
+        assert sender.attempts == [(PARENT, DEST)]
+        assert any('could not expand' in r.getMessage() for r in caplog.records)
+
+    def test_a_pending_stop_lists_no_descendants(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        worker = make_worker(cfg)
+        worker.stop_event.set()
+        assert [d.name for d in worker._get_datasets(DatasetManager(cfg))] == [PARENT]
+        assert zfs_world.name_lists() == [] and worker._expansion_failed == {}
+
+
+@pytest.mark.unit
+class TestA2ParentFirst:
+    """R-2 on the serial worker: an EXPANDED pair waits until the nearest ancestor pair on the same
+    destination has been CONFIRMED in this incarnation (`ChainSender.copy_confirmed`: a negotiate found
+    the copy and the call returned True, or a stream committed). No anchor and no status record is
+    evidence; an unconfirmed ancestor with waiting dependents is DUE whatever its anchor says. WARNING
+    once per (ancestor, destination) with the number of waiting children, per-child lines at DEBUG,
+    INFO when released; nothing recorded for a held pair."""
+
+    @pytest.fixture
+    def rig(self, zfs_world, sdir):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        return SimpleNamespace(world=zfs_world, cfg=cfg, sender=sender, manager=DatasetManager(cfg),
+                               worker=make_worker(cfg, sender, sdir), sdir=sdir)
+
+    @staticmethod
+    def newest(world, name):
+        return world.snaps[name][-1]
+
+    @staticmethod
+    def aggregated(caplog):
+        """`[(count, ancestor, destination)]` of the aggregated WARNINGs."""
+        out = []
+        for w in worker_warnings(caplog):
+            m = re.match(r'(\d+) descendants? of (\S+) wait until its copy at (\S+) is confirmed in this run', w)
+            assert m, w
+            out.append((int(m.group(1)), m.group(2), m.group(3)))
+        return sorted(out)
+
+    # -- waiting, and what is logged / recorded --------------------------------------------------
+
+    def test_children_wait_for_a_parent_that_is_not_confirmed(self, rig, caplog):
+        rig.sender.outcomes[(PARENT, DEST)] = False
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            for _ in range(3):
+                cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST)] * 3
+        # one WARNING per (ancestor, destination): `a` waits for the parent, `a/b` for its nearest, `a`
+        assert self.aggregated(caplog) == [(1, PARENT, DEST), (1, A, DEST)]
+        debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG and r.name == WORKER_LOGGER
+                 and 'waiting for' in r.getMessage()]
+        assert f'{A} -> {DEST}: waiting for {PARENT}' in debug and f'{AB} -> {DEST}: waiting for {A}' in debug
+
+    def test_the_warning_counts_the_waiting_descendants_once(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, *[f'{PARENT}/c{i}' for i in range(3)])
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        sender.outcomes[(PARENT, DEST)] = False
+        worker = make_worker(cfg, sender)
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            for _ in range(2):
+                cycle(worker, DatasetManager(cfg))
+        assert self.aggregated(caplog) == [(3, PARENT, DEST)]
+        assert f'3 descendants of {PARENT} wait' in worker_warnings(caplog)[0]
+
+    def test_nothing_is_recorded_for_a_waiting_pair(self, rig):
+        rig.sender.outcomes[(PARENT, DEST)] = False
+        cycle(rig.worker, rig.manager)
+        rig.worker._flush_status(force=True)
+        keys = {r.key for r in health.read_worker_status(rig.sdir, rig.worker.name).records}
+        assert keys == {(health.KIND_SEND, PARENT, DEST)}
+        assert status_record(rig.worker, A, DEST) is None
+        assert status_record(rig.worker, PARENT, DEST).consecutive_failures == 1
+
+    def test_the_parents_confirmation_releases_the_children_in_the_same_cycle(self, rig, caplog):
+        rig.sender.outcomes[(PARENT, DEST)] = False
+        cycle(rig.worker, rig.manager)
+        rig.sender.attempts.clear()
+        rig.sender.outcomes[(PARENT, DEST)] = True
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)]
+        assert worker_warnings(caplog) == []
+        infos = [r.getMessage() for r in caplog.records if r.name == WORKER_LOGGER and r.levelno == logging.INFO
+                 and 'is confirmed at' in r.getMessage()]
+        assert infos == [f'{PARENT} is confirmed at {DEST}: its descendants follow',
+                         f'{A} is confirmed at {DEST}: its descendants follow']
+
+    def test_the_wait_is_announced_again_after_it_ended(self, rig, caplog):
+        rig.sender.outcomes[(PARENT, DEST)] = False
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            cycle(rig.worker, rig.manager)
+            rig.sender.outcomes[(PARENT, DEST)] = True
+            cycle(rig.worker, rig.manager)
+            n = len(self.aggregated(caplog))
+            rig.sender.confirmed.clear()                       # a new incarnation of the sender
+            rig.sender.outcomes[(PARENT, DEST)] = False
+            cycle(rig.worker, rig.manager)
+        assert len(self.aggregated(caplog)) == 2 * n, 'both episodes announced again'
+
+    # -- the evidence: only this incarnation's confirmation -----------------------------------------
+
+    def test_a_status_success_alone_releases_nothing(self, zfs_world, sdir):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        earlier = StatusWriter(sdir, 'remote-backup-worker')
+        earlier.record(health.KIND_SEND, PARENT, DEST, ok=True)
+        earlier.flush(force=True)
+        sender = ScriptedSender()
+        sender.outcomes[(PARENT, DEST)] = False
+        worker = make_worker(cfg, sender, sdir)
+        for _ in range(2):
+            cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST)] * 2
+
+    def test_a_true_return_that_confirmed_nothing_releases_nothing(self, rig):
+        # `backup_dataset` is True for "nothing to send" too; only `copy_confirmed` counts
+        rig.sender.unconfirmed_success.add((PARENT, DEST))
+        cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST)]
+
+    @pytest.mark.parametrize('age', [timedelta(minutes=10), timedelta(hours=5)], ids=['fresh', 'stale'])
+    def test_an_anchor_alone_is_no_evidence_fresh_or_stale(self, rig, age):
+        # the M2 scenario: the anchor names a live snapshot but the copy at this destination may be gone
+        # (URL switched, another client id): the parent is confirmed again before its children go
+        old = stamp(age)
+        rig.world.snaps[PARENT].insert(0, old)
+        rig.world.set_prop(PARENT, ANCHOR, old)
+        rig.sender.outcomes[(PARENT, DEST)] = False
+        cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST)], 'no child follows a parent that failed to confirm'
+
+    def test_a_fresh_anchor_does_not_stop_an_unconfirmed_parent_with_dependents_being_negotiated(self, rig):
+        rig.world.set_prop(PARENT, ANCHOR, self.newest(rig.world, PARENT))      # not due by its anchor
+        cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)], \
+            'forced due, confirmed, and its children follow in the same cycle'
+
+    def test_the_forced_negotiate_happens_once_per_incarnation(self, rig):
+        rig.world.set_prop(PARENT, ANCHOR, self.newest(rig.world, PARENT))
+        for _ in range(3):
+            cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts.count((PARENT, DEST)) == 1, 'confirmed: the anchor decides again'
+
+    def test_the_forced_negotiate_records_an_ok_when_the_copy_was_up_to_date(self, rig):
+        rig.world.set_prop(PARENT, ANCHOR, self.newest(rig.world, PARENT))
+        cycle(rig.worker, rig.manager)
+        record = status_record(rig.worker, PARENT, DEST)
+        assert record.result == health.RESULT_OK and record.consecutive_failures == 0
+
+    def test_a_parent_without_dependents_is_not_forced(self, zfs_world):
+        add_tree(zfs_world, PARENT)                                            # recursive, but no child
+        zfs_world.set_prop(PARENT, ANCHOR, zfs_world.snaps[PARENT][-1])
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert sender.attempts == [], 'fresh anchor, nothing waiting on it: not due'
+
+    def test_a_configured_pair_without_expanded_children_is_not_forced(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        zfs_world.set_prop(A, ANCHOR, zfs_world.snaps[A][-1])
+        cfg = config(dataset(PARENT), dataset(A))
+        sender = ScriptedSender(zfs_world)
+        zfs_world.set_prop(PARENT, ANCHOR, zfs_world.snaps[PARENT][-1])
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert sender.attempts == []
+
+    def test_an_anchor_naming_a_vanished_snapshot_or_unreadable_changes_nothing(self, rig):
+        rig.world.set_prop(PARENT, ANCHOR, stamp(timedelta(minutes=5)))
+        rig.world.unreadable.add((A, ANCHOR))
+        rig.sender.outcomes[(PARENT, DEST)] = False
+        cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST)]
+
+    def test_a_parent_with_no_snapshots_never_confirms_so_its_children_wait(self, zfs_world):
+        add_tree(zfs_world, PARENT, snaps=False)
+        add_tree(zfs_world, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        sender.unconfirmed_success.add((PARENT, DEST))        # backup_dataset says True, nothing is confirmed
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST)]
+
+    def test_a_parent_whose_send_raises_does_not_release_them(self, rig):
+        rig.sender.raises.add((PARENT, DEST))
+        cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST)]
+        assert status_record(rig.worker, PARENT, DEST).result == health.RESULT_ERROR
+
+    def test_without_a_status_directory_the_confirmation_is_the_evidence(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        worker = make_worker(cfg, sender)                                   # no status writer
+        sender.outcomes[(PARENT, DEST)] = False
+        cycle(worker, DatasetManager(cfg))
+        sender.outcomes[(PARENT, DEST)] = True
+        cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST), (PARENT, DEST), (A, DEST)]
+
+    # -- how the confirmation is asked --------------------------------------------------------------
+
+    def test_an_exception_from_the_sender_means_not_confirmed(self, rig):
+        rig.sender.confirm_raises = True
+        cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST)]
+
+    def test_a_non_true_answer_means_not_confirmed(self, rig, mocker):
+        mocker.patch.object(rig.sender, 'copy_confirmed', return_value=mocker.MagicMock())    # truthy, not True
+        cycle(rig.worker, rig.manager)
+        assert rig.sender.attempts == [(PARENT, DEST)]
+
+    def test_a_sender_that_was_not_built_means_not_confirmed(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, ['vault'], recursive=True), destinations={'vault': Destination(url='zfs:bk/vault')})
+        worker = make_worker(cfg, None, local=None)                         # `_local_manager` is None
+        worker._remote_manager = ScriptedSender(zfs_world)
+        manager = DatasetManager(cfg)
+        datasets = worker._get_datasets(manager)
+        child = next(d for d in datasets if d.name == A)
+        assert worker._ancestor_confirmed(manager, datasets[0], 'vault') is False
+        worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
+        assert worker._remote_manager.attempts == []
+
+    def test_the_confirmation_is_read_from_the_manager_that_serves_the_destination(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, ['off', 'vault'], recursive=True),
+                     destinations={'off': Destination(url='https://h:8443'), 'vault': Destination(url='zfs:bk/vault')})
+        remote, local = ScriptedSender(zfs_world), ScriptedSender(zfs_world)
+        worker = make_worker(cfg, remote, local=local)
+        cycle(worker, DatasetManager(cfg))
+        assert {c[1] for c in remote.confirm_calls} == {'off'} and {c[1] for c in local.confirm_calls} == {'vault'}
+
+    # -- dry run -----------------------------------------------------------------------------------
+
+    def dry(self, world):
+        add_tree(world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True), dry_run=True)
+        sender = ScriptedSender()                    # a dry run sends nothing and confirms nothing
+        sender.unconfirmed_success.add((PARENT, DEST))
+        return cfg, sender, make_worker(cfg, sender)
+
+    def test_in_a_dry_run_the_parents_true_return_passes(self, zfs_world):
+        cfg, sender, worker = self.dry(zfs_world)
+        cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST), (A, DEST)]
+
+    def test_in_a_dry_run_a_failed_parent_still_holds_its_children(self, zfs_world):
+        cfg, sender, worker = self.dry(zfs_world)
+        sender.outcomes[(PARENT, DEST)] = False
+        cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST)]
+
+    def test_outside_a_dry_run_a_true_return_is_never_evidence(self, zfs_world):
+        cfg, sender, worker = self.dry(zfs_world)
+        cfg = dataclasses.replace(cfg, dry_run=False)
+        cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST)]
+
+    # -- a child with nothing to send, a child whose listing fails ---------------------------------------
+
+    def test_a_child_without_snapshots_is_not_held_negotiated_or_warned_about(self, zfs_world, sdir, caplog):
+        add_tree(zfs_world, PARENT)
+        add_tree(zfs_world, A, snaps=False)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        sender.outcomes[(PARENT, DEST)] = False
+        worker = make_worker(cfg, sender, sdir)
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST)], 'no backup_dataset (so no negotiate) for the child'
+        assert worker_warnings(caplog) == []
+        record = status_record(worker, A, DEST)
+        assert record is not None and record.result == health.RESULT_OK
+
+    def test_a_child_whose_listing_fails_is_held_silently_and_not_recorded(self, zfs_world, sdir, caplog):
+        add_tree(zfs_world, PARENT, A)
+        zfs_world.snapshot_list_failures.add(A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        sender.outcomes[(PARENT, DEST)] = False
+        worker = make_worker(cfg, sender, sdir)
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            cycle(worker, DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST)]
+        assert worker_warnings(caplog) == [] and status_record(worker, A, DEST) is None
+
+    def test_a_confirmed_parent_releases_a_child_without_snapshots_to_the_sender(self, zfs_world):
+        add_tree(zfs_world, PARENT)
+        add_tree(zfs_world, A, snaps=False)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST), (A, DEST)]
+
+    # -- per destination, local destinations, configured pairs -------------------------------------
+
+    def test_the_wait_is_per_destination(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
+                     destinations={'off': Destination(url='https://h:8443'),
+                                   'second': Destination(url='https://s:8443')})
+        sender = ScriptedSender(zfs_world)
+        sender.outcomes[(PARENT, 'second')] = False
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, 'off'), (PARENT, 'second'), (A, 'off')]
+
+    def test_a_local_destination_waits_the_same_way(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, ['vault'], recursive=True),
+                     destinations={'vault': Destination(url='zfs:bk/vault')})
+        local = ScriptedSender(zfs_world)
+        local.outcomes[(PARENT, 'vault')] = False
+        worker = make_worker(cfg, None, local=local)
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            cycle(worker, DatasetManager(cfg))
+        assert local.attempts == [(PARENT, 'vault')] and worker._remote_manager.attempts == []
+        assert self.aggregated(caplog) == [(1, PARENT, 'vault')]
+        local.outcomes[(PARENT, 'vault')] = True
+        cycle(worker, DatasetManager(cfg))
+        assert local.attempts[-2:] == [(PARENT, 'vault'), (A, 'vault')]
+
+    def test_configured_child_pairs_are_not_held(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, recursive=True), dataset(A))      # `a` is configured, not expanded
+        sender = ScriptedSender(zfs_world)
+        sender.outcomes[(PARENT, DEST)] = False
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert (A, DEST) in sender.attempts, 'a configured pair keeps its pre-recursive behaviour'
+        assert (AB, DEST) in sender.attempts, 'the expanded pair below it waits for a (which confirmed)'
+        assert worker_warnings(caplog) == []
+
+    def test_an_expanded_pair_waits_for_the_nearest_ancestor_pair_even_if_configured(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, recursive=True), dataset(A))
+        sender = ScriptedSender(zfs_world)
+        sender.outcomes[(A, DEST)] = False
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert sender.attempts == [(PARENT, DEST), (A, DEST)]
+        assert self.aggregated(caplog) == [(1, A, DEST)]
+
+    def test_the_nearest_ancestor_is_the_nearest_with_a_pair_on_that_destination(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
+                     rdataset(A, ['second']),                           # `a` sends to `second` only
+                     destinations={'off': Destination(url='https://h:8443'),
+                                   'second': Destination(url='https://s:8443')})
+        sender = ScriptedSender(zfs_world)
+        sender.outcomes[(A, 'second')] = False
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert (AB, 'off') in sender.attempts, 'on `off` the nearest ancestor pair is the parent (confirmed)'
+        assert (AB, 'second') not in sender.attempts, 'on `second` it is `a`, which failed'
+        assert self.aggregated(caplog) == [(1, A, 'second')]
+
+    # -- the fail-closed fallback -------------------------------------------------------------------
+
+    def fallback_rig(self, world, pairs):
+        add_tree(world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        sender = ScriptedSender(world)
+        worker = make_worker(cfg, sender)
+        child = manager.expand_recursive().children[0]
+        worker._pairs = pairs(manager, child)
+        worker._dependents = {}
+        return manager, worker, sender, child
+
+    @staticmethod
+    def other_destination_parent(manager, child):
+        parent = manager.datasets[0]
+        return {PARENT: DatasetInfo(parent.dataset, dataclasses.replace(
+            parent.config, remote=[RemoteDatasetConfig(destination='other')]))}   # a pair, but not on DEST
+
+    def test_without_a_nearest_pair_it_falls_back_to_the_parent_it_was_expanded_from(self, zfs_world):
+        manager, worker, sender, child = self.fallback_rig(zfs_world, self.other_destination_parent)
+        assert worker._nearest_pair(child.name, DEST) is None
+        sender.confirmed.add((PARENT, DEST))
+        worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
+        assert sender.attempts == [(A, DEST)], 'the parent proved confirmed through the fallback'
+
+    def test_the_fallback_waits_without_confirmation(self, zfs_world, caplog):
+        manager, worker, sender, child = self.fallback_rig(zfs_world, self.other_destination_parent)
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
+        assert sender.attempts == []
+        assert self.aggregated(caplog) == [(1, PARENT, DEST)]
+
+    def test_with_no_parent_at_all_the_child_is_not_sent_and_one_warning_says_so(self, zfs_world, caplog):
+        manager, worker, sender, child = self.fallback_rig(zfs_world, lambda m, c: {})
+        sender.confirmed.add((PARENT, DEST))                                  # even a confirmed parent
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
+        assert sender.attempts == []
+        (warning,) = worker_warnings(caplog)
+        assert f'cannot find {PARENT}, which it was expanded from; not sent' in warning
+
+    def test_a_configured_pair_is_never_held_whatever_the_lookup_says(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        sender = ScriptedSender(zfs_world)
+        worker = make_worker(cfg, sender)
+        worker._pairs = {}
+        assert manager.datasets[0].expanded_from is None
+        worker._send_to_destination(manager, manager.datasets[0], manager.datasets[0].config.remote[0],
+                                    logging.getLogger(WORKER_LOGGER))
+        assert sender.attempts == [(PARENT, DEST)]
+
+
+@pytest.mark.unit
+class TestA2StatusKeys:
+    def test_keys_cover_every_pair_incl_expanded_children_per_destination(self, zfs_world):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
+                     destinations={'off': Destination(url='https://h:8443'),
+                                   'second': Destination(url='https://s:8443')})
+        worker = make_worker(cfg)
+        datasets = worker._get_datasets(DatasetManager(cfg))
+        assert worker._status_keys(datasets) == {
+            (d, dest) for d in (PARENT, A, AB) for dest in ('off', 'second')}
+
+    def seeded(self, zfs_world, sdir):
+        add_tree(zfs_world, PARENT, A, AB, 'pool/data2', 'pool/data2/x')
+        cfg = config(rdataset(PARENT, recursive=True))
+        worker = make_worker(cfg, ScriptedSender(zfs_world), sdir)
+        manager = DatasetManager(cfg)
+        cycle(worker, manager)
+        worker._status.record(health.KIND_SEND, 'pool/data2/x', DEST, ok=True)     # a lookalike prefix
+        worker._status.record(health.KIND_PRUNE, AB, ok=True)                        # not a send record
+        return cfg, worker, manager
+
+    def held(self, worker):
+        return {r.key for r in worker._status.records}
+
+    def test_records_of_a_failing_parents_children_survive_the_retain(self, zfs_world, sdir):
+        cfg, worker, manager = self.seeded(zfs_world, sdir)
+        zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
+        datasets = cycle(worker, manager)
+        assert [d.name for d in datasets] == [PARENT]
+        held = self.held(worker)
+        assert {(health.KIND_SEND, A, DEST), (health.KIND_SEND, AB, DEST)} <= held
+        assert (health.KIND_SEND, 'pool/data2/x', DEST) not in held, 'the sibling with a common prefix goes'
+        assert (health.KIND_PRUNE, AB, None) not in held, 'only send records are kept'
+
+    def test_the_keys_of_a_failing_parent_name_its_children(self, zfs_world, sdir):
+        cfg, worker, manager = self.seeded(zfs_world, sdir)
+        zfs_world.list_failures[PARENT] = 'boom'
+        datasets = worker._get_datasets(manager)
+        assert worker._status_keys(datasets) == {(PARENT, DEST), (A, DEST), (AB, DEST)}
+
+    def test_a_vanished_childs_record_goes_when_discovery_works(self, zfs_world, sdir):
+        cfg, worker, manager = self.seeded(zfs_world, sdir)
+        del zfs_world.datasets[AB]
+        cycle(worker, manager)
+        held = self.held(worker)
+        assert (health.KIND_SEND, AB, DEST) not in held and (health.KIND_SEND, A, DEST) in held
+
+    def test_records_are_dropped_once_discovery_recovers_and_the_child_is_gone(self, zfs_world, sdir):
+        cfg, worker, manager = self.seeded(zfs_world, sdir)
+        zfs_world.list_failures[PARENT] = 'boom'
+        cycle(worker, manager)
+        assert (health.KIND_SEND, AB, DEST) in self.held(worker)
+        del zfs_world.list_failures[PARENT]
+        del zfs_world.datasets[AB]
+        cycle(worker, manager)
+        assert (health.KIND_SEND, AB, DEST) not in self.held(worker)
+
+    def test_a_renamed_childs_old_record_goes_and_the_new_one_starts_empty(self, zfs_world, sdir):
+        cfg, worker, manager = self.seeded(zfs_world, sdir)
+        zfs_world.datasets[f'{PARENT}/a2'] = zfs_world.datasets.pop(AB)
+        zfs_world.snaps[f'{PARENT}/a2'] = zfs_world.snaps.pop(AB)
+        cycle(worker, manager)
+        held = self.held(worker)
+        assert (health.KIND_SEND, AB, DEST) not in held
+        assert (health.KIND_SEND, f'{PARENT}/a2', DEST) in held        # the new name was attempted
+
+    def test_a_renamed_child_with_a_stale_anchor_is_due_under_its_new_name(self, zfs_world):
+        old = stamp(timedelta(hours=3))
+        zfs_world.add(PARENT, snaps=[stamp(timedelta(minutes=10))])
+        zfs_world.add(f'{PARENT}/a2', snaps=[old])
+        zfs_world.set_prop(f'{PARENT}/a2', ANCHOR, old)              # travelled with the rename
+        sender = ScriptedSender(zfs_world)
+        cfg = config(rdataset(PARENT, recursive=True))
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert (f'{PARENT}/a2', DEST) in sender.attempts
+
+    def test_a_child_with_no_snapshots_is_attempted_and_the_sender_decides(self, zfs_world):
+        add_tree(zfs_world, PARENT)
+        add_tree(zfs_world, f'{PARENT}/new', snaps=False)
+        sender = ScriptedSender(zfs_world)
+        cfg = config(rdataset(PARENT, recursive=True))
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert (f'{PARENT}/new', DEST) in sender.attempts
+
+    def test_the_over_cap_warning_is_given_once_per_episode(self, mocker, caplog):
+        mocker.patch.object(health, 'STATUS_MAX_RECORDS', 3)
+        cfg = config(*[dataset(f'pool/d{i}') for i in range(4)])
+        worker = make_worker(cfg)
+        datasets = DatasetManager(cfg).datasets
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            for _ in range(3):
+                assert len(worker._status_keys(datasets)) == 4
+        (warning,) = worker_warnings(caplog)
+        assert '4 dataset x destination pairs' in warning and 'more than the 3' in warning
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            assert len(worker._status_keys(datasets[:3])) == 3        # at the cap: fine, episode over
+            assert len(worker_warnings(caplog)) == 1
+            worker._status_keys(datasets)
+        assert len(worker_warnings(caplog)) == 2
+
+    def test_expanded_children_count_towards_the_cap(self, zfs_world, mocker, caplog):
+        mocker.patch.object(health, 'STATUS_MAX_RECORDS', 3)
+        add_tree(zfs_world, PARENT, A, f'{PARENT}/b', f'{PARENT}/c')
+        cfg = config(rdataset(PARENT, recursive=True))
+        worker = make_worker(cfg)
+        datasets = worker._get_datasets(DatasetManager(cfg))
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            assert len(worker._status_keys(datasets)) == 4
+        assert len(worker_warnings(caplog)) == 1
+
+    def test_the_default_cap_is_not_reached_by_a_small_tree(self, zfs_world, caplog):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, recursive=True))
+        worker = make_worker(cfg)
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            worker._status_keys(worker._get_datasets(DatasetManager(cfg)))
+        assert worker_warnings(caplog) == []
+
+
+@pytest.mark.unit
+class TestA2ExpansionCrash:
+    """`expand_recursive` is documented never to raise; if it does, the children missing from the
+    list are unknown, not gone: `_status_keys` returns None (the loop then retains nothing)."""
+
+    def test_a_crash_keeps_every_record_that_cycle_and_recovers_the_next(self, zfs_world, sdir, mocker, caplog):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        sender = ScriptedSender(zfs_world)
+        worker = make_worker(cfg, sender, sdir)
+        cycle(worker, manager)
+        assert {r.dataset for r in worker._status.records} == {PARENT, A, AB}
+        worker._status.record(health.KIND_SEND, 'pool/gone', DEST, ok=True)       # dropped when retain runs
+        real = manager.expand_recursive
+        mocker.patch.object(manager, 'expand_recursive', side_effect=RuntimeError('boom'))
+        with caplog.at_level(logging.ERROR, logger=WORKER_LOGGER):
+            datasets = worker._get_datasets(manager)
+        assert [d.name for d in datasets] == [PARENT]
+        assert worker._expansion_crashed is True and worker._status_keys(datasets) is None
+        assert any('could not expand' in r.getMessage() for r in caplog.records)
+        cycle(worker, manager)                                       # a whole cycle through the loop's rule
+        assert {r.dataset for r in worker._status.records} == {PARENT, A, AB, 'pool/gone'}
+        manager.expand_recursive.side_effect = real
+        cycle(worker, manager)
+        assert worker._expansion_crashed is False
+        assert {r.dataset for r in worker._status.records} == {PARENT, A, AB}
+
+    def test_a_failed_discovery_is_not_a_crash(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        zfs_world.list_failures[PARENT] = 'boom'
+        cfg = config(rdataset(PARENT, recursive=True))
+        worker = make_worker(cfg)
+        datasets = worker._get_datasets(DatasetManager(cfg))
+        assert worker._expansion_crashed is False and worker._status_keys(datasets) == {(PARENT, DEST)}
+
+
+@pytest.mark.unit
+class TestA2FailedListingIsAFailure:
+    """`ChainSender.backup_dataset`: `[]` from `list_snapshots` is "nothing to send" (True) only when no
+    listing error was recorded; a FAILED listing is a failure with its own status text."""
+
+    Sender = TestA1MatrixSender.Sender
+
+    class Ready(Sender):
+        def begin_cycle(self):
+            pass
+
+        def _ready_transport(self, destination, dest):
+            return object()
+
+        def _negotiate(self, *a, **k):
+            raise AssertionError('negotiated although the snapshots could not be listed')
+
+    def rig(self, world):
+        add_tree(world, PARENT)
+        cfg = config(dataset(PARENT))
+        manager = DatasetManager(cfg)
+        return cfg, manager, self.Ready(cfg, manager, client_id='client1'), manager.datasets[0]
+
+    def test_a_failed_listing_returns_false_with_the_error_as_the_problem(self, zfs_world):
+        cfg, manager, sender, dsi = self.rig(zfs_world)
+        zfs_world.snapshot_list_failures.add(PARENT)
+        assert sender.backup_dataset(dsi, dsi.config.remote[0]) is False
+        problem = sender.last_problem(PARENT, DEST)
+        assert problem.startswith('cannot list snapshots: ') and 'suspended' in problem
+
+    def test_an_empty_listing_is_still_nothing_to_send(self, zfs_world):
+        add_tree(zfs_world, PARENT, snaps=False)
+        cfg = config(dataset(PARENT))
+        manager = DatasetManager(cfg)
+        sender = self.Ready(cfg, manager, client_id='client1')
+        dsi = manager.datasets[0]
+        assert sender.backup_dataset(dsi, dsi.config.remote[0]) is True
+        assert sender.last_problem(PARENT, DEST) is None
+
+    def test_the_problem_is_cleared_by_the_next_call(self, zfs_world):
+        cfg, manager, sender, dsi = self.rig(zfs_world)
+        zfs_world.snapshot_list_failures.add(PARENT)
+        sender.backup_dataset(dsi, dsi.config.remote[0])
+        zfs_world.snapshot_list_failures.clear()
+        zfs_world.snaps[PARENT] = []
+        assert sender.backup_dataset(dsi, dsi.config.remote[0]) is True
+        assert sender.last_problem(PARENT, DEST) is None
+
+    def test_the_worker_records_it_as_a_failure_and_the_count_rises(self, zfs_world, sdir):
+        cfg, manager, sender, dsi = self.rig(zfs_world)
+        worker = make_worker(cfg, sender, sdir)
+        zfs_world.snapshot_list_failures.add(PARENT)
+        for expected in (1, 2, 3):
+            cycle(worker, manager)
+            record = status_record(worker, PARENT, DEST)
+            assert record.result == health.RESULT_ERROR and record.consecutive_failures == expected
+            assert record.last_error.startswith('cannot list snapshots: ')
+        zfs_world.snapshot_list_failures.clear()
+        zfs_world.snaps[PARENT] = []                      # listing works again and finds nothing to send
+        cycle(worker, manager)
+        assert status_record(worker, PARENT, DEST).consecutive_failures == 0
+
+
+@pytest.mark.unit
+class TestCopyConfirmedInTheChain:
+    """`ChainSender.copy_confirmed`: the destination's copy was confirmed in THIS incarnation (a negotiate
+    reported a copy and the call returned True, or a stream was acknowledged); never from an anchor."""
+
+    @pytest.fixture(autouse=True)
+    def _presence(self, snapshot_presence):
+        return snapshot_presence
+
+    @staticmethod
+    def rig(mocker, *listings, copy='none', **kw):
+        rig = ChainRig(mocker, *listings, **kw)
+        real = rig.sender._negotiate
+
+        def negotiate(transport, client_id, dsi, snapshots, destination):
+            common = real(transport, client_id, dsi, snapshots, destination)
+            rig.sender._server_info[(dsi.name, destination)] = (copy, 'bk/c1/pool/data')
+            return common
+
+        rig.sender._negotiate = negotiate
+        return rig
+
+    @staticmethod
+    def confirmed(rig):
+        return rig.sender.copy_confirmed(CHAIN_DS, CHAIN_DEST)
+
+    def test_nothing_is_confirmed_at_first(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=S2, copy='plain')
+        assert self.confirmed(rig) is False
+
+    @pytest.mark.parametrize('copy', ['plain', 'raw'])
+    def test_a_reported_copy_that_is_up_to_date_confirms(self, mocker, copy):
+        names = (S1, S2)
+        snaps = ([sinfo(n, encryption='aes-256-gcm', keystatus='available') for n in reversed(names)]
+                 if copy == 'raw' else listing(*names))       # a raw copy goes with an encrypted dataset
+        rig = self.rig(mocker, snaps, common=S2, copy=copy)
+        assert rig.run() is True and rig.sender.stream_calls == []
+        assert self.confirmed(rig) is True
+
+    def test_a_named_common_snapshot_confirms_even_without_a_copy_report(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2, S3), common=S1, copy=None)
+        assert rig.run() is True and len(rig.sender.stream_calls) == 2
+        assert self.confirmed(rig) is True
+
+    def test_a_first_full_send_confirms_when_the_receiver_acknowledges(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=None, copy='none')
+        assert rig.run() is True
+        assert self.confirmed(rig) is True
+
+    def test_an_acknowledged_stream_confirms_even_if_the_anchor_write_then_fails(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=None, copy='none')
+        rig.ledger.anchor_writes_succeed = False
+        rig.run()                                  # the anchor bookkeeping fails; the stream was acknowledged
+        assert rig.ledger.anchor is None and self.confirmed(rig) is True
+
+    def test_a_later_step_failing_keeps_the_confirmation_of_the_earlier_ack(self, mocker):
+        from zfsbackup.chain import _FAILED
+        rig = self.rig(mocker, listing(S1, S2, S3), common=S1, copy='plain', outcomes=[_OK, _FAILED])
+        assert rig.run() is False
+        assert self.confirmed(rig) is True
+
+    def test_a_failed_first_stream_confirms_nothing(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=S1, copy='plain', outcomes=[_FAILED])
+        assert rig.run() is False
+        assert self.confirmed(rig) is False
+
+    def test_a_dry_run_confirms_nothing(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=S2, copy='plain')
+        rig.config.dry_run = True
+        assert rig.run() is True
+        assert self.confirmed(rig) is False
+
+    def test_a_later_negotiate_that_finds_no_copy_unsets_it(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=[S2, None], copy='plain')
+        assert rig.run() is True and self.confirmed(rig) is True
+        # the destination lost its copy: the next negotiate reports none and no common snapshot
+        real = rig.sender._negotiate
+
+        def lost(transport, client_id, dsi, snapshots, destination):
+            common = real(transport, client_id, dsi, snapshots, destination)
+            rig.sender._server_info[(dsi.name, destination)] = ('none', None)
+            return common
+
+        rig.sender._negotiate = lost
+        rig.sender.outcomes = [_FAILED]                      # and the fresh stream then fails
+        assert rig.run() is False
+        assert self.confirmed(rig) is False
+
+    def test_it_is_per_dataset_and_destination(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=S2, copy='plain')
+        rig.run()
+        assert rig.sender.copy_confirmed(CHAIN_DS, 'elsewhere') is False
+        assert rig.sender.copy_confirmed('pool/other', CHAIN_DEST) is False
+
+    def test_it_is_in_memory_only(self, mocker):
+        rig = self.rig(mocker, listing(S1, S2), common=S2, copy='plain')
+        rig.run()
+        rig2 = self.rig(mocker, listing(S1, S2), common=S2, copy='plain')
+        assert self.confirmed(rig2) is False
+
+
+@pytest.mark.unit
+class TestBareWorkerHelper:
+    """`tests/_remote_worker_support.py` sets exactly what `RemoteBackupWorker.__init__` sets for A2."""
+
+    def test_it_matches_init(self):
+        from _remote_worker_support import REMOTE_RECURSIVE_STATE, bare_remote_worker
+        real = RemoteBackupWorker(config(dataset(PARENT)), StopFlag())
+        bare = bare_remote_worker()
+        for name in REMOTE_RECURSIVE_STATE:
+            assert type(getattr(bare, name)) is type(getattr(real, name)), name
+            assert getattr(bare, name) == getattr(real, name), name
+        new_in_init = {n for n in vars(real) if n.startswith('_') and n not in vars(RemoteBackupWorker.__new__(RemoteBackupWorker))}
+        recursive_in_init = new_in_init & {'_pairs', '_dependents', '_waiting_noted', '_dry_run_sent',
+                                           '_expansion_failed', '_expansion_crashed', '_pairs_over_cap_noted'}
+        assert recursive_in_init == set(REMOTE_RECURSIVE_STATE), 'the helper misses (or invents) state'
+
+    def test_the_state_is_per_instance(self):
+        from _remote_worker_support import bare_remote_worker
+        a, b = bare_remote_worker(), bare_remote_worker()
+        a._waiting_noted.add(('x', 'y'))
+        a._pairs['p'] = object()
+        assert b._waiting_noted == set() and b._pairs == {}
+
+
+@pytest.mark.unit
+class TestA2PerChildSendMode:
+    """`raw: auto` is decided per child, from its own newest snapshot (the real `_send_mode`)."""
+
+    Sender = TestA1MatrixSender.Sender
+
+    def rig(self, world, raw=None):
+        add_tree(world, PARENT, f'{PARENT}/secret', f'{PARENT}/open', f'{PARENT}/secret/inner')
+        world.encryption[f'{PARENT}/secret'] = 'aes-256-gcm'
+        world.encryption[f'{PARENT}/secret/inner'] = 'aes-256-gcm'      # inherits the encryption
+        cfg = config(DatasetConfig(
+            name=PARENT, recursive=True, frequency=Duration('1h'),
+            remote=[RemoteDatasetConfig(destination=DEST, raw=raw)]))
+        manager = DatasetManager(cfg)
+        children = {c.name: c for c in manager.expand_recursive().children}
+        children[PARENT] = manager.datasets[0]
+        return cfg, manager, children, self.Sender(cfg, manager, client_id='client1')
+
+    def mode(self, sender, manager, dsi):
+        newest = manager.list_snapshots(dsi)[0]
+        return sender._send_mode(dsi, dsi.config.remote[0], newest)
+
+    def test_auto_is_raw_for_an_encrypted_child_and_plain_for_the_unencrypted_parent(self, zfs_world):
+        cfg, manager, ds, sender = self.rig(zfs_world)
+        assert self.mode(sender, manager, ds[PARENT]) == 'plain'
+        assert self.mode(sender, manager, ds[f'{PARENT}/secret']) == 'raw'
+        assert self.mode(sender, manager, ds[f'{PARENT}/secret/inner']) == 'raw'
+        assert self.mode(sender, manager, ds[f'{PARENT}/open']) == 'plain'
+
+    def test_raw_true_on_the_parent_refuses_an_unencrypted_child_with_one_error_each(self, zfs_world, caplog):
+        cfg, manager, ds, sender = self.rig(zfs_world, raw=True)
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(2):
+                assert self.mode(sender, manager, ds[f'{PARENT}/secret']) == 'raw'
+                assert self.mode(sender, manager, ds[f'{PARENT}/open']) is None
+                assert self.mode(sender, manager, ds[PARENT]) is None
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 2, 'one per refused pair, however many cycles'
+        assert any(e.startswith(f'{PARENT}/open -> {DEST}: raw is true but the dataset is not encrypted') for e in errors)
+        assert any(e.startswith(f'{PARENT} -> {DEST}: raw is true') for e in errors)
+
+    def test_a_child_without_snapshots_is_a_successful_nothing_to_send(self, zfs_world):
+        add_tree(zfs_world, PARENT)
+        add_tree(zfs_world, f'{PARENT}/new', snaps=False)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        (child,) = manager.expand_recursive().children
+
+        class Sender(self.Sender):
+            def _ready_transport(self, destination, dest):
+                return object()
+
+            def _negotiate(self, *a, **k):
+                raise AssertionError('negotiated for a dataset that has nothing to send')
+
+        sender = Sender(cfg, manager, client_id='client1')
+        assert sender.backup_dataset(child, child.config.remote[0]) is True

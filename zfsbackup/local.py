@@ -817,6 +817,12 @@ class LocalBackupManager(ChainSender):
         copy = self._copy_name(transport, client_id, dsi, destination)
         if copy is None:
             raise NegotiationFailed(f"invalid dataset name {dsi.name!r}")
+        # Before anything is created: a copy whose snapshots could never exist
+        # (the full name is over ZFS's limit) is refused, one ERROR per episode.
+        too_long = receiver.copy_snapshot_name_problem(copy, (s.name for s in snapshots))
+        if too_long is not None:
+            self._log_refusal_once(key, f"{dsi.name} -> {destination}: {too_long}; nothing is sent")
+            raise NegotiationFailed(too_long)
         try:
             canonical = receiver.canonical_dataset_config(dsi.config.to_property(destination))
         except ValueError as e:

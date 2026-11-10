@@ -260,6 +260,13 @@ class ChainSender:
         # not complete`, where this class knows (the token check); read by
         # `last_problem`, reset at the start of every call.
         self._call_note: Dict[Tuple[str, str], str] = {}
+        # `(dataset, destination)` pairs whose copy at the destination was
+        # CONFIRMED in this incarnation: a negotiate reported an existing copy
+        # (`server_copy` plain or raw, or a common snapshot) and the call then
+        # returned True, or a stream to it committed (`_record_step`). Only
+        # ever read through `copy_confirmed`; never persisted (a new worker
+        # confirms again), and removed when a later negotiate finds no copy.
+        self._copy_confirmed: Set[Tuple[str, str]] = set()
 
     def _token_skipped(self, dsi: DatasetInfo, destination: str, reason: str) -> None:
         """The resume-token check skipped this cycle for `dsi` -> `destination`
@@ -300,6 +307,18 @@ class ChainSender:
         if key in self._token_error_logged:
             self._token_error_logged.discard(key)
             self._logger.info(f"{dsi.name} -> {destination}: the resume-token check passes again")
+
+    def copy_confirmed(self, dataset: str, destination: str) -> bool:
+        """Whether the destination's copy of `dataset` has been CONFIRMED in
+        this incarnation: a `backup_dataset` call returned True after a
+        negotiate that reported an existing copy (`server_copy` plain or raw,
+        or a common snapshot), or a stream to it committed (acknowledged,
+        `_record_step`). Not a statement about being up to date, and not
+        evidence from any anchor or status record: an anchor can be stale (a
+        changed URL or target, another client id, a lost copy). A dry run
+        confirms nothing (no stream is sent, and a missing copy is not
+        created). The worker's parent-first rule is the one reader."""
+        return (dataset, destination) in self._copy_confirmed
 
     def last_problem(self, dataset: str, destination: str) -> Optional[str]:
         """Why the last `backup_dataset(dataset, destination)` did not
@@ -351,6 +370,15 @@ class ChainSender:
 
         snapshots = self.local_manager.list_snapshots(dsi)
         if not snapshots:
+            # An empty listing and a FAILED one both come back as `[]`:
+            # only `last_list_error` tells them apart. A failed listing is
+            # not "nothing to send" (it was logged by `list_snapshots`): it
+            # is a failure of this pair, recorded and graded as one, and what
+            # the status file says.
+            list_error = self.local_manager.last_list_error
+            if list_error is not None:
+                self._call_note[(dsi.name, destination)] = f"cannot list snapshots: {list_error}"
+                return False
             self._logger.debug(f"No snapshots available to send for {dsi.name}")
             return True
 
@@ -373,6 +401,15 @@ class ChainSender:
                     f"skipping {dsi.name} this cycle"
                 )
             return False
+        key = (dsi.name, destination)
+        existing = (
+            self._server_info.get(key, (None, None))[0] in ('plain', 'raw')
+            or bool(common_snap_name)
+        )
+        if not existing:
+            # The destination holds no copy now: whatever was confirmed
+            # earlier is gone (a stream of this call confirms it again).
+            self._copy_confirmed.discard(key)
         if not self._server_copy_matches(dsi, destination, mode):
             return False
 
@@ -399,10 +436,13 @@ class ChainSender:
         if discard is None:
             return False
 
-        return self._transfer(
+        done = self._transfer(
             transport, client_id, dsi, latest, common_snap, destination,
             snapshots=snapshots, should_stop=should_stop, mode=mode, discard=discard,
         )
+        if done and existing and not self.config.dry_run:
+            self._copy_confirmed.add(key)
+        return done
 
     def _send_mode(self, dsi: DatasetInfo, remote_cfg: RemoteDatasetConfig, newest) -> Optional[str]:
         """`'raw'` or `'plain'` for this dataset and destination, or `None`
@@ -997,6 +1037,9 @@ class ChainSender:
         cannot be confirmed while it was being sent: the pin stays)."""
         stream, mode, inflight_set, sent, base = started
 
+        # The receiver acknowledged `sent`: the copy exists, whatever happens
+        # to the bookkeeping below.
+        self._copy_confirmed.add((dsi.name, destination))
         self._refusal_logged.pop((f"{dsi.name} [{self._refusal_label}]", destination), None)
         # The RAISING read: "unset" and "could not read" differ here. An
         # unreadable anchor must neither skip the never-backwards rule below

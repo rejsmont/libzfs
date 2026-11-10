@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 import zfsbackup.workers as workers_module
 from _config_handoff import config_signature, literals_in
+from _remote_worker_support import bare_remote_worker, configured_dsi
 from zfsbackup.config import BackupConfig, DatasetConfig, Destination, Duration, RemoteDatasetConfig
 from zfsbackup.config.store import dispose_all
 from zfsbackup.runtime_config import load_runtime_config
@@ -456,12 +457,12 @@ class TestRemoteBackupWorker:
                 ),
             ],
         )
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         interval = worker._get_interval(config)
         assert interval == timedelta(minutes=30).total_seconds()
 
     def test_get_interval_falls_back_to_check_interval_when_no_remote(self, sample_backup_config):
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         interval = worker._get_interval(sample_backup_config)
         assert interval == sample_backup_config.check_interval.total_seconds()
 
@@ -475,15 +476,15 @@ class TestRemoteBackupWorker:
                 ),
             ],
         )
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         interval = worker._get_interval(config)
         assert interval == timedelta(hours=2).total_seconds()
 
     def test_process_dataset_skips_when_no_remote_config(self, mocker):
         manager = MagicMock()
-        dsi = MagicMock()
+        dsi = configured_dsi()
         dsi.config.remote = []
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         worker.name = 'remote-backup-worker'
         worker._remote_manager = MagicMock()
         worker._process_dataset(manager, dsi)
@@ -494,7 +495,7 @@ class TestRemoteBackupWorker:
         remote_cfg = MagicMock()
         remote_cfg.destination = 'offsite'
         remote_cfg.frequency = timedelta(hours=1)
-        dsi = MagicMock()
+        dsi = configured_dsi()
         dsi.config.remote = [remote_cfg]
         dsi.config.frequency = timedelta(hours=1)
 
@@ -505,7 +506,7 @@ class TestRemoteBackupWorker:
         manager.list_snapshots.return_value = [anchor_snap]
         manager.clock_behind.return_value = False       # the anchor is not future-dated
 
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         worker.name = 'remote-backup-worker'
         worker._remote_manager = MagicMock()
         worker._process_dataset(manager, dsi)
@@ -516,12 +517,12 @@ class TestRemoteBackupWorker:
         remote_cfg = MagicMock()
         remote_cfg.destination = 'offsite'
         remote_cfg.frequency = timedelta(hours=1)
-        dsi = MagicMock()
+        dsi = configured_dsi()
         dsi.config.remote = [remote_cfg]
         dsi.config.frequency = timedelta(hours=1)
         manager.get_own_anchor.return_value = None
 
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         worker.name = 'remote-backup-worker'
         worker._remote_manager = MagicMock()
         worker._process_dataset(manager, dsi)
@@ -549,7 +550,7 @@ class TestRemoteWorkerPassesShouldStop:
         remote_cfg = MagicMock()
         remote_cfg.destination = 'offsite'
         remote_cfg.frequency = timedelta(hours=1)
-        dsi = MagicMock()
+        dsi = configured_dsi()
         dsi.config.remote = [remote_cfg]
         dsi.config.frequency = timedelta(hours=1)
         manager = MagicMock()
@@ -593,7 +594,7 @@ class TestRemoteWorkerPassesShouldStop:
         remote_cfg = MagicMock()
         remote_cfg.destination = 'offsite'
         remote_cfg.frequency = timedelta(hours=1)
-        dsi = MagicMock()
+        dsi = configured_dsi()
         dsi.config.remote = [remote_cfg]
         manager = MagicMock()
         manager.get_own_anchor.return_value = None
@@ -638,7 +639,7 @@ class TestPerDestinationIsolation:
         manager = MagicMock(name='manager')
         manager.config = config
         manager.get_own_anchor.return_value = None
-        dsi = SimpleNamespace(name='pool/data', config=config.datasets[0])
+        dsi = SimpleNamespace(name='pool/data', config=config.datasets[0], expanded_from=None)
         return worker, manager, dsi
 
     @staticmethod
@@ -903,7 +904,7 @@ class TestRemoteBackupWorkerBeforeLoop:
             destinations={'offsite': Destination(url='https://backup.example.com')},
         )
         manager = MagicMock()
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         worker._remote_manager = None
         worker.client_id = 'host-1'                      # from the Handoff
         worker.tls_dir = tmp_path / 'db.tls'
@@ -1416,7 +1417,7 @@ class TestFutureDatedAnchor:
         anchor_name = {dest: snaps[m].name for dest, m in anchors.items()}
         mocker.patch.object(manager, 'list_snapshots', side_effect=lambda d: list(snaps.values()))
         mocker.patch.object(manager, 'get_own_anchor', side_effect=lambda d, dest: anchor_name.get(dest))
-        worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
+        worker = bare_remote_worker()
         worker.name = 'remote-backup-worker'
         worker._exit_reason = lambda: None
         worker._remote_manager = MagicMock()

@@ -66,10 +66,16 @@ pass `zfs-code-reviewer` (and `concurrency-reviewer` for B1.3 and B3) before the
   - A name at or below a local target or the server target is skipped with one ERROR (defence in depth; validation
     already refuses this).
 - **Clones** are sent as ordinary datasets (R-3).
-- **Order.** In the serial worker, children join the existing depth sort, after their parent. R-2 (wait for the
-  parent's first success) is enforced by the Track B scheduler. In Track A, a child pair whose ancestor pair on the
-  same destination has never succeeded (no `last_success` in the status records and none this incarnation) is skipped
-  for that cycle with one WARNING per episode.
+- **Backup copies are never sources.** Expansion skips, with its whole subtree, every dataset that carries
+  `org.zfsbackup:client_id` or `source_dataset` as a local, received or inherited value. One value-free
+  `property_sources` read per parent finds them, and a failed read fails the parent's expansion. The server target
+  counts as a receive target whether or not `remote_backup` is enabled, and `validate_config` agrees.
+- **Order.** In the serial worker, children join the existing depth sort, after their parent. R-2: a child pair waits
+  until its nearest ancestor pair on the same destination has been **confirmed in this incarnation**, meaning its
+  negotiate reported an existing copy or a stream to it committed. An anchor alone is not evidence, because it is keyed
+  by destination name and can outlive the copy. An unconfirmed ancestor pair with waiting children is treated as due,
+  so it negotiates once per incarnation. One WARNING per (ancestor, destination) per episode, with a count. A child
+  with no snapshots is not held. In a dry run, the ancestor's `backup_dataset` returning True passes.
 - **Lifecycle.**
   - A child created later is discovered the next cycle. It gets a full send once its first recursive snapshot exists.
   - A child destroyed on the source drops out of the pairs. Its status records go at `retain()`, except while that
@@ -91,13 +97,14 @@ pass `zfs-code-reviewer` (and `concurrency-reviewer` for B1.3 and B3) before the
 | A0 | pytest-test-author | low-risk | Characterization tests, `xfail(strict=True)` until the fix lands: (1) a configured parent and child share a destination and frequency, and the child has no local anchor → it stays "not due" across cycles; (2) `check` grades that never-sent child as fresh; (3) the descendants of a recursive dataset are never sent. |
 | A1 | zfsbackup-developer | needs-approval | Add `DatasetManager.get_own_anchor` / `get_own_inflight` (`zfs.get.value(..., sources='local')`). Unreadable → `None` with a DEBUG line, so the pair is due and negotiate decides. Use them in the due check (`workers.py:1353`), `_record_step` (`chain.py:~1003`), `_settle_up_to_date` (`chain.py:~1104`, `~1130`) and `health_collect` (`:145`, `:150`). Leave `get_anchor`/`get_anchors` for the pruner. Fix the `_get_prop` docstring. Tests: A0 (1) and (2) flip; a matrix of {local, inherited, received, unset, unreadable} × {due, record, settle, health}; the pruner's protect set is unchanged. |
 | A2 | zfsbackup-developer | needs-approval | `DatasetManager.expand_recursive(should_stop) -> Expansion(children, failed)` with the semantics above (`DatasetInfo.expanded_from`). `RemoteBackupWorker._get_datasets` appends the children before the depth sort. `_status_keys` covers the expanded pairs and keeps a failing parent's children's records. Discovery errors: one ERROR per parent per episode, INFO on recovery. The R-2 skip in the serial worker. The copy-name length check. The status-cap WARNING. Tests: kinds and deep trees, explicit override, nearest ancestor, disabled subtree excluded, skipped names, failed discovery, depth order, stamped config per destination, per-child `raw: auto`, no snapshots yet, vanished and renamed children, over-long name, R-2 skip. |
+| A2b | zfsbackup-developer | needs-approval (retention; a safety fix found in the A2 review) | The recursive prune must never destroy snapshots inside a backup copy below the recursive dataset, for example the copies of a `zfs:` destination later removed from the config, or a `send -R` replica. `zfs destroy -r pool@snap` also destroys `copy@snap` when names match. Feed the copy-root detection (local, received or inherited `client_id`/`source_dataset`) into `_descendant_anchor_protection` / `_still_prunable`: a copy below the dataset protects every snapshot name it holds, so the recursive destroy of that name is skipped, with one ERROR per episode naming the copy and the remedy (move it out of the recursive tree). An unreadable copy read protects everything (no recursive destroy that pass). Tests in `test_zfsbackup_prune_descendants.py` style. |
 | A3 | zfsbackup-developer | low-risk | `health_collect`: `expand_recursive` plus one anchor observation per child × destination (own reads, the parent's expected interval). A failed discovery gives one WARN entry for that subtree. Also (A1 review L2): an unreadable own anchor is reported as an observation error (the raising `get_local_anchor` → `Observation(error=...)`, as the listing failure does), not as "never sent". Tests: `test_zfsbackup_health_collect.py`, `test_zfsbackup_cli_check.py` (JSON, Prometheus, Nagios). |
 | A4 | zfsbackup-cli-developer | needs-approval | `rename destination` copies and clears `anchor.<old>`/`inflight.<old>` on the descendants of recursive datasets too (local values only) and prints the undo/inherit commands. `rename dataset` notes that children's copies move with the parent copy's `zfs rename`. Also (A1 review L3): `copy_anchor_property` (`backup_manager.py:~321`) and `_copy_inflight_property` (`cli/rename.py:~167`) copy only LOCAL values, never a received one: after A1 a received anchor is not evidence, and a rename must not turn it into a local one. Tests: `test_zfsbackup_cli_rename.py`, using a recursive tree in `tests/_fake_zfs.py`. |
-| A5 | zfsbackup-developer (README), main session (CLAUDE.md) | low-risk | README "Recursive datasets" section; fix README ~953; update the CLAUDE.md `backup_manager.py`/`workers.py` paragraphs and the tests table. |
+| A5 | zfsbackup-developer (README), main session (CLAUDE.md) | low-risk | README "Recursive datasets" section. Also from the A2 review: (a) anchors are keyed by destination NAME, so after a URL or `zfs:` target switch a parent's stale fresh anchor reads as "sent" (R-2 passes, and the parent itself waits up to one period), so document it and have A4/`set`/`edit` warn; (b) a child without a readable own anchor has an unprotected common snapshot until its pin is written (same as configured children); (c) `raw: true` on a parent applies to every child, and an unencrypted child is refused with the existing ERROR; (d) dropped children (names libzfseasy cannot represent) leave only libzfseasy's WARNING; (e) a child's encoded config near the 8 KiB cap is refused at negotiate. Contents: fix README ~953; update the CLAUDE.md `backup_manager.py`/`workers.py` paragraphs and the tests table. |
 | A6a | pytest-test-author | low-risk | Real ZFS, using a tree of: an unencrypted parent; a child that is its own encryption root (raw); a grandchild inheriting that encryption; a zvol child; an explicitly configured child. Cover parent-first fulls, incrementals, a child created mid-run, the recursive prune keeping children's anchored snapshots, the inherited-anchor regression, and receiver pruning by stamped config. |
 | A6b | real-zfs-scenario-dev | low-risk | `test_two_vm_backup.sh`, `test_local_destination.sh`: the same tree, plus a child created then destroyed mid-run. Never launch two VMs at once. |
 
-Order: A0 → A1 → A2 → (A3 ∥ A4) → (A5 ∥ A6a ∥ A6b). The tests author follows each item.
+Order: A0 → A1 → A2 → A2b → (A3 ∥ A4) → (A5 ∥ A6a ∥ A6b). The tests author follows each item.
 
 ## Track B — parallel sender threads
 
@@ -165,7 +172,8 @@ Its main thread becomes the **scheduler**:
   - A pair never runs while an ancestor or descendant pair on the same destination runs or is due ahead of it. The
     ancestor goes first, then by due time, depth and config order.
   - A blocked pair does not block unrelated pairs.
-  - R-2 wait as above.
+  - R-2 wait as above, applied to EVERY child pair, configured or expanded (A2 applies it to expanded children only;
+    a configured child whose parent never negotiated can still create a placeholder parent copy until B lands).
   - The same dataset may go to several destinations at once.
 
 ### Items

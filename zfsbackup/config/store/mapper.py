@@ -976,22 +976,37 @@ def _require_outside_receive_targets(
     by this host's own workers inside received data (the next incremental
     receive then fails, and an aligned `{prefix}_{ts}` name makes the prune
     destroy received snapshots); a `recursive` ancestor reaches the same
-    datasets through `zfs snapshot -r` and `zfs destroy -r`. Enabled or not,
-    so enabling a dataset later cannot open the hole.
+    datasets through `zfs snapshot -r` and `zfs destroy -r` (and, with
+    recursive sends, would SEND other clients' backups to this host's own
+    destinations). Enabled or not, so enabling a dataset later cannot open
+    the hole.
 
     Compared by path COMPONENTS, never by string prefix: `tank/b` is not an
     ancestor of `tank/backup`, and `tank/backup` is not the target
     `tank/backups`. A non-recursive ancestor only touches its own snapshots,
-    so it stays allowed. The remote target counts only while remote_backup
-    is enabled (disabled or unset: nothing is received, so nothing can
-    overlap); every declared local target counts always (`_local_targets`).
+    so it stays allowed. The remote target counts whenever
+    `remote_backup.target_dataset` is set, ENABLED OR NOT: a former server
+    that disabled remote_backup still has other clients' received copies on
+    disk under the target, and a snapshot, prune or (recursive) send over
+    them is exactly the hazard above. Only an unset remote_backup imposes
+    nothing. Every declared local target counts always (`_local_targets`).
     """
     d = _dataset_components(ds.name) if isinstance(ds.name, str) else None
     if d is None:
         return
-    if remote_backup is not None and getattr(remote_backup, "enabled", False):
+    if remote_backup is not None:
         target = getattr(remote_backup, "target_dataset", None)
         if isinstance(target, str) and target:
+            # Counted although remote_backup may be disabled: say so, or an
+            # operator with `enabled: false` cannot see why it is refused.
+            note = (
+                ""
+                if getattr(remote_backup, "enabled", False)
+                else " remote_backup is disabled, but the target still counts: "
+                "a former server's received backups stay on disk under it. "
+                "Remove or move remote_backup.target_dataset, or change the "
+                "dataset."
+            )
             t = _dataset_components(target)
             if _is_prefix(t, d):
                 where = "is" if len(d) == len(t) else "is below"
@@ -1000,15 +1015,16 @@ def _require_outside_receive_targets(
                     f"{target!r}. The server treats everything under the target as "
                     "received backups, so snapshotting or pruning a dataset there "
                     "would act on received data. Move the target to a dedicated "
-                    "dataset that no configured dataset is at or below."
+                    "dataset that no configured dataset is at or below." + note
                 )
             if ds.recursive is True and len(d) < len(t) and _is_prefix(d, t):
                 raise ValueError(
                     f"{key}: the dataset is recursive and is an ancestor of "
                     f"remote_backup.target_dataset {target!r}. Its recursive "
-                    "snapshots (zfs snapshot -r) and prunes (zfs destroy -r) would "
-                    "reach the received datasets under the target. Make the dataset "
-                    "non-recursive, or move the target outside it."
+                    "snapshots (zfs snapshot -r), sends and prunes (zfs destroy "
+                    "-r) would reach the received datasets under the target. Make "
+                    "the dataset non-recursive, or move the target outside it."
+                    + note
                 )
     for dest_name, target in _local_targets(destinations):
         t = _dataset_components(target)
@@ -1170,9 +1186,10 @@ def validate_config(config: BackupConfig) -> List[str]:
       path or is set without the other (`client_tls_files_problem`);
     - any retention rule with a non-positive `age`/`keep_for`, and any
       `validate_retention_uniqueness` collision, per scope.
-    - with remote backup ENABLED: a configured dataset (enabled or not) at or
-      below `remote_backup.target_dataset`, or a `recursive` one that is a
-      strict ancestor of it; likewise for the target of EVERY declared
+    - with `remote_backup.target_dataset` set (enabled OR NOT: a former
+      server's received copies stay on disk): a configured dataset (enabled
+      or not) at or below it, or a `recursive` one that is a strict ancestor
+      of it; likewise for the target of EVERY declared
       `zfs:` (local) destination, used or not
       (`_require_outside_receive_targets`);
     - receive targets that overlap one another: two local targets, equal or

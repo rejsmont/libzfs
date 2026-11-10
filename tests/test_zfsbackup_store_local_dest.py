@@ -782,11 +782,13 @@ class TestOrderAndCompatibility:
             _require_outside_target(
                 DatasetConfig(name="tank/backups"), "datasets[tank/backups]", RemoteServerConfig("tank/backups")
             )
-        _require_outside_target(
-            DatasetConfig(name="tank/backups"),
-            "datasets[tank/backups]",
-            RemoteServerConfig("tank/backups", enabled=False),
-        )
+        # the target counts whenever it is set, enabled or not (a former server's received copies)
+        with pytest.raises(ValueError, match="remote_backup is disabled, but the target still counts"):
+            _require_outside_target(
+                DatasetConfig(name="tank/backups"),
+                "datasets[tank/backups]",
+                RemoteServerConfig("tank/backups", enabled=False),
+            )
         _require_outside_target(DatasetConfig(name="tank/backups"), "datasets[tank/backups]", None)
 
     def test_require_outside_target_knows_nothing_of_local_destinations(self):

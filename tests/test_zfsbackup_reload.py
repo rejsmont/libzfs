@@ -585,10 +585,24 @@ class TestRejection:
         assert world.daemon._rejected == (STORE, 8)     # and the poll does not retry it
         assert len(messages(caplog, logging.ERROR)) == 1
 
-    def test_the_same_datasets_with_a_disabled_receiver_are_accepted(self, world, caplog):
+    def test_the_same_datasets_with_a_disabled_receiver_are_rejected_too(self, world, caplog):
+        """The target counts whenever it is set: a former server still holds other clients' copies."""
+        before = world.start_workers()
+        bad = BackupConfig(
+            datasets=[DatasetConfig(name="pool/backups/a")],
+            remote_backup=RemoteServerConfig("pool/backups", enabled=False),
+        )
+        world.write((STORE, 8), config=bad)
+        world.hup()
+        self._assert_nothing_changed(world, before)
+        (error,) = messages(caplog, logging.ERROR)
+        assert "remote_backup is disabled, but the target still counts" in error
+        assert world.daemon._rejected == (STORE, 8)
+
+    def test_a_disabled_receiver_over_unrelated_datasets_is_accepted(self, world, caplog):
         world.start_workers()
         ok = BackupConfig(
-            datasets=[DatasetConfig(name="pool/backups/a")],
+            datasets=[DatasetConfig(name="pool/data")],
             remote_backup=RemoteServerConfig("pool/backups", enabled=False),
         )
         world.write((STORE, 8), config=ok)

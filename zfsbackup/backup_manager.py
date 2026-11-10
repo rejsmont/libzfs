@@ -504,6 +504,11 @@ class DatasetInfo:
         #: a copy found by `DatasetManager.local_copies`, else `None`. Its
         #: pruning runs under timeouts (`LOCAL_PRUNE_*_BUDGET`).
         self.local_target: Optional[str] = None
+        #: The enabled recursive configured dataset this one was expanded from
+        #: (`DatasetManager.expand_recursive`), else `None`. An expanded child
+        #: is a SENDING pair only: it is never snapshotted or pruned by its own
+        #: entry (the parent's `zfs snapshot -r` and recursive prune cover it).
+        self.expanded_from: Optional[str] = None
 
     @property
     def reference_time(self) -> datetime:
@@ -530,6 +535,16 @@ class DatasetInfo:
 
     def __repr__(self):
         return f"DatasetInfo({self.name})"
+
+
+class Expansion(NamedTuple):
+    """What `DatasetManager.expand_recursive` found: the `children` (one
+    `DatasetInfo` per descendant to send, parents' order, each with
+    `expanded_from` set) and `failed`, which maps a recursive parent whose
+    discovery failed this time to the error (its children are unknown, not
+    gone)."""
+    children: List['DatasetInfo']
+    failed: Dict[str, str]
 
 
 class DatasetManager:
@@ -612,6 +627,14 @@ class DatasetManager:
         # True while `prune_snapshots` runs a local copy under timeouts.
         self._prune_timed = False
         self._reread_error: Optional[str] = None
+        # `expand_recursive`: the parents whose discovery is failing (ERROR
+        # once per episode, INFO when it works again) and the (parent, target)
+        # pairs whose descendants under a receive target were announced.
+        self._expand_error_noted: Set[str] = set()
+        self._expand_target_noted: Set[Tuple[str, str]] = set()
+        # ... and the (parent, copy root) pairs skipped for a local
+        # `client_id`/`source_dataset`.
+        self._expand_copy_noted: Set[Tuple[str, str]] = set()
 
     @property
     def datasets(self) -> List[DatasetInfo]:
@@ -629,6 +652,284 @@ class DatasetManager:
             dataset = Dataset(ds_config.name)
             datasets.append(DatasetInfo(dataset, ds_config))
         return datasets
+
+    def _receive_targets(self) -> List[str]:
+        """The datasets that receive copies: the server target and every
+        declared local (`zfs:`) destination's target, a trailing `/` stripped.
+        Nothing at or below one of them is a source. The server target counts
+        whether or not `remote_backup` is enabled: a former server still holds
+        other clients' received copies there, and sending them under this
+        host's id is the one thing this must never allow."""
+        targets: List[str] = []
+        rb = self.config.remote_backup
+        if rb and rb.target_dataset:
+            targets.append(rb.target_dataset.rstrip('/'))
+        for dest in (self.config.destinations or {}).values():
+            if getattr(dest, 'is_local', False) is True:
+                target = (dest.target_dataset or '').rstrip('/')
+                if target and target not in targets:
+                    targets.append(target)
+        return targets
+
+    def expand_recursive(self, should_stop: Optional[Callable[[], bool]] = None) -> Expansion:
+        """The descendants of the enabled `recursive: true` datasets that have
+        `remote:` entries, each as its own sending pair (never `send -R`, `-p`
+        or `-I`: every child is an ordinary `-i` chain into its own copy).
+        Needs no daemon: the workers and the CLI (`check`, `rename`) call it
+        on a `DatasetManager` built from a `BackupConfig`. Nothing is stored
+        on the manager's `datasets`: the snapshot and pruning workers never see
+        a child (the parent's `zfs snapshot -r` and recursive prune cover it).
+
+        * **Discovery** is a name-only `zfs list -r -t filesystem,volume` of
+          each such parent, UNTIMED (source datasets never are). It names no
+          property, so no value can forge a row; the default (non-strict) list
+          reader is right: a name libzfseasy cannot represent is dropped with
+          its own WARNING, and nothing else can be skipped. Only names strictly
+          below the parent count (hidden `%recv` datasets are never listed by
+          zfs, and `@`, `#`, `%` names are refused here regardless).
+        * **Explicit configuration wins.** A descendant configured explicitly,
+          enabled or not, is not expanded (it is sent by its own entry or not
+          at all). Walking down from a parent, a configured DISABLED dataset
+          excludes its whole subtree (R-1), and so does any configured ENABLED
+          RECURSIVE one, whether or not it has `remote:` entries (`remote: []`
+          means "snapshot locally, send nothing", and those names are not the
+          outer parent's to send): it is the root of its own subtree, expanded
+          from its own listing when it has `remote:` entries, so each name has
+          exactly one owner and a pair is unique by (dataset, destination).
+          A configured enabled NON-recursive ancestor is passed through: the
+          names below it still expand from the nearest enabled recursive one.
+        * **Stamped config.** A child's config is the parent's with the
+          child's name and `recursive=False`: `to_property(destination)`
+          stamps the child's name, the parent's retention for that destination
+          and the frequency; `raw` per destination is the parent's (`raw: auto`
+          is decided per child by the sender). Each child owns copies of the
+          parent's `remote` and `retention_rules` (the dataclasses are mutable).
+          Clones are ordinary children.
+        * **Backup copies are never sources** (trust boundary: a copy of
+          another client's data must not be sent under this host's id, raw
+          needs no key). A name at or below a receive target
+          (`_receive_targets`: the server target ENABLED OR NOT, and every
+          local destination's target) is skipped with one ERROR per parent
+          and target; and so is any descendant, with its whole subtree, that
+          carries a LOCAL, RECEIVED or INHERITED `org.zfsbackup:client_id` or
+          `source_dataset` (one `zfs get -r -s local,received,inherited`,
+          name/property/source only, so no value is read; one call per
+          parent, after the listing, so every listed name existed when it was
+          read). A tree replicated onto this host (`send -R`, syncoid with
+          properties) carries them as RECEIVED, and a dataset under a marked
+          ancestor ABOVE the recursive parent inherits them: then the parent
+          itself is inside a copy and EVERY child is skipped (the ERROR says
+          so). Only those two keys: a source has a LOCAL
+          `org.zfsbackup:config` and anchors, never these (the daemon's own
+          sends carry no properties and the documented restore uses no
+          `-p`/`-R`). One ERROR per (parent, copy root) per episode. If that
+          read fails the parent's expansion FAILS (`failed`): it is never
+          expanded without it.
+
+        `failed` maps a parent whose listing failed to the error: its children
+        are then unknown (not gone), the parent itself is unaffected. ERROR once
+        per parent while it persists, INFO when it works again. `should_stop`
+        is checked before each parent; once it is true the result is partial
+        and only fit for leaving. Never raises."""
+        children: List[DatasetInfo] = []
+        failed: Dict[str, str] = {}
+        configured = {c.name: c for c in self.config.datasets}
+        roots = [c for c in self.config.enabled_datasets if c.recursive and c.remote]
+        if not roots:
+            self._expand_error_noted.clear()
+            self._expand_target_noted.clear()
+            self._expand_copy_noted.clear()
+            return Expansion(children, failed)
+        targets = self._receive_targets()
+        seen: Set[str] = set()
+        blocked_now: Set[Tuple[str, str]] = set()
+        copies_now: Set[Tuple[str, str]] = set()
+        listed_ok: Set[str] = set()
+        stopped = False
+        for root in roots:
+            if should_stop is not None and should_stop():
+                stopped = True
+                break
+            try:
+                listing = [
+                    d.name for d in zfs.list(
+                        roots=Dataset(root.name), recursive=True, types='filesystem,volume'
+                    )
+                ]
+                copy_roots = self._copy_roots(root.name)
+            except Exception as e:
+                failed[root.name] = f"{type(e).__name__}: {e}"
+                if root.name not in self._expand_error_noted:
+                    self._expand_error_noted.add(root.name)
+                    logger.error(
+                        "Cannot list the descendants of %s, so they are not sent until this "
+                        "passes (%s: %s); %s itself is unaffected",
+                        root.name, type(e).__name__, e, root.name,
+                    )
+                else:
+                    logger.debug("Still cannot list the descendants of %s: %r", root.name, e)
+                continue
+            listed_ok.add(root.name)
+            if root.name in self._expand_error_noted:
+                self._expand_error_noted.discard(root.name)
+                logger.info("The descendants of %s can be listed again", root.name)
+            prefix = root.name + '/'
+            for name in listing:
+                if (
+                    not name.startswith(prefix) or name in seen
+                    or any(c in name for c in '@#%')
+                ):
+                    continue
+                if self._expansion_owner(name, root.name, configured) is None:
+                    continue
+                hit = next((t for t in targets if name == t or name.startswith(t + '/')), None)
+                if hit is not None:
+                    key = (root.name, hit)
+                    blocked_now.add(key)
+                    if key not in self._expand_target_noted:
+                        self._expand_target_noted.add(key)
+                        logger.error(
+                            "%s is at or below %s, which receives copies: it and its descendants "
+                            "are not sent (a recursive dataset must not contain a receive target; "
+                            "move the target out of %s)", name, hit, root.name,
+                        )
+                    continue
+                copy_root = self._topmost_copy(name, root.name, copy_roots)
+                if copy_root is not None:
+                    key = (root.name, copy_root)
+                    copies_now.add(key)
+                    if key not in self._expand_copy_noted:
+                        self._expand_copy_noted.add(key)
+                        logger.error(self._copy_root_message(
+                            root.name, copy_root, copy_roots[copy_root],
+                        ))
+                    continue
+                seen.add(name)
+                info = DatasetInfo(
+                    Dataset(name),
+                    dataclasses.replace(
+                        root, name=name, recursive=False,
+                        retention_rules=[dataclasses.replace(r) for r in root.retention_rules],
+                        remote=[
+                            dataclasses.replace(
+                                rc, retention_rules=[dataclasses.replace(r) for r in rc.retention_rules]
+                            )
+                            for rc in root.remote
+                        ],
+                    ),
+                )
+                info.expanded_from = root.name
+                children.append(info)
+        if not stopped:
+            # Forget an episode that is over (the recovery INFO above covers
+            # the parents that were listed; a parent no longer configured just goes).
+            self._expand_error_noted &= {r.name for r in roots}
+            self._expand_target_noted = {
+                k for k in self._expand_target_noted
+                if k in blocked_now or k[0] not in listed_ok
+            }
+            self._expand_copy_noted = {
+                k for k in self._expand_copy_noted
+                if k in copies_now or k[0] not in listed_ok
+            }
+        return Expansion(children, failed)
+
+    @staticmethod
+    def _copy_roots(parent: str) -> Dict[str, str]:
+        """The datasets at or below `parent` that carry a LOCAL, RECEIVED or
+        INHERITED `org.zfsbackup:client_id` or `org.zfsbackup:source_dataset`:
+        backup copies (a server's, a local destination's, or a replica of
+        either), wherever they sit, mapped to the source zfs printed
+        (`local`, `received` or `inherited from <dataset>`; a local or
+        received one wins over an inherited one). One recursive, value-free
+        `zfs get -H -o name,property,source -s local,received,inherited -r -t
+        filesystem,volume all <parent>` filtered by property prefix, so a
+        hostile value cannot disturb it, and names libzfseasy cannot
+        represent still count. `inherited` also puts `parent` itself in the
+        map when an ancestor ABOVE it carries them: the parent is then inside
+        a copy. Raises on any failure (the caller then does not expand)."""
+        rows = zfs.get.property_sources(
+            Dataset(parent), types='filesystem,volume',
+            sources=['local', 'received', 'inherited'], recursive=True,
+            prefix=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
+        )
+        found: Dict[str, str] = {}
+        for r in rows:
+            if r.property not in (PROP_CLIENT_ID, PROP_SOURCE_DATASET):
+                continue
+            have = found.get(r.name)
+            if have is None or (have.startswith('inherited') and not r.source.startswith('inherited')):
+                found[r.name] = r.source
+        return found
+
+    @staticmethod
+    def _copy_root_message(parent: str, copy_root: str, source: str) -> str:
+        """The ERROR for a copy root met while expanding `parent`: what it is,
+        that it and everything below it is not sent, and the remedy that fits
+        where the marker comes from. `zfs inherit` clears only a LOCAL value:
+        a RECEIVED one stays (`zfs inherit -S` merely reverts a local
+        override to it), so for that the remedy is to move the copy out."""
+        props = f"{PROP_CLIENT_ID} or {PROP_SOURCE_DATASET}"
+        if source.startswith('inherited'):
+            origin = source[len('inherited from '):] or 'an ancestor'
+            return (
+                f"{parent} itself is inside a backup copy: it inherits {props} from {origin}, "
+                f"so none of its descendants is sent. If {origin} is a backup copy, move "
+                f"{parent} out of it (zfs rename) or stop it being recursive; if it is really a "
+                f"source, clear the properties on {origin} (zfs inherit {PROP_CLIENT_ID} "
+                f"{origin}; zfs inherit {PROP_SOURCE_DATASET} {origin}), which works only for "
+                "local values, not received ones"
+            )
+        if source == 'received':
+            return (
+                f"{copy_root} carries a received {props}: it is a replicated backup copy, so it "
+                f"and its descendants (under {parent}) are not sent. A received value is not "
+                f"removed by `zfs inherit` (`zfs inherit -S` only reverts a local override to "
+                f"it): move the copy out of {parent} (zfs rename {copy_root} <a name outside "
+                f"{parent}>)"
+            )
+        return (
+            f"{copy_root} carries a local {props}: it is a backup copy, so it and its "
+            f"descendants (under {parent}) are not sent. If it is really a source, clear them: "
+            f"zfs inherit {PROP_CLIENT_ID} {copy_root}; zfs inherit {PROP_SOURCE_DATASET} "
+            f"{copy_root}. Otherwise move it out of {parent} (zfs rename)"
+        )
+
+    @staticmethod
+    def _topmost_copy(name: str, parent: str, copy_roots: Dict[str, str]) -> Optional[str]:
+        """The topmost dataset among `parent` (itself) and the names between
+        it and `name`, `name` included, that is in `copy_roots`, else `None`."""
+        if not copy_roots:
+            return None
+        node = parent
+        if node in copy_roots:
+            return node
+        for part in name[len(parent) + 1:].split('/'):
+            node = f"{node}/{part}"
+            if node in copy_roots:
+                return node
+        return None
+
+    @staticmethod
+    def _expansion_owner(
+        name: str, root: str, configured: Dict[str, DatasetConfig],
+    ) -> Optional[str]:
+        """`root` if `name` (strictly below it) is to be expanded from it,
+        else `None`: the name itself is configured (explicit config wins), a
+        configured disabled dataset lies between (R-1), or a configured
+        ENABLED RECURSIVE dataset lies between (it owns its subtree, with or
+        without `remote:` entries: `remote: []` sends nothing and nothing
+        outer may send there). An enabled non-recursive configured dataset
+        between is passed through."""
+        if name in configured:
+            return None
+        ancestor = name.rpartition('/')[0]
+        while len(ancestor) > len(root):
+            cfg = configured.get(ancestor)
+            if cfg is not None and (not cfg.enabled or cfg.recursive):
+                return None
+            ancestor = ancestor.rpartition('/')[0]
+        return root
 
     def verify_datasets(self, should_stop: Optional[Callable[[], bool]] = None) -> None:
         """Log an ERROR for each configured dataset that does not exist.

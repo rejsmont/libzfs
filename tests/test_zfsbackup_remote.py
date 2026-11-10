@@ -6013,3 +6013,236 @@ class TestSettleHardening:
         chain.ws_cls.assert_not_called()
         assert anchors == {'offsite': S3}
         h5.clear_inflight.assert_called_once()
+
+
+class TestNameTooLongRefusal:
+    """A2: the server's 400 `{'error', 'reason': 'name_too_long'}` (decided before it wrote
+    anything) is one ERROR per episode on the client, with `last_problem` carrying it; any other
+    400 keeps the old per-cycle ERROR."""
+
+    URL = 'https://backup.example.com'
+    TEXT = 'a snapshot of the copy would have a 256-character name; shorten the dataset name'
+    REFUSAL = {'error': TEXT, 'reason': 'name_too_long'}
+
+    @pytest.fixture
+    def rig(self):
+        config = _make_config()
+        manager = DatasetManager(config)
+        rbm = _rbm(config, manager)
+        return rbm, manager.datasets[0]
+
+    def post(self, requests_mock, dsi, **kw):
+        requests_mock.post(re.compile(rf'{re.escape(self.URL)}/backup/[^/]+/{re.escape(dsi.name)}/negotiate$'), **kw)
+
+    def negotiate(self, rbm, dsi):
+        return rbm._negotiate(tr(), 'client1', dsi, [], 'offsite')
+
+    def errors(self, caplog):
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+    def test_the_refusal_raises_negotiation_failed_with_the_servers_text(self, rig, requests_mock):
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, status_code=400, json=self.REFUSAL)
+        with pytest.raises(NegotiationFailed, match='HTTP 400') as exc:
+            self.negotiate(rbm, dsi)
+        assert self.TEXT in str(exc.value) and exc.value.reloading is False
+
+    def test_one_error_per_episode_naming_the_dataset(self, rig, requests_mock, caplog):
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, status_code=400, json=self.REFUSAL)
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(3):
+                with pytest.raises(NegotiationFailed):
+                    self.negotiate(rbm, dsi)
+        (error,) = self.errors(caplog)
+        assert error == f'server refused {dsi.name}: {self.TEXT}; nothing is sent'
+        assert 'Negotiation failed' not in caplog.text
+
+    def test_a_good_negotiate_ends_the_episode_so_the_next_refusal_is_logged_again(self, rig, requests_mock, caplog):
+        rbm, dsi = rig
+        with caplog.at_level(logging.DEBUG):
+            self.post(requests_mock, dsi, status_code=400, json=self.REFUSAL)
+            with pytest.raises(NegotiationFailed):
+                self.negotiate(rbm, dsi)
+            self.post(requests_mock, dsi, json={'common_snapshot': None, 'server_dataset': 'x'})
+            assert self.negotiate(rbm, dsi) is None
+            assert rbm.last_problem(dsi.name, 'offsite') is None
+            self.post(requests_mock, dsi, status_code=400, json=self.REFUSAL)
+            with pytest.raises(NegotiationFailed):
+                self.negotiate(rbm, dsi)
+        assert len(self.errors(caplog)) == 2
+
+    def test_last_problem_carries_the_text_for_the_status_file(self, rig, requests_mock):
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, status_code=400, json=self.REFUSAL)
+        with pytest.raises(NegotiationFailed):
+            self.negotiate(rbm, dsi)
+        assert self.TEXT in rbm.last_problem(dsi.name, 'offsite')
+
+    def test_a_400_without_the_reason_is_still_the_plain_error_every_time(self, rig, requests_mock, caplog):
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, status_code=400, json={'error': self.TEXT})
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(2):
+                with pytest.raises(NegotiationFailed):
+                    self.negotiate(rbm, dsi)
+        assert len([e for e in self.errors(caplog) if 'Negotiation failed' in e]) == 2
+
+    def test_a_reason_without_an_error_text_is_not_the_refusal(self, rig, requests_mock, caplog):
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, status_code=400, json={'reason': 'name_too_long'})
+        with caplog.at_level(logging.ERROR), pytest.raises(NegotiationFailed):
+            self.negotiate(rbm, dsi)
+        assert not [e for e in self.errors(caplog) if e.startswith('server refused')]
+
+    def test_through_backup_dataset_nothing_is_sent(self, rig, requests_mock, mocker, client_tls_dir, caplog):
+        config = _make_config()
+        manager = DatasetManager(config)
+        rbm = _rbm(config, manager, client_tls_dir)
+        dsi = manager.datasets[0]
+        requests_mock.get(f'{self.URL}/whoami', json=whoami_json('client1'))
+        mocker.patch.object(manager, 'list_snapshots', return_value=[sinfo('autosnap_20240101120000')])
+        send = mocker.patch('zfsbackup.remote.zfs.send.snapshot', return_value=_finite_stream())
+        self.post(requests_mock, dsi, status_code=400, json=self.REFUSAL)
+        with caplog.at_level(logging.INFO):
+            assert rbm.backup_dataset(dsi, dsi.config.remote[0]) is False
+        assert not send.called
+        assert len([e for e in self.errors(caplog) if e.startswith('server refused')]) == 1
+
+
+class TestNameTooLongAfterA200:
+    """A2: an older server has no name-length check. The client knows the copy's name from the 200's
+    `server_dataset`, so it refuses before anything is stored or sent (ERROR once per episode)."""
+
+    URL = 'https://backup.example.com'
+    SNAP = 'autosnap_20240101120000'                                     # 23 characters
+
+    @staticmethod
+    def copy(snapshot_length, extra=0):
+        return 'bk/' + 'c' * (255 - 3 - 1 - snapshot_length + extra)      # copy + '@' + snapshot == 255 + extra
+
+    @pytest.fixture
+    def rig(self):
+        config = _make_config()
+        manager = DatasetManager(config)
+        return _rbm(config, manager), manager.datasets[0]
+
+    def post(self, requests_mock, dsi, **kw):
+        requests_mock.post(re.compile(rf'{re.escape(self.URL)}/backup/[^/]+/{re.escape(dsi.name)}/negotiate$'), **kw)
+
+    def negotiate(self, rbm, dsi, names=None):
+        snaps = [sinfo(n) for n in (names or [self.SNAP])]
+        return rbm._negotiate(tr(), 'client1', dsi, snaps, 'offsite')
+
+    def errors(self, caplog):
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+    def test_exactly_255_is_accepted_and_the_answer_is_stored(self, rig, requests_mock):
+        rbm, dsi = rig
+        copy = self.copy(len(self.SNAP))
+        self.post(requests_mock, dsi, json={'common_snapshot': None, 'server_dataset': copy, 'server_copy': 'none'})
+        assert self.negotiate(rbm, dsi) is None
+        assert rbm._server_info[(dsi.name, 'offsite')] == ('none', copy)
+
+    def test_256_is_refused_with_negotiation_failed_and_nothing_stored(self, rig, requests_mock, caplog):
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, json={'common_snapshot': 'x', 'server_dataset': self.copy(len(self.SNAP), 1),
+                                            'server_copy': 'plain', 'server_newer': []})
+        with caplog.at_level(logging.DEBUG), pytest.raises(NegotiationFailed, match='256-character'):
+            self.negotiate(rbm, dsi)
+        for table in (rbm._server_info, rbm._server_newer, rbm._server_newer_status):
+            assert (dsi.name, 'offsite') not in table, 'refused before anything is stored'
+        (error,) = self.errors(caplog)
+        assert error.startswith(f'{dsi.name} -> offsite: ') and error.endswith('nothing is sent')
+
+    def test_one_error_per_episode_a_good_answer_ends_it_and_last_problem_reports_it(self, rig, requests_mock, caplog):
+        rbm, dsi = rig
+        bad = {'common_snapshot': None, 'server_dataset': self.copy(len(self.SNAP), 1)}
+        good = {'common_snapshot': None, 'server_dataset': self.copy(len(self.SNAP))}
+        with caplog.at_level(logging.DEBUG):
+            self.post(requests_mock, dsi, json=bad)
+            for _ in range(3):
+                with pytest.raises(NegotiationFailed):
+                    self.negotiate(rbm, dsi)
+            assert len(self.errors(caplog)) == 1
+            assert '256-character' in rbm.last_problem(dsi.name, 'offsite')
+            self.post(requests_mock, dsi, json=good)
+            assert self.negotiate(rbm, dsi) is None
+            assert rbm.last_problem(dsi.name, 'offsite') is None
+            self.post(requests_mock, dsi, json=bad)
+            with pytest.raises(NegotiationFailed):
+                self.negotiate(rbm, dsi)
+        assert len(self.errors(caplog)) == 2
+
+    def test_the_standing_refusal_is_not_cleared_by_the_refused_answer_itself(self, rig, requests_mock, caplog):
+        # the entry is only popped once the check passed: a refusal does not re-arm its own ERROR
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, json={'server_dataset': self.copy(len(self.SNAP), 1)})
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(2):
+                with pytest.raises(NegotiationFailed):
+                    self.negotiate(rbm, dsi)
+        assert len(self.errors(caplog)) == 1 and (dsi.name, 'offsite') in rbm._refusal_logged
+
+    def test_the_longest_snapshot_decides(self, rig, requests_mock):
+        rbm, dsi = rig
+        self.post(requests_mock, dsi, json={'server_dataset': self.copy(len(self.SNAP))})
+        assert self.negotiate(rbm, dsi, ['autosnap_1', self.SNAP]) is None
+        with pytest.raises(NegotiationFailed):
+            self.negotiate(rbm, dsi, ['autosnap_1', self.SNAP + 'x'])
+
+    @pytest.mark.parametrize('server_dataset', [None, '', 5, ['x'], {'a': 1}])
+    def test_an_answer_without_a_string_copy_name_is_not_refused(self, rig, requests_mock, server_dataset):
+        rbm, dsi = rig
+        body = {'common_snapshot': None}
+        if server_dataset is not None:
+            body['server_dataset'] = server_dataset
+        self.post(requests_mock, dsi, json=body)
+        assert self.negotiate(rbm, dsi, ['s' * 200]) is None
+
+    def test_through_backup_dataset_nothing_is_sent(self, requests_mock, mocker, client_tls_dir, caplog):
+        config = _make_config()
+        manager = DatasetManager(config)
+        rbm = _rbm(config, manager, client_tls_dir)
+        dsi = manager.datasets[0]
+        requests_mock.get(f'{self.URL}/whoami', json=whoami_json('client1'))
+        mocker.patch.object(manager, 'list_snapshots', return_value=[sinfo(self.SNAP)])
+        send = mocker.patch('zfsbackup.remote.zfs.send.snapshot', return_value=_finite_stream())
+        self.post(requests_mock, dsi, json={'common_snapshot': None, 'server_dataset': self.copy(len(self.SNAP), 1)})
+        with caplog.at_level(logging.INFO):
+            assert rbm.backup_dataset(dsi, dsi.config.remote[0]) is False
+        assert not send.called
+        assert len([e for e in self.errors(caplog) if e.endswith('nothing is sent')]) == 1
+
+
+class TestCopyConfirmedRemote:
+    """`copy_confirmed` on the remote manager (the parent-first rule of recursive datasets reads it): the
+    server's copy was found by a negotiate and the call returned True, or a stream was acknowledged."""
+
+    def confirmed(self, h):
+        return h.rbm.copy_confirmed(h.dsi.name, 'offsite')
+
+    def test_nothing_is_confirmed_at_first(self, h):
+        assert self.confirmed(h) is False
+
+    def test_a_common_snapshot_that_is_the_newest_confirms(self, h, mocker):
+        Chain(h, mocker, sessions=1, negotiate=NEW)
+        assert h.rbm.backup_dataset(h.dsi, cfg_for(None)) is True
+        assert self.confirmed(h) is True
+
+    def test_an_acknowledged_first_full_send_confirms(self, h, mocker):
+        Chain(h, mocker, sessions=1, negotiate=None)
+        assert h.rbm.backup_dataset(h.dsi, cfg_for(None)) is True
+        assert self.confirmed(h) is True
+
+    def test_a_negotiate_that_failed_confirms_nothing(self, h, mocker):
+        Chain(h, mocker, sessions=1, negotiate=NegotiationFailed('server is busy', reloading=True))
+        assert h.rbm.backup_dataset(h.dsi, cfg_for(None)) is False
+        assert self.confirmed(h) is False
+
+    def test_a_later_negotiate_that_finds_nothing_unsets_it(self, h, mocker):
+        Chain(h, mocker, sessions=1, negotiate=NEW)
+        assert h.rbm.backup_dataset(h.dsi, cfg_for(None)) is True and self.confirmed(h) is True
+        Chain(h, mocker, sessions=1, negotiate=None)
+        assert h.rbm.backup_dataset(h.dsi, cfg_for(None), should_stop=lambda: True) is False
+        assert self.confirmed(h) is False

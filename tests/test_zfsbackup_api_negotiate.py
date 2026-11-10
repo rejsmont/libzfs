@@ -49,6 +49,7 @@ from zfsbackup.api import (
 )
 from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET
 from zfsbackup.config import BackupConfig, DatasetConfig, RemoteServerConfig, RetentionRule
+from zfsbackup.protocol import NAME_TOO_LONG_REASON
 
 #: The real `zfs.get.value`, captured before any test patches it: a test that drives the real
 #: command through a mocked `Popen` puts it back as the mock's `side_effect`.
@@ -2606,3 +2607,86 @@ class TestServerNewerUnknown:
         authed = Authed(_config(dry_run=True))
         self.untrusted(zfs)
         self.assert_marked(negotiate(authed.client(), snapshots=[self.A]).get_json(), self.A)
+
+
+# ---------------------------------------------------------------------------
+# A2: a copy whose snapshots could never exist (the full name is over 255 characters)
+# ---------------------------------------------------------------------------
+
+
+class TestNameTooLong:
+    """`<server dataset>@<snapshot>` over ZFS's 255 characters: 400 `{'error', 'reason': 'name_too_long'}`
+    before the claim, the config decode and every `zfs` call; WARNING once per dataset and episode."""
+
+    SNAP = "autosnap_20240101120000"                       # 23 characters
+
+    @staticmethod
+    def dataset_for(snapshot_length):
+        """A client dataset whose server copy plus '@' plus `snapshot_length` characters is exactly 255."""
+        room = 255 - 1 - snapshot_length - len(f"pool/backups/{CLIENT_ID}/")
+        return "pool/" + "a" * (room - len("pool/"))
+
+    def post(self, client, dataset, snapshots):
+        return client.post(f"/backup/{CLIENT_ID}/{dataset}/negotiate", json=body_with(snapshots=snapshots))
+
+    def test_exactly_255_is_accepted_and_256_is_refused(self, client, zfs):
+        dataset = self.dataset_for(len(self.SNAP))
+        assert self.post(client, dataset, [self.SNAP]).status_code == 200
+        resp = self.post(client, dataset, [self.SNAP + "x"])
+        assert resp.status_code == 400
+
+    def test_the_answer_names_the_reason_and_echoes_no_snapshot_name(self, client, zfs):
+        dataset = self.dataset_for(len(self.SNAP))
+        resp = self.post(client, dataset, ["EVIL-" + self.SNAP])
+        body = resp.get_json()
+        assert resp.status_code == 400 and body["reason"] == NAME_TOO_LONG_REASON == "name_too_long"
+        assert set(body) == {"error", "reason"} and "260-character" in body["error"]
+        assert "28 for the snapshot" in body["error"] and "EVIL" not in body["error"]
+
+    def test_the_longest_name_decides(self, client, zfs):
+        dataset = self.dataset_for(len(self.SNAP))
+        assert self.post(client, dataset, ["a", self.SNAP, "b"]).status_code == 200
+        assert self.post(client, dataset, ["a", self.SNAP + "x", "b"]).status_code == 400
+
+    def test_nothing_is_written_or_claimed_and_no_zfs_call_is_made(self, client, authed, zfs):
+        dataset = self.dataset_for(len(self.SNAP))
+        resp = self.post(client, dataset, [self.SNAP + "x"])
+        assert resp.status_code == 400
+        for name, mock in zfs.items():
+            assert not mock.called, f"zfs access {name} for a refused negotiate"
+        assert streams_in_progress(authed.app) == set() and dict(pending_configs(authed.app)) == {}
+        assert authed.gate.active == 0
+
+    def test_it_is_decided_before_the_config_is_looked_at(self, client, zfs):
+        dataset = self.dataset_for(len(self.SNAP))
+        resp = client.post(f"/backup/{CLIENT_ID}/{dataset}/negotiate",
+                           json={"snapshots": [self.SNAP + "x"], "config": "!!not base64!!"})
+        assert resp.get_json()["reason"] == NAME_TOO_LONG_REASON
+
+    def test_warning_once_per_dataset_and_again_after_a_good_negotiate(self, client, zfs, caplog):
+        dataset = self.dataset_for(len(self.SNAP))
+        other = dataset[:-1] + "z"                                       # same length, another name
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING and NAME_TOO_LONG_REASON in r.getMessage()]
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.api"):
+            for _ in range(3):
+                self.post(client, dataset, [self.SNAP + "x"])
+            assert len(warnings()) == 1
+            self.post(client, other, [self.SNAP + "x"])
+            assert len(warnings()) == 2, "another dataset has its own episode"
+            assert self.post(client, dataset, [self.SNAP]).status_code == 200
+            self.post(client, dataset, [self.SNAP + "x"])
+        assert len(warnings()) == 3, "a good negotiate ends the episode"
+
+    def test_a_short_copy_with_ordinary_names_is_untouched(self, client, zfs):
+        assert post_json(client, body_with(snapshots=[self.SNAP])).status_code == 200
+
+    def test_the_limit_is_in_bytes_not_characters(self, client, zfs):
+        dataset = self.dataset_for(len(self.SNAP))
+        room = len(self.SNAP)                                           # bytes of room for the snapshot name
+        ok = "é" * (room // 2) + "s" * (room % 2)                    # `room` bytes, fewer characters
+        assert len(ok.encode()) == room and len(ok) < room
+        assert self.post(client, dataset, [ok]).status_code == 200
+        over = ok + "é"                                             # 2 more bytes, 1 more character
+        resp = self.post(client, dataset, [over])
+        assert resp.status_code == 400 and resp.get_json()["reason"] == NAME_TOO_LONG_REASON

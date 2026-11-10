@@ -623,6 +623,7 @@ class TestReportClientTls:
 class Dsi:
     def __init__(self, name, destinations):
         self.name = name
+        self.expanded_from = None                  # a configured pair, never an expanded child
         self.config = SimpleNamespace(
             remote=[SimpleNamespace(destination=d, frequency=None) for d in destinations],
             frequency=timedelta(hours=1),
