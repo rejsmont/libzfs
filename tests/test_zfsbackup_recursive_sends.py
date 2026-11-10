@@ -40,6 +40,7 @@ from typing import Dict, List, Set, Tuple
 import pytest
 
 import libzfseasy as libzfseasy_module
+from _get_support import copy_read_argv
 from _snapshot_support import list_row
 from libzfseasy.zfs import ZFSTimeoutError
 from zfsbackup.backup_manager import (
@@ -143,6 +144,7 @@ class InheritingZfs:
         self.snapshot_list_failures: Set[str] = set()
         self.encryption: Dict[str, str] = {}
         self.allow_writes = False
+        self.unset_rows = False        # print a source `-` row for an unset requested property of the copy read
         self.writes: List[Tuple[str, ...]] = []
         self.calls: List[List[str]] = []
         mocker.patch('subprocess.Popen', side_effect=self._popen)
@@ -176,8 +178,9 @@ class InheritingZfs:
                 self.props[(rest[-1], prop)] = value
             return _Proc()
         if self.allow_writes and rest[:1] == ['inherit']:
-            self.writes.append(('inherit', rest[-1], rest[1]))
-            self.props.pop((rest[-1], rest[1]), None)
+            assert rest[1:-2] in ([], ['-S']), f'every option comes before the property: {rest}'
+            self.writes.append(('inherit', rest[-1], rest[-2]))
+            self.props.pop((rest[-1], rest[-2]), None)
             return _Proc()
         raise AssertionError(f'fake zfs: unexpected command {rest}')
 
@@ -233,20 +236,23 @@ class InheritingZfs:
         `sources` (`inherited` matches `inherited from X`), the root and with `-r` every dataset
         below it, a dataset's rows together; no value is printed."""
         root = rest[-1]
-        assert rest[-2] == 'all', rest
+        requested = None if rest[-2] == 'all' else rest[-2].split(',')       # `all`, or an explicit list
         wanted = rest[rest.index('-s') + 1].split(',')
         if root in self.copy_read_failures:
             return _Proc(b'', self.copy_read_failures[root].encode() + b'\n', 1)
         if root not in self.datasets:
             return _Proc(b'', f"cannot open '{root}': dataset does not exist\n".encode(), 1)
         names = [root] + ([n for n in self.datasets if n.startswith(root + '/')] if '-r' in rest else [])
-        known = sorted({prop for (_, prop) in list(self.props) + list(self.received)})
+        known = requested if requested is not None else sorted(
+            {prop for (_, prop) in list(self.props) + list(self.received)})
         lines = []
         for n in names:
             for prop in known:
                 source = self._source_of(n, prop)
                 if source is not None and source.split(' ')[0] in wanted:
                     lines.append(f"{n}\t{prop}\t{source}\n")
+                elif requested is not None and self.unset_rows and source is None:
+                    lines.append(f"{n}\t{prop}\t-\n")      # an unset requested property: `-` (the reader drops it)
         return _Proc(''.join(lines).encode())
 
     def name_sources_reads(self, root=None):
@@ -894,8 +900,7 @@ class TestExpandTrees:
         timeout = mocker.spy(libzfseasy_module, 'timeout')
         expand(config(dataset(PARENT, recursive=True), dataset('pool/other', recursive=True)))
         assert zfs_world.name_sources_reads() == [
-            ['get', '-H', '-o', 'name,property,source', '-s', 'local,received,inherited', '-r', '-t',
-             'filesystem,volume', 'all', root]
+            copy_read_argv(root)
             for root in (PARENT, 'pool/other')], 'name, property and source only: no value is ever read'
         assert [c[0] for c in zfs_world.calls] == ['list', 'get', 'list', 'get'], 'the listing first, then the read'
         assert timeout.call_count == 0
@@ -1197,8 +1202,7 @@ class TestExpandBackupCopies:
         self.tree(zfs_world)
         DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()
         assert zfs_world.name_sources_reads() == [
-            ['get', '-H', '-o', 'name,property,source', '-s', 'local,received,inherited', '-r', '-t',
-             'filesystem,volume', 'all', PARENT]]
+            copy_read_argv(PARENT)]
 
     def test_a_replica_with_received_markers_is_never_sent(self, zfs_world, caplog):
         # what `zfs send -R | zfs receive` leaves: the markers are RECEIVED, and `zfs inherit` cannot clear them
@@ -1263,9 +1267,11 @@ class TestExpandBackupCopies:
 
     @pytest.mark.parametrize('source, needles', [
         ('local', ['carries a local', 'zfs inherit org.zfsbackup:client_id pool/data/copy', 'zfs rename']),
-        ('received', ['carries a received', 'is not removed by `zfs inherit`', 'move the copy out of pool/data']),
+        ('received', ['carries a received', 'is not removed by `zfs inherit`', 'move the copy out of pool/data',
+                      'a plain `zfs inherit` of a received value only masks it',
+                      'a masked marker makes this check stop seeing the copy']),
         ('inherited from pool', ['itself is inside a backup copy', 'inherits', 'from pool', 'none of its descendants is sent',
-                                 'works only for local values']),
+                                 'works only for local values (a plain `zfs inherit` of a received value only masks it']),
     ])
     def test_the_three_wordings(self, source, needles):
         message = DatasetManager._copy_root_message(PARENT, self.COPY if source != 'inherited from pool' else PARENT, source)

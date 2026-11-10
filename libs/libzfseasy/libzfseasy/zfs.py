@@ -1,6 +1,6 @@
 from libzfseasy.types import InvalidNameError, InvalidValueError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
      SnapshotRange, Property, Properties
-from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple, Tuple
+from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple, Tuple, List, Sequence
 
 import collections
 import contextlib
@@ -1741,25 +1741,136 @@ class SnapshotCommand(Command):
 
     @classmethod
     def _snapshot(cls, ds: Dataset, name: str, recursive: bool = False,
-                  properties: Optional[Properties] = None) -> Snapshot:
+                  properties: Optional[Properties] = None) -> Union[Snapshot, List[Snapshot]]:
+        """Create the snapshot `ds@name`, or with `recursive=True` the same-named snapshot of `ds` and every
+        descendant filesystem and volume in one atomic `zfs snapshot -r`.
+
+        Arguments:
+            ds: Dataset -- the dataset to snapshot
+            name: str -- the short snapshot name (what follows the `@`)
+
+        Keyword arguments:
+            recursive: bool -- snapshot the descendants too (`-r`; default False)
+            properties: dict -- user properties to set on the snapshot(s) (`-o`)
+
+        Returns:
+            A `Snapshot` when `recursive` is False. When it is True, a list of `Snapshot`s whose FIRST element is
+            always the snapshot of `ds` itself, followed by the descendants' as listed by `zfs list -r`.
+
+        The recursive form runs `zfs snapshot -r` FIRST and lists the descendants afterwards, best-effort, to build
+        the list. If that listing fails (zfs error, timeout under `timeout()`) or does not contain `ds`, one WARNING is
+        logged on the 'libzfseasy' logger and the list holds only what is known: the `Snapshot` of `ds` (and any
+        descendants a partial listing did return). A snapshot that was made is never reported as a failure, so a
+        caller must not read a short list as "the descendants were not snapshotted"; `-r` takes them all or none
+        (the list is the listing's view taken after the snapshot, so a dataset created in between can appear in it).
+        Previously the listing ran before `zfs snapshot -r`, so a failing listing raised and no snapshot was made,
+        and a row the listing dropped could leave `ds` out of (or not first in) the returned list.
+
+        Raises:
+            ValueError -- before zfs runs: an invalid dataset, name or property
+            Exception -- `zfs snapshot` failed (`ZFSTimeoutError` under `timeout()`); a failure of the later listing
+                is never raised
+        """
 
         snapshot = Snapshot(ds, name, properties)
-        # Before the recursive listing below, which already runs zfs.
         _check_values(snapshot.properties)
         cmd = [_zfs_cmd(), 'snapshot']
         if recursive:
             cmd += ['-r']
-            datasets = ListCommand()(ds, types='filesystem,volume', recursive=recursive)
-            result = [Snapshot(cds, name, properties) for cds in datasets]
-        else:
-            result = snapshot
         if properties:
             for k, v in snapshot.properties:
                 cmd += ['-o', k + '=' + str(v)]
         cmd += [str(snapshot)]
         cls._exec(cmd)
 
-        return result
+        if not recursive:
+            return snapshot
+
+        # The snapshots exist now: nothing below may turn that into a failure.
+        own = snapshot
+        rest = []
+        found = False
+        try:
+            for cds in ListCommand()(ds, types='filesystem,volume', recursive=True):
+                if cds.name == snapshot.dataset.name:
+                    own, found = Snapshot(cds, name, properties), True
+                else:
+                    rest.append(Snapshot(cds, name, properties))
+        except Exception as e:
+            logger.warning('zfs snapshot -r %s succeeded, but listing the descendants failed (%s); returning the '
+                           'snapshots known', _clip(str(snapshot)), _clip(str(e)))
+        else:
+            if not found:
+                logger.warning('zfs snapshot -r %s succeeded, but its listing did not contain the dataset itself; '
+                               'the result may be incomplete', _clip(str(snapshot)))
+        return [own] + rest
+
+    # The most argv one `snapshot.many()` command may carry (every argument plus its NUL, in bytes). A bound is
+    # needed because the command cannot be split without losing atomicity. 128 KiB is far below the smallest ARG_MAX
+    # in use (1 MiB on macOS, 2 MiB on Linux, both shared with the environment) and keeps the nvlist zfs hands the
+    # kernel small; it takes roughly a thousand datasets with typical names (a name is at most 255 bytes, so never
+    # fewer than ~500).
+    MANY_MAX_ARGV_BYTES = 128 * 1024
+
+    @classmethod
+    def many(cls, datasets: Sequence[Dataset], name: str,
+             properties: Optional[Properties] = None) -> List[Snapshot]:
+        """Snapshot several datasets under one short name with ONE command, so that all the snapshots are atomic (the
+        same txg): `zfs snapshot [-o k=v ...] a@name b@name c@name`. Never `-r`: the caller chooses the datasets.
+
+        zfs is all-or-nothing here: if one snapshot cannot be created (a name collision on one dataset, say) none is,
+        and the failure is raised like the single form's, with zfs's stderr (it names the dataset and ends with
+        `no snapshots were created`).
+
+        Arguments:
+            datasets: [Dataset] -- the datasets to snapshot (Filesystem, Volume or Dataset), in the order they are
+                passed to zfs and returned. One pool only
+            name: str -- the short snapshot name (what follows the `@`)
+
+        Keyword arguments:
+            properties: dict -- user properties to set on every snapshot (`-o`), as for the single form
+
+        Returns:
+            The `Snapshot` objects, in the order of `datasets`.
+
+        Raises:
+            ValueError -- before zfs runs: an empty list, a non-dataset entry, an invalid dataset, name or property,
+                a dataset twice, datasets from more than one pool (a single `zfs snapshot` cannot span pools: the
+                kernel refuses it with EXDEV), or more argv than `MANY_MAX_ARGV_BYTES` (never split into several
+                commands, which would not be atomic)
+            Exception -- zfs failed (`ZFSTimeoutError` under `timeout()`), with zfs's stderr as the message
+        """
+        if isinstance(datasets, (str, bytes, ZFS)) or not isinstance(datasets, Iterable):
+            raise ValueError('Expected a list of Filesystem, Volume or Dataset, got ' + type(datasets).__name__
+                             + ' instead')
+        datasets = list(datasets)
+        if not datasets:
+            raise ValueError('No datasets to snapshot')
+        if not isinstance(name, str):
+            raise ValueError('Expected a snapshot name, got ' + type(name).__name__ + ' instead')
+        snapshots = [Snapshot(ds, name, properties) for ds in datasets]  # validates every dataset and the name
+        _check_values(snapshots[0].properties)
+        seen = set()
+        for snapshot in snapshots:
+            if str(snapshot) in seen:
+                raise ValueError('Dataset %s listed twice' % _clip(snapshot.dataset.name))
+            seen.add(str(snapshot))
+        pools = {snapshot.dataset.name.split('/', 1)[0] for snapshot in snapshots}
+        if len(pools) > 1:
+            raise ValueError('An atomic snapshot cannot span pools (got %s)' % ', '.join(sorted(map(_clip, pools))))
+
+        cmd = [_zfs_cmd(), 'snapshot']
+        if properties:
+            for k, v in snapshots[0].properties:
+                cmd += ['-o', k + '=' + str(v)]
+        cmd += [str(snapshot) for snapshot in snapshots]
+        size = sum(len(a.encode('utf-8', 'surrogateescape')) + 1 for a in cmd)
+        if size > cls.MANY_MAX_ARGV_BYTES:
+            raise ValueError('Too many datasets for one atomic snapshot command: %d bytes of arguments, at most %d '
+                             '(it is not split, which would not be atomic)' % (size, cls.MANY_MAX_ARGV_BYTES))
+        cls._exec(cmd)
+
+        return snapshots
 
 
 class BookmarkCommand(Command):
@@ -2370,7 +2481,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
     @classmethod
     def property_sources(cls, ds: Optional[ZFSList] = None, types: Optional[StringList] = 'all',
                          sources: Optional[StringList] = 'all', recursive: bool = False, depth: int = 0,
-                         prefix: Optional[StringList] = None) -> list:
+                         prefix: Optional[StringList] = None, properties: Optional[Sequence[str]] = None) -> list:
         """Discover which properties exist on objects and where each comes from, with no values
         (`zfs get -H -o name,property,source [-s sources] [-r | -d depth] -t types all <ds>`): phase one of a
         fail-closed read. Phase two is an explicit-list `rows()` of just the names wanted.
@@ -2394,6 +2505,16 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             prefix: str | [str] -- keep only properties whose name starts with one of these (default None: all),
                 filtered here, after every row has been checked (so a malformed row is never hidden by it). A string is
                 one prefix, never a comma list
+            properties: [str] -- ask zfs for just these properties (their comma-joined names go where `all` would) instead
+                of every property (default None: `all`, argv unchanged). On a large tree `all` makes zfs print a row per
+                inherited native property per dataset. Each is validated as `Validate.attribute` (a known native name or a
+                user property with a `:`; `all`, names starting with `-`, an empty list and duplicates are refused; a
+                string is one name). zfs prints a row for every requested property on every object, an unset user property
+                as source `-` (all of 2.1.5, 2.2.2, 2.3.9 and 2.4.1 print `-  -  -` for value, received and source;
+                captured, `tests/fixtures/openzfs/*/M5_Z1.txt`): such a row means "not set" and is dropped from the
+                result, never returned as a row with a source (after being checked and counted for duplicates and
+                contiguity). A native property with source `-` (read-only or not applicable) is kept, as with `all`. A
+                row for a property that was not requested is refused. `prefix` still applies, on top
 
         Returns:
             A list of `PropertySource(name, property, source)` in the order zfs printed them (each object's rows
@@ -2427,11 +2548,31 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         for x in prefixes:
             if not isinstance(x, str) or not re.fullmatch(Validate.name, x, re.ASCII):
                 raise ValueError('%s is not a valid property name prefix' % _clip(repr(x)))
+        names = requested = None
+        if properties is not None:
+            if isinstance(properties, str):
+                names = [properties]
+            elif isinstance(properties, (list, tuple)):
+                names = list(properties)
+            else:
+                raise ValueError('properties must be None, a string or a list of strings, got %s'
+                                 % type(properties).__name__)
+            if not names:
+                raise ValueError('properties must not be empty')
+            for x in names:
+                if not isinstance(x, str) or x == 'all' or x.startswith('-'):
+                    raise ValueError(_clip(repr(x)) + ' is not a valid ZFS property name')
+                Validate.attribute(x)
+            if len(set(names)) != len(names):
+                raise ValueError('properties lists a property twice')
+            requested = frozenset(names)
 
         cmd = [_zfs_cmd(), 'get', '-H', '-o', 'name,property,source']
         if sources and 'all' not in sources:
             cmd += ['-s', ','.join(sources)]
-        cmd += cls._scope_options(recursive=recursive, depth=depth, types=types) + ['all'] + datasets
+        cmd += cls._scope_options(recursive=recursive, depth=depth, types=types) + [
+            'all' if names is None else ','.join(names)
+        ] + datasets
         scope = _Scope(datasets, recursive=recursive, depth=depth)
 
         found = []
@@ -2445,7 +2586,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             for line in lines:
                 if not line:
                     continue
-                problem = cls._source_row_problem(line, wanted, scope)
+                problem = cls._source_row_problem(line, wanted, scope, requested)
                 row = None
                 if problem is None:
                     row = PropertySource(*line.split('\t'))
@@ -2463,6 +2604,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
                     if first is None:
                         first = '%s: %r' % (problem, _clip(_redact(line)))
                     continue
+                if requested is not None and row.source == '-' and ':' in row.property:
+                    continue    # an unset user property: zfs prints it as `-`, it has no source
                 if not prefixes or row.property.startswith(tuple(prefixes)):
                     found.append(row)
         finally:
@@ -2473,8 +2616,10 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return found
 
     @staticmethod
-    def _source_row_problem(line: str, wanted: Optional[set], scope: Callable[[str], bool]) -> Optional[str]:
-        """Why one `name<TAB>property<TAB>source` row of `property_sources()` cannot be trusted, or None."""
+    def _source_row_problem(line: str, wanted: Optional[set], scope: Callable[[str], bool],
+                            requested: Optional[frozenset] = None) -> Optional[str]:
+        """Why one `name<TAB>property<TAB>source` row of `property_sources()` cannot be trusted, or None. With
+        `requested` (an explicit property list), a row for any other property is refused."""
         cols = line.split('\t')
         if len(cols) != 3:
             return 'expected 3 columns, got %d' % len(cols)
@@ -2498,6 +2643,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         if not (re.fullmatch(Validate.native, prop, re.ASCII) or
                 (':' in prop and len(prop) <= Validate.max_name_len and re.fullmatch(Validate.name, prop, re.ASCII))):
             return 'invalid property name'
+        if requested is not None and prop not in requested:
+            return 'a property that was not requested'
         if source not in _PLAIN_SOURCES:
             if not source.startswith(_INHERITED):
                 return 'invalid source'
@@ -2805,7 +2952,10 @@ class InheritCommand(Command):
             ds.check_property(prop)
 
         for prop in props:
-            cmd = [_zfs_cmd(), 'inherit', prop] + cls._get_options(recursive=recursive, received=received) + [str(ds)]
+            # Every option before the property: BSD/macOS/illumos getopt stops at the first operand, so
+            # `inherit <prop> -S <ds>` fails there (`cannot open '-S'`); glibc would permute.
+            cmd = [_zfs_cmd(), 'inherit'] + cls._get_options(recursive=recursive, received=received) + \
+                [prop, str(ds)]
             cls._exec(cmd)
             ds.update({prop: None})
 

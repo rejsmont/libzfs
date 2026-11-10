@@ -98,13 +98,15 @@ pass `zfs-code-reviewer` (and `concurrency-reviewer` for B1.3 and B3) before the
 | A1 | zfsbackup-developer | needs-approval | Add `DatasetManager.get_own_anchor` / `get_own_inflight` (`zfs.get.value(..., sources='local')`). Unreadable → `None` with a DEBUG line, so the pair is due and negotiate decides. Use them in the due check (`workers.py:1353`), `_record_step` (`chain.py:~1003`), `_settle_up_to_date` (`chain.py:~1104`, `~1130`) and `health_collect` (`:145`, `:150`). Leave `get_anchor`/`get_anchors` for the pruner. Fix the `_get_prop` docstring. Tests: A0 (1) and (2) flip; a matrix of {local, inherited, received, unset, unreadable} × {due, record, settle, health}; the pruner's protect set is unchanged. |
 | A2 | zfsbackup-developer | needs-approval | `DatasetManager.expand_recursive(should_stop) -> Expansion(children, failed)` with the semantics above (`DatasetInfo.expanded_from`). `RemoteBackupWorker._get_datasets` appends the children before the depth sort. `_status_keys` covers the expanded pairs and keeps a failing parent's children's records. Discovery errors: one ERROR per parent per episode, INFO on recovery. The R-2 skip in the serial worker. The copy-name length check. The status-cap WARNING. Tests: kinds and deep trees, explicit override, nearest ancestor, disabled subtree excluded, skipped names, failed discovery, depth order, stamped config per destination, per-child `raw: auto`, no snapshots yet, vanished and renamed children, over-long name, R-2 skip. |
 | A2b | zfsbackup-developer | needs-approval (retention; a safety fix found in the A2 review) | The recursive prune must never destroy snapshots inside a backup copy below the recursive dataset, for example the copies of a `zfs:` destination later removed from the config, or a `send -R` replica. `zfs destroy -r pool@snap` also destroys `copy@snap` when names match. Feed the copy-root detection (local, received or inherited `client_id`/`source_dataset`) into `_descendant_anchor_protection` / `_still_prunable`: a copy below the dataset protects every snapshot name it holds, so the recursive destroy of that name is skipped, with one ERROR per episode naming the copy and the remedy (move it out of the recursive tree). An unreadable copy read protects everything (no recursive destroy that pass). Tests in `test_zfsbackup_prune_descendants.py` style. |
+| A2c | zfsbackup-developer | needs-approval (user decision 2026-11-10: "skip copies") | The snapshot worker never snapshots into a backup copy below a recursive dataset. When `_copy_roots` finds a copy strictly below a recursive dataset, take ONE atomic `zfs snapshot a@s b@s …` over the dataset and its source descendants (a name-only `zfs list -r -t filesystem,volume`, minus every copy subtree) instead of `snapshot -r`, with one ERROR per (dataset, copy root) per episode naming the copy and the remedy. No copy → plain `snapshot -r` as today. If the copy read or the listing FAILS, fall back to plain `snapshot -r` with an ERROR. This is deliberate: a stray snapshot in a copy is recoverable, a missed source snapshot is not. A child created between the listing and the snapshot misses one snapshot (next period catches up). Check libzfseasy's `zfs.snapshot` accepts several datasets in one call (it must be one command, so the snapshot is atomic). |
+| A2d | zfsbackup-cli-developer | needs-approval (user decision 2026-11-10: refuse, `--force` overrides) | Prevention, so plain `snapshot -r` stays the normal path. `validate_config` already refuses DECLARED targets at, below or recursively above configured datasets. The CLI additionally reads ZFS before committing (`set`/`unset`/`edit`/`import`, through the shared write path): (1) a dataset that becomes `recursive: true`, or is added as recursive, with a backup copy below it (`DatasetManager._copy_tops`: markers local/received/inherited, plus receive targets) → refuse, exit 1, naming the copy and the `zfs rename` to move it out; (2) removing a `zfs:` destination, or the server `target_dataset`, while copies under that target would be left below a recursive configured dataset → refuse with "move them first". `--force` overrides both (a warning is still printed). When zfs cannot be read (no zfs on this host, pool not imported, timeout), WARN only and commit. The daemon keeps A2c as the backstop for copies no config check sees (outside replicas). |
 | A3 | zfsbackup-developer | low-risk | `health_collect`: `expand_recursive` plus one anchor observation per child × destination (own reads, the parent's expected interval). A failed discovery gives one WARN entry for that subtree. Also (A1 review L2): an unreadable own anchor is reported as an observation error (the raising `get_local_anchor` → `Observation(error=...)`, as the listing failure does), not as "never sent". Tests: `test_zfsbackup_health_collect.py`, `test_zfsbackup_cli_check.py` (JSON, Prometheus, Nagios). |
 | A4 | zfsbackup-cli-developer | needs-approval | `rename destination` copies and clears `anchor.<old>`/`inflight.<old>` on the descendants of recursive datasets too (local values only) and prints the undo/inherit commands. `rename dataset` notes that children's copies move with the parent copy's `zfs rename`. Also (A1 review L3): `copy_anchor_property` (`backup_manager.py:~321`) and `_copy_inflight_property` (`cli/rename.py:~167`) copy only LOCAL values, never a received one: after A1 a received anchor is not evidence, and a rename must not turn it into a local one. Tests: `test_zfsbackup_cli_rename.py`, using a recursive tree in `tests/_fake_zfs.py`. |
 | A5 | zfsbackup-developer (README), main session (CLAUDE.md) | low-risk | README "Recursive datasets" section. Also from the A2 review: (a) anchors are keyed by destination NAME, so after a URL or `zfs:` target switch a parent's stale fresh anchor reads as "sent" (R-2 passes, and the parent itself waits up to one period), so document it and have A4/`set`/`edit` warn; (b) a child without a readable own anchor has an unprotected common snapshot until its pin is written (same as configured children); (c) `raw: true` on a parent applies to every child, and an unencrypted child is refused with the existing ERROR; (d) dropped children (names libzfseasy cannot represent) leave only libzfseasy's WARNING; (e) a child's encoded config near the 8 KiB cap is refused at negotiate. Contents: fix README ~953; update the CLAUDE.md `backup_manager.py`/`workers.py` paragraphs and the tests table. |
 | A6a | pytest-test-author | low-risk | Real ZFS, using a tree of: an unencrypted parent; a child that is its own encryption root (raw); a grandchild inheriting that encryption; a zvol child; an explicitly configured child. Cover parent-first fulls, incrementals, a child created mid-run, the recursive prune keeping children's anchored snapshots, the inherited-anchor regression, and receiver pruning by stamped config. |
 | A6b | real-zfs-scenario-dev | low-risk | `test_two_vm_backup.sh`, `test_local_destination.sh`: the same tree, plus a child created then destroyed mid-run. Never launch two VMs at once. |
 
-Order: A0 → A1 → A2 → A2b → (A3 ∥ A4) → (A5 ∥ A6a ∥ A6b). The tests author follows each item.
+Order: A0 → A1 → A2 → A2b → A2c → (A2d ∥ A3 ∥ A4) → (A5 ∥ A6a ∥ A6b). The tests author follows each item.
 
 ## Track B — parallel sender threads
 
@@ -157,6 +159,14 @@ Its main thread becomes the **scheduler**:
   - `DatasetInfo.snapshots` is written by every listing.
 - `/whoami`, the identity reload and the local target check run once per send.
 
+Carried over from A2 (the serial worker's state that B must move or rework):
+- `_waiting_noted`, `_pairs_over_cap_noted`, `_expand_*_noted`, `_dry_run_sent` and the `_dependents` map are plain
+  per-worker state. They belong in `SendMemory`, or in the scheduler thread only.
+- `copy_confirmed` lives on the sender instance. With fresh managers per send (B3) it must move to `SendMemory`, keyed
+  by (dataset, destination), so that confirmation survives across sends within the incarnation.
+- `_waits_for_ancestor` lists each held child's snapshots every cycle while its ancestor is unconfirmed. Under the
+  scheduler, hold children without listing, and decide "no snapshots" in the sender.
+
 ### Scheduling
 
 - **Notation:** `F` = snapshot frequency; `P` = `remote.frequency or F`; `W = min(P, F)`;
@@ -188,6 +198,36 @@ Its main thread becomes the **scheduler**:
 | B4 | various | low-risk | README (lines ~922, 975, 1429) and CLAUDE.md; a `check`/`status` regression with many pairs; scenarios (overlapping sends, reload during a long send, concurrent local sends, hung target pool, throughput at 1, 2 and 4 senders); real-ZFS concurrent chains from one dataset to two destinations. |
 
 Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 after A2 and B2, then B4.
+
+## Follow-ups found during Track A (not yet scheduled)
+
+- **A configured child under a recursive parent, snapshotted first, blocks the parent's tree (pre-existing).** The
+  snapshot worker walks datasets in config order. A configured enabled child with the same frequency as its recursive
+  parent, listed before it, takes `@N` first. The parent's `snapshot -r` (or the A2c atomic list) then fails with
+  "already exists" every period, so the parent's whole tree is never snapshotted. Validation does not refuse this
+  layout. **Decided 2026-11-10 (item A2e): parents first, ride along.** The snapshot worker snapshots enabled recursive
+  parents before their configured descendants (a depth sort, as the remote worker does). A configured child whose
+  `@N` was just created by an enabled recursive ancestor's snapshot (`snapshot -r` or the A2c atomic list) counts that
+  as its own snapshot for that period: no "already exists" WARNING, not a failure. It keeps its own retention and
+  destinations, and takes extra snapshots only when its own frequency is higher. Tests: config order child-before-parent,
+  equal and different frequencies, the parent's atomic snapshot covering the child, and the child's own pruning.
+
+- **libzfseasy option order.** `zfs.inherit` emits `zfs inherit <prop> -S <ds>` (and `-r` likewise) with the option AFTER
+  the property. glibc getopt permutes, so this works on Linux, but a BSD or illumos getopt stops at the first operand.
+  Move the options before the property (libzfseasy-developer). Check the other commands for the same pattern.
+
+- **The cost of the copy read (A2/A2b review).**
+  `zfs get -H -o name,property,source -s local,received,inherited -r … all <ds>` returns a row for every inherited
+  native property of every dataset in the tree. It runs once per expansion (each remote cycle) and once per destroy
+  call in `_still_prunable`.
+  - **Done:** `zfs.get.property_sources(..., properties=[...])` takes an explicit property list and `_copy_roots` passes
+    `org.zfsbackup:client_id,org.zfsbackup:source_dataset`, so the read is `zfs get -H -o name,property,source
+    -s local,received,inherited -r -t filesystem,volume org.zfsbackup:client_id,org.zfsbackup:source_dataset <ds>`
+    (still value-free). What remains is the call count.
+  - Or share the discovery with the descendant-anchor read.
+- **Copies without markers** (a manual `send | recv` with no `-o`, a syncoid replica without properties), not under a
+  known receive target, are indistinguishable from source children. They are sent as children (A2) and pruned
+  recursively. A6a: also add a `real_zfs` test proving `zfs destroy -r R@x` keeps a MARKED copy's `@x`.
 
 ## Known trade-offs of the thread model
 

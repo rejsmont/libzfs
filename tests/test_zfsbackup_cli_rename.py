@@ -80,6 +80,9 @@ from _cli_support import (
     fake_zfs,
     generation,
     host_client_id,
+    inherit_command,
+    inherit_property,
+    interleaved,
     isolated,
     live_daemon,
     make_db,
@@ -274,7 +277,7 @@ class TestRenameDataset:
         fake_zfs.add("tank/vm.02", {})
         out = run("rename", "dataset", "tank/vm.01", "tank/vm.02", "-c", rich).stdout
         assert "The stale properties on 'tank/vm.01' were left in place. To remove them, once no daemon is running:" in out
-        assert f"zfs inherit {ANCHOR}offsite tank/vm.01" in out and f"zfs inherit {CONFIG_PROP} tank/vm.01" in out
+        assert f"zfs inherit -S {ANCHOR}offsite tank/vm.01" in out and f"zfs inherit {CONFIG_PROP} tank/vm.01" in out
         assert "compression" not in out
 
     def test_no_commands_when_the_properties_will_follow_a_zfs_rename(self, run, rich, fake_zfs):
@@ -623,7 +626,7 @@ class TestRenameDatasetClearStale:
 
     def test_one_zfs_inherit_per_property_in_order(self, run, rich, stale):
         self.clear(run, rich)
-        assert [c[1] for c in self.inherits(stale)] == self.ORDER
+        assert [inherit_property(c) for c in self.inherits(stale)] == self.ORDER
 
     def test_the_inherit_runs_only_after_the_configuration_is_written(self, run, rich, stale, monkeypatch):
         seen = {}
@@ -703,7 +706,7 @@ class TestRenameDatasetClearStale:
         assert f"a daemon is running (pid {holder.pid})" in err
         assert "Once it is stopped, run:" in err
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in err
+            assert inherit_command(prop, "tank/vm.01") in err
         assert "tank/vm.02" in names(rich)                       # the write stands
         assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
         assert "config updated" in result.stdout                 # the daemon notice still printed
@@ -768,7 +771,7 @@ class TestRenameDatasetClearStale:
         assert result.exit_code == 1
         err = result.stderr
         assert "NOT cleared: cannot tell whether a daemon is running (Input/output error)" in err
-        assert all(f"zfs inherit {p} tank/vm.01" in err for p in self.ORDER)
+        assert all(inherit_command(p, "tank/vm.01") in err for p in self.ORDER)
         assert stale.mutations == [] and "tank/vm.02" in names(rich)
 
     def test_one_probe_after_the_write_and_no_lock_is_held_through_the_inherits(self, run, rich, stale, monkeypatch):
@@ -875,20 +878,20 @@ class TestRenameDatasetClearStale:
         assert "the configuration was renamed, but clearing the stale properties on 'tank/vm.01' failed" in err
         assert f"Cleared so far: {ANCHOR}dc.two" in err
         assert "Still set, to clear by hand:" in err
-        assert f"zfs inherit {ANCHOR}offsite tank/vm.01" in err and f"zfs inherit {CONFIG_PROP} tank/vm.01" in err
-        assert f"zfs inherit {ANCHOR}dc.two" not in err
+        assert f"zfs inherit -S {ANCHOR}offsite tank/vm.01" in err and f"zfs inherit {CONFIG_PROP} tank/vm.01" in err
+        assert f"zfs inherit -S {ANCHOR}dc.two" not in err
         assert "tank/vm.02" in names(rich)
         assert stale.props("tank/vm.01") == {
             CONFIG_PROP: "cfg", ANCHOR + "offsite": "snap1", "compression": "lz4",
         }
         # it stopped at the first failure
-        assert [c[1] for c in self.inherits(stale)] == [ANCHOR + "dc.two", ANCHOR + "offsite"]
+        assert [inherit_property(c) for c in self.inherits(stale)] == [ANCHOR + "dc.two", ANCHOR + "offsite"]
 
     def test_a_failure_on_the_first_property_says_none_were_cleared(self, run, rich, stale):
         stale.fail("inherit", "tank/vm.01", ANCHOR + "dc.two")
         err = self.clear(run, rich).stderr
         assert "Cleared so far: none" in err
-        assert all(f"zfs inherit {p} tank/vm.01" in err for p in self.ORDER)
+        assert all(inherit_command(p, "tank/vm.01") in err for p in self.ORDER)
 
     def test_an_interrupt_mid_clear_lists_what_was_cleared(self, run, rich, stale, monkeypatch):
         import zfsbackup.backup_manager as bm
@@ -1007,7 +1010,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert self.REFUSED in err and why in err
         assert "Once it is stopped, run:" in err
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in err
+            assert inherit_command(prop, "tank/vm.01") in err
         assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
         if renamed:
             assert "tank/vm.02" in names(rich)                   # the rename itself stands
@@ -1016,7 +1019,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert result.exit_code == 0, (result.stdout, result.stderr)
         assert "Cleared on 'tank/vm.01':" in result.stdout
         assert stale.props("tank/vm.01") == {"compression": "lz4"}
-        assert [c[1] for c in self.inherits(stale)] == self.ORDER
+        assert [inherit_property(c) for c in self.inherits(stale)] == self.ORDER
         assert "tank/vm.02" in names(rich)
 
     # -- 1, 2: the daemon applied the rename -----------------------------
@@ -1066,7 +1069,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
             f"{self.REFUSED}: a daemon is running (pid {d.pid}). Once it is stopped, run:\n"
         ) in result.stderr
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in result.stderr
+            assert inherit_command(prop, "tank/vm.01") in result.stderr
         assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
         assert "tank/vm.02" in names(rich)
         assert answers == []                      # and it did not wait for anything
@@ -1341,7 +1344,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
             f"{self.REFUSED}: a daemon is running (pid {daemon.pid}). Once it is stopped, run:\n"
         ) in result.stderr
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in result.stderr
+            assert inherit_command(prop, "tank/vm.01") in result.stderr
         assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
         assert "tank/vm.02" in names(rich)
         assert [w for w in answers if w[1]] == []         # never waited for `applied`
@@ -1433,7 +1436,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert "the writer lock was not free" in err
         assert "Re-running the rename cannot help" in err and "run this again" not in err
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in err
+            assert inherit_command(prop, "tank/vm.01") in err
         assert stale.mutations == [] and "tank/vm.02" in names(rich)
 
     def test_a_real_holder_of_the_writer_lock_is_exit_75(
@@ -1468,7 +1471,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
             thread.join(10)
         assert result.exit_code == 75, (result.stdout, result.stderr)
         assert "the writer lock was not free" in result.stderr
-        assert f"zfs inherit {ANCHOR}offsite tank/vm.01" in result.stderr
+        assert f"zfs inherit -S {ANCHOR}offsite tank/vm.01" in result.stderr
         assert stale.mutations == [] and "tank/vm.02" in names(rich)
         assert done.is_set()
 
@@ -1723,7 +1726,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert "Re-running the rename cannot help" in err
         assert "run this again" not in err
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in err
+            assert inherit_command(prop, "tank/vm.01") in err
         assert stale.mutations == [] and "tank/vm.02" in names(rich)
 
     # -- errors from the gate itself ---------------------------------------------
@@ -1751,7 +1754,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert "the configuration was renamed, but clearing the stale properties on 'tank/vm.01' failed" in err
         assert "Cleared so far: none" in err
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in err
+            assert inherit_command(prop, "tank/vm.01") in err
         assert stale.mutations == [] and "tank/vm.02" in names(rich)
 
     def test_a_probe_error_after_the_writer_lock_is_still_cannot_tell(
@@ -1885,7 +1888,7 @@ class TestRenameDatasetClearWithAVerifiedDaemon:
         assert "clearing the stale properties on 'tank/vm.01' failed" in err
         assert "Cleared so far: none" in err
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in err
+            assert inherit_command(prop, "tank/vm.01") in err
         assert stale.mutations == [] and "tank/vm.02" in names(rich)
 
     def test_an_existing_but_unheld_workers_lock_is_no_workers(self, run, rich, db, stale):
@@ -2077,15 +2080,15 @@ class TestRenameDestination:
         assert "Restart the daemon" not in out
         assert "anchor.offsite keeps protecting its snapshot from pruning" in out
         assert "Once a send to 'offsite2' has succeeded, clear the old property" in out
-        assert f"zfs inherit {ANCHOR}offsite tank/data" in out
-        assert f"zfs inherit {ANCHOR}offsite tank/other" in out
+        assert f"zfs inherit -S {ANCHOR}offsite tank/data" in out
+        assert f"zfs inherit -S {ANCHOR}offsite tank/other" in out
 
     def test_only_datasets_that_have_an_old_anchor_get_an_inherit_hint(self, run, rich, fake_zfs):
         fake_zfs.add("tank/data", {})                                   # nothing to copy
         fake_zfs.add("tank/other", {ANCHOR + "offsite": "x"})
         out = self.rename(run, rich).stdout
         hints = [l for l in out.splitlines() if l.strip().startswith("zfs inherit")]
-        assert hints == [f"  zfs inherit {ANCHOR}offsite tank/other"]
+        assert hints == [f"  zfs inherit -S {ANCHOR}offsite tank/other"]
         assert "on 'tank/other'" in out and "'tank/data'" not in out.split("A running daemon reloads")[1]
 
     def test_no_advice_when_no_anchor_was_involved(self, run, rich, fake_zfs):
@@ -2188,7 +2191,7 @@ class TestRenameDestination:
         assert "Nothing was written to the configuration" in err
         # tank/data got a NEW anchor.offsite2 (it had none): putting it back = inherit
         assert "To put the previous values back run:" in err
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/data" in err
         assert "tank/other" not in err.split("To put the previous values back run:")[1]
         assert "Already copied" not in err
         assert db_state(rich) == state
@@ -2258,8 +2261,8 @@ class TestRenameDestination:
         assert "interrupted while copying org.zfsbackup:anchor.offsite to anchor.offsite2 on 'tank/other'" in err
         assert "Nothing was written to the configuration" in err
         # the finished copy AND the one in flight (which may or may not have landed)
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/other" in err
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/data" in err
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/other" in err
         assert db_state(rich) == state
 
     def test_an_interrupt_on_the_first_copy_restores_only_the_one_in_flight(self, run, rich, anchors, monkeypatch):
@@ -2270,7 +2273,7 @@ class TestRenameDestination:
 
         monkeypatch.setattr(bm, "copy_anchor_property", interrupting)
         err = self.rename(run, rich).stderr
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/data" in err
         assert "tank/other" not in err.split("To put the previous values back run:")[1]
 
     def test_a_dataset_missing_from_zfs_aborts_before_anything_is_copied(self, run, rich, fake_zfs):
@@ -2387,7 +2390,7 @@ class TestRenameDestination:
         assert "database is locked by another process" in err
         assert "To put the previous values back run:" in err
         assert f"  zfs set {ANCHOR}offsite2=older tank/data" in err        # was overwritten
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/other" in err         # was absent
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/other" in err         # was absent
         assert "offsite2" not in stored(rich).destinations
 
     def test_a_conflict_raised_by_the_commit_is_75_with_the_restore_commands(
@@ -2399,8 +2402,8 @@ class TestRenameDestination:
         monkeypatch.setattr(rename, "commit_config", conflict)
         result = self.rename(run, rich)
         assert result.exit_code == 75
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in result.stderr
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/other" in result.stderr
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/data" in result.stderr
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/other" in result.stderr
 
     def test_the_commit_gets_the_held_writer_lock(self, run, rich, anchors, monkeypatch):
         seen = {}
@@ -2583,19 +2586,19 @@ class TestRenameDestinationInflight:
 
     def test_the_stale_commands_include_the_inflight_inherit(self, run, rich, pins):
         out = self.rename(run, rich).stdout
-        assert f"zfs inherit {INFLIGHT}offsite tank/data" in out
-        assert f"zfs inherit {INFLIGHT}offsite tank/other" in out
-        assert f"zfs inherit {ANCHOR}offsite tank/data" in out
-        assert f"zfs inherit {ANCHOR}offsite tank/other" not in out        # no anchor there
+        assert f"zfs inherit -S {INFLIGHT}offsite tank/data" in out
+        assert f"zfs inherit -S {INFLIGHT}offsite tank/other" in out
+        assert f"zfs inherit -S {ANCHOR}offsite tank/data" in out
+        assert f"zfs inherit -S {ANCHOR}offsite tank/other" not in out        # no anchor there
         assert "inflight.offsite (the pin on the snapshots of a send to 'offsite'" in out
-        assert f"zfs inherit {INFLIGHT}dc.two" not in out                   # not this destination's
+        assert f"zfs inherit -S {INFLIGHT}dc.two" not in out                   # not this destination's
 
     def test_only_a_pin_alone_still_gets_the_inherit_hint(self, run, rich, fake_zfs):
         fake_zfs.add("tank/data", {})
         fake_zfs.add("tank/other", {INFLIGHT + "offsite": "s1,s2"})
         out = self.rename(run, rich).stdout
         hints = [l.strip() for l in out.splitlines() if l.strip().startswith("zfs inherit")]
-        assert hints == [f"zfs inherit {INFLIGHT}offsite tank/other"]
+        assert hints == [f"zfs inherit -S {INFLIGHT}offsite tank/other"]
 
     def test_a_dotted_destination_pin(self, run, rich, pins):
         result = self.rename(run, rich, old="dc.two", new="dc.three")
@@ -2621,8 +2624,8 @@ class TestRenameDestinationInflight:
         err = result.stderr
         assert "To put the previous values back run:" in err
         assert f"  zfs set {INFLIGHT}offsite2=o1,o2 tank/data" in err        # was overwritten
-        assert f"  zfs inherit {INFLIGHT}offsite2 tank/other" in err          # was absent
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err             # the anchor, as before
+        assert f"  zfs inherit -S {INFLIGHT}offsite2 tank/other" in err          # was absent
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/data" in err             # the anchor, as before
         assert f"{INFLIGHT}offsite2 was overwritten on 'tank/data'" in err
         assert f"{INFLIGHT}offsite2 was newly set on 'tank/other'" in err
         assert "which copies anchor.offsite and inflight.offsite again" in err
@@ -2654,7 +2657,7 @@ class TestRenameDestinationInflight:
         ]
         assert sorted(commands) == sorted([
             f"zfs set {INFLIGHT}offsite2=o1,o2 tank/data",
-            f"zfs inherit {INFLIGHT}offsite2 tank/other",
+            f"zfs inherit -S {INFLIGHT}offsite2 tank/other",
         ])
         for command in commands:
             subprocess.run([str(fake_zfs.wrapper), *shlex.split(command)[1:]], check=True, env=dict(os.environ))
@@ -2669,8 +2672,8 @@ class TestRenameDestinationInflight:
         err = result.stderr
         assert f"copying {INFLIGHT}offsite to inflight.offsite2 on 'tank/data' failed" in err
         assert "Nothing was written to the configuration" in err
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err           # the anchor that landed
-        assert f"zfs inherit {INFLIGHT}offsite2 tank/data" not in err      # the pin that did not
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/data" in err           # the anchor that landed
+        assert f"zfs inherit -S {INFLIGHT}offsite2 tank/data" not in err      # the pin that did not
         assert db_state(rich) == state
 
     def test_an_interrupt_during_a_pin_copy_covers_it_in_the_note(self, run, rich, pins, monkeypatch):
@@ -2684,8 +2687,8 @@ class TestRenameDestinationInflight:
         err = result.stderr
         assert f"interrupted while copying {INFLIGHT}offsite to inflight.offsite2 on 'tank/data'" in err
         assert "Nothing was written to the configuration" in err
-        assert f"  zfs inherit {ANCHOR}offsite2 tank/data" in err           # finished anchor copy
-        assert f"  zfs inherit {INFLIGHT}offsite2 tank/data" in err         # the one in flight
+        assert f"  zfs inherit -S {ANCHOR}offsite2 tank/data" in err           # finished anchor copy
+        assert f"  zfs inherit -S {INFLIGHT}offsite2 tank/data" in err         # the one in flight
         assert db_state(rich) == state
 
     # -- --skip-missing ---------------------------------------------------------
@@ -2697,7 +2700,7 @@ class TestRenameDestinationInflight:
         assert fake_zfs.props("tank/data")[INFLIGHT + "offsite2"] == "a,b"
         assert all(c[-1] != "tank/other" for c in fake_zfs.mutations)
         assert "tank/other:" not in result.stdout
-        assert f"zfs inherit {INFLIGHT}offsite tank/other" not in result.stdout
+        assert f"zfs inherit -S {INFLIGHT}offsite tank/other" not in result.stdout
 
 
 class TestRenameDatasetInflight:
@@ -2728,18 +2731,38 @@ class TestRenameDatasetInflight:
     def test_clear_stale_props_inherits_the_pins_in_sorted_order(self, run, rich, stale):
         result = self.clear(run, rich)
         assert result.exit_code == 0, result.stderr
-        assert [c[1] for c in self.inherits(stale)] == self.ORDER
+        assert [inherit_property(c) for c in self.inherits(stale)] == self.ORDER
         assert all(c[-1] == "tank/vm.01" for c in self.inherits(stale))
         assert stale.props("tank/vm.01") == {"compression": "lz4"}
         assert "tank/vm.02" in names(rich)
         cleared = [l for l in result.stdout.splitlines() if l.startswith("Cleared on 'tank/vm.01':")]
         assert cleared == ["Cleared on 'tank/vm.01': " + ", ".join(self.ORDER)]
 
-    def test_a_pin_inherit_is_a_plain_one_property_inherit(self, run, rich, stale):
+    def test_a_pin_inherit_is_a_one_property_inherit_on_the_old_dataset(self, run, rich, stale):
         self.clear(run, rich)
-        pin_calls = [c for c in self.inherits(stale) if c[1].startswith(INFLIGHT)]
-        assert pin_calls == [["inherit", INFLIGHT + "dc.two", "tank/vm.01"],
-                             ["inherit", INFLIGHT + "offsite", "tank/vm.01"]]
+        pin_calls = [c for c in self.inherits(stale) if inherit_property(c).startswith(INFLIGHT)]
+        assert [(inherit_property(c), c[-1]) for c in pin_calls] == [(INFLIGHT + "dc.two", "tank/vm.01"),
+                                                       (INFLIGHT + "offsite", "tank/vm.01")]
+
+    def test_a_pin_is_cleared_with_inherit_dash_S_like_the_advice_says(self, run, rich, stale):
+        self.clear(run, rich)
+        pin_calls = [c for c in self.inherits(stale) if inherit_property(c).startswith(INFLIGHT)]
+        # libzfseasy writes the options before the property: `zfs inherit -S PROP DATASET`
+        assert pin_calls == [["inherit", "-S", INFLIGHT + "dc.two", "tank/vm.01"],
+                             ["inherit", "-S", INFLIGHT + "offsite", "tank/vm.01"]]
+
+    def test_clearing_leaves_a_received_only_anchor_in_place(self, run, rich, fake_zfs):
+        """`-S` leaves a received-only anchor alone (the pruner keeps protecting it); what the
+        command says about it is pinned in `TestRenameDatasetLeftInPlaceReceived`."""
+        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "cfg"})
+        fake_zfs.set_prop("tank/vm.01", ANCHOR + "offsite", "RCV", "received")
+        fake_zfs.add("tank/vm.02", {})
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.value("tank/vm.01", ANCHOR + "offsite") == "RCV"
+        assert fake_zfs.source("tank/vm.01", ANCHOR + "offsite") == "received"
+        assert fake_zfs.value("tank/vm.01", CONFIG_PROP) is None
+
 
     def test_a_failing_pin_inherit_reports_cleared_so_far_and_what_is_left(self, run, rich, stale):
         stale.fail("inherit", "tank/vm.01", INFLIGHT + "offsite")
@@ -2749,21 +2772,21 @@ class TestRenameDatasetInflight:
         assert "clearing the stale properties on 'tank/vm.01' failed" in err
         assert "Cleared so far: " + ", ".join(self.ORDER[:4]) in err
         left = err.split("Still set, to clear by hand:")[1]
-        assert f"zfs inherit {INFLIGHT}offsite tank/vm.01" in left
+        assert f"zfs inherit -S {INFLIGHT}offsite tank/vm.01" in left
         for prop in self.ORDER[:4]:
-            assert f"zfs inherit {prop} " not in left
+            assert inherit_command(prop, "tank/vm.01") not in left
         assert stale.props("tank/vm.01") == {
             INFLIGHT + "offsite": "a,b", "compression": "lz4",
         }
-        assert [c[1] for c in self.inherits(stale)] == self.ORDER       # it stopped at the failure
+        assert [inherit_property(c) for c in self.inherits(stale)] == self.ORDER       # it stopped at the failure
 
     def test_a_failing_first_pin_leaves_both_pins(self, run, rich, stale):
         stale.fail("inherit", "tank/vm.01", INFLIGHT + "dc.two")
         err = self.clear(run, rich).stderr
         assert "Cleared so far: " + ", ".join(self.ORDER[:3]) + "." in err
         left = err.split("Still set, to clear by hand:")[1]
-        assert f"zfs inherit {INFLIGHT}dc.two tank/vm.01" in left
-        assert f"zfs inherit {INFLIGHT}offsite tank/vm.01" in left
+        assert f"zfs inherit -S {INFLIGHT}dc.two tank/vm.01" in left
+        assert f"zfs inherit -S {INFLIGHT}offsite tank/vm.01" in left
         assert stale.props("tank/vm.01")[INFLIGHT + "offsite"] == "a,b"
 
     def test_an_interrupt_before_a_pin_lists_the_pins_that_may_remain(self, run, rich, stale, monkeypatch):
@@ -2789,7 +2812,7 @@ class TestRenameDatasetInflight:
         out = result.stdout
         assert "The stale properties on 'tank/vm.01' were left in place" in out
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in out
+            assert inherit_command(prop, "tank/vm.01") in out
         assert stale.mutations == []
 
     def test_the_warning_names_the_pins_among_the_stale_properties(self, run, rich, stale):
@@ -2824,7 +2847,7 @@ class TestRenameDatasetInflight:
         result = self.clear(run, rich)
         assert result.exit_code == 1
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in result.stderr
+            assert inherit_command(prop, "tank/vm.01") in result.stderr
         assert stale.mutations == [] and stale.props("tank/vm.01") == self.PROPS
 
 
@@ -3339,7 +3362,7 @@ class TestInterruptAfterTheWrite:
         assert "the rename of dataset 'tank/vm.01' was applied" in err
         assert "to clear them once no daemon is running:" in err
         for prop in self.ORDER:
-            assert f"zfs inherit {prop} tank/vm.01" in err
+            assert inherit_command(prop, "tank/vm.01") in err
         assert stale.props("tank/vm.01") == self.PROPS and "tank/vm.02" in names(rich)
 
     def test_no_inherit_commands_without_the_flag(self, run, rich, stale, monkeypatch):
@@ -3496,3 +3519,1073 @@ class TestRenameDestinationHoldsTheWriterLock:
         with pytest.raises(ConfigConflict) as excinfo:
             rename._require_generation(resolved, snapshot)
         assert (excinfo.value.expected, excinfo.value.actual) == (snapshot.generation, snapshot.generation + 1)
+
+
+# --------------------------------------------------------------------------
+# A4: recursive datasets. The descendants of an enabled `recursive: true`
+# dataset that sends to OLD are sent as copies of their own, each with its own
+# LOCAL `anchor.OLD` / `inflight.OLD`, so `rename destination` copies those too.
+# --------------------------------------------------------------------------
+
+#: One recursive dataset sending to `offsite`, a second recursive one sending only
+#: to `spare`, and room for per-test extra datasets (`{extra}`).
+TREE_YAML = """\
+snapshot_prefix: "autosnap"
+check_interval: "5m"
+datasets:
+  - name: "tank/tree"
+    frequency: "1h"
+    recursive: true
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "offsite"
+{extra}destinations:
+  offsite:
+    url: "https://offsite:8080"
+  spare:
+    url: "https://spare:8080"
+"""
+
+
+def dataset_block(name, *, recursive=False, enabled=True, remote=("offsite",)):
+    lines = [f'  - name: "{name}"', '    frequency: "1h"', '    retention:', '      "1d": "30d"']
+    if recursive:
+        lines.insert(2, "    recursive: true")
+    if not enabled:
+        lines.insert(2, "    enabled: false")
+    if remote:
+        lines.append("    remote:")
+        lines += [f'      - destination: "{d}"' for d in remote]
+    else:
+        lines.append("    remote: []")
+    return "\n".join(lines) + "\n"
+
+
+def tree_db(run, db, *blocks):
+    return make_db(run, db, TREE_YAML.format(extra="".join(blocks)))
+
+
+def grow_tree(fake):
+    """The ZFS side: the parent and four descendants with a mix of state."""
+    fake.add("tank/tree", {ANCHOR + "offsite": "P0"})
+    fake.add("tank/tree/a", {ANCHOR + "offsite": "A1", INFLIGHT + "offsite": "a1,a2"})
+    fake.add("tank/tree/b", {ANCHOR + "offsite": "B1"})
+    fake.add("tank/tree/b/deep", {INFLIGHT + "offsite": "d1,d2"})     # a pin and no anchor
+    fake.add("tank/tree/empty", {})                                   # never sent
+    return fake
+
+
+def recursive_calls(fake, command="list"):
+    return [c for c in fake.calls_of(command) if "-r" in c]
+
+
+class TestRenameDestinationRecursive:
+    @pytest.fixture
+    def tree(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        return tree_db(run, db)
+
+    def rename(self, run, database, *extra, old="offsite", new="offsite2"):
+        return run("rename", "destination", old, new, *extra, "-c", database)
+
+    def test_the_fake_walks_the_tree_and_finds_no_copy_root(self, fake_zfs):
+        grow_tree(fake_zfs)
+        listed = subprocess.run(
+            [str(fake_zfs.wrapper), "list", "-H", "-r", "-t", "filesystem,volume", "-o", "name,type", "tank/tree"],
+            capture_output=True, text=True, env=dict(os.environ),
+        )
+        assert listed.stdout.splitlines() == [
+            "tank/tree\tfilesystem", "tank/tree/a\tfilesystem", "tank/tree/b\tfilesystem",
+            "tank/tree/b/deep\tfilesystem", "tank/tree/empty\tfilesystem",
+        ]
+
+    # -- what is copied ---------------------------------------------------
+
+    def test_every_descendant_with_something_to_copy_gets_its_own_copy_before_the_write(
+        self, run, tree, fake_zfs, monkeypatch
+    ):
+        seen = {}
+        real = rename.commit_config
+
+        def commit(*args, **kwargs):
+            seen["sets"] = [c for c in fake_zfs.calls if c[0] == "set"]
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rename, "commit_config", commit)
+        gen = generation(tree)
+        result = self.rename(run, tree)
+        assert result.exit_code == 0, result.stderr
+        assert sorted(seen["sets"]) == sorted([
+            ["set", f"{ANCHOR}offsite2=P0", "tank/tree"],
+            ["set", f"{ANCHOR}offsite2=A1", "tank/tree/a"],
+            ["set", f"{INFLIGHT}offsite2=a1,a2", "tank/tree/a"],
+            ["set", f"{ANCHOR}offsite2=B1", "tank/tree/b"],
+            ["set", f"{INFLIGHT}offsite2=d1,d2", "tank/tree/b/deep"],
+        ])
+        for name, prop, value in [
+            ("tank/tree/a", ANCHOR, "A1"), ("tank/tree/b", ANCHOR, "B1"),
+            ("tank/tree/a", INFLIGHT, "a1,a2"), ("tank/tree/b/deep", INFLIGHT, "d1,d2"),
+        ]:
+            assert fake_zfs.props(name)[prop + "offsite2"] == value
+            assert fake_zfs.props(name)[prop + "offsite"] == value                # copied, never moved
+        assert ANCHOR + "offsite2" not in fake_zfs.props("tank/tree/empty")
+        assert INFLIGHT + "offsite2" not in fake_zfs.props("tank/tree/empty")
+        assert fake_zfs.props("tank/tree/a")[ANCHOR + "offsite"] == "A1"       # copied, never moved
+        assert fake_zfs.calls_of("inherit") == []
+        assert generation(tree) == gen + 1
+        assert "offsite2" in stored(tree).destinations and "offsite" not in stored(tree).destinations
+
+    def test_the_output_names_each_child_copy_and_summarises_the_parent_once(self, run, tree):
+        out = self.rename(run, tree).stdout
+        assert "tank/tree: anchor.offsite2 set to P0 (copied from anchor.offsite)" in out
+        assert "tank/tree/a: anchor.offsite2 set to A1 (copied from anchor.offsite)" in out
+        assert "tank/tree/a: inflight.offsite2 set to a1,a2 (copied from inflight.offsite)" in out
+        assert "tank/tree/b: anchor.offsite2 set to B1 (copied from anchor.offsite)" in out
+        assert "tank/tree/b/deep: inflight.offsite2 set to d1,d2 (copied from inflight.offsite)" in out
+        summaries = [l for l in out.splitlines() if "descendant(s)" in l]
+        assert summaries == [
+            "4 descendant(s) of 'tank/tree' send to 'offsite'; 3 had an anchor.offsite or inflight.offsite to copy"
+        ]
+
+    def test_a_child_with_nothing_to_copy_prints_nothing(self, run, tree):
+        out = self.rename(run, tree).stdout
+        assert "tank/tree/empty" not in out
+        before_summary = out.split("descendant(s)")[0]
+        # a child with an anchor and no pin (or a pin and no anchor) is reported for what it has, as a configured one is
+        assert [l for l in before_summary.splitlines() if "tank/tree/b:" in l] == [
+            "tank/tree/b: anchor.offsite2 set to B1 (copied from anchor.offsite)"
+        ]
+        assert "tank/tree: has no" not in out
+
+    def test_a_configured_dataset_with_nothing_to_copy_still_says_so(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree", {})
+        tree_db(run, db)
+        out = self.rename(run, db).stdout
+        assert "tank/tree: has no anchor.offsite to copy" in out
+
+    def test_the_old_properties_are_listed_for_clearing_children_included_and_never_run(self, run, tree, fake_zfs):
+        out = self.rename(run, tree).stdout
+        anchors = [l.strip() for l in out.splitlines() if l.strip().startswith(f"zfs inherit -S {ANCHOR}offsite ")]
+        assert anchors == [
+            f"zfs inherit -S {ANCHOR}offsite tank/tree",
+            f"zfs inherit -S {ANCHOR}offsite tank/tree/a",
+            f"zfs inherit -S {ANCHOR}offsite tank/tree/b",
+        ]
+        pins = [l.strip() for l in out.splitlines() if l.strip().startswith(f"zfs inherit -S {INFLIGHT}offsite ")]
+        assert pins == [
+            f"zfs inherit -S {INFLIGHT}offsite tank/tree/a",
+            f"zfs inherit -S {INFLIGHT}offsite tank/tree/b/deep",
+        ]
+        assert "tank/tree/empty" not in out.split("A running daemon reloads")[1]
+        assert fake_zfs.calls_of("inherit") == []              # the tool never clears the old ones
+
+    def test_a_differing_local_new_value_on_a_child_is_overwritten_and_restorable(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/a", {
+            ANCHOR + "offsite": "A1", ANCHOR + "offsite2": "A0", INFLIGHT + "offsite": "a1,a2",
+        })
+        fake_zfs.fail("set", "tank/tree/b")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 1
+        err = result.stderr
+        assert "copying org.zfsbackup:anchor.offsite to anchor.offsite2 on 'tank/tree/b' failed" in err
+        tail = err.split("To put the previous values back run:")[1]
+        assert f"zfs set {ANCHOR}offsite2=A0 tank/tree/a" in tail          # overwritten: set the old value back
+        assert f"zfs inherit -S {ANCHOR}offsite2 tank/tree\n" in tail                # the parent: newly set
+        assert f"zfs inherit -S {INFLIGHT}offsite2 tank/tree/a" in tail      # newly set pin
+        assert "tank/tree/b" not in tail and "deep" not in tail             # not reached
+        assert "Nothing was written to the configuration" in err
+        assert "offsite" in stored(db).destinations and "offsite2" not in stored(db).destinations
+
+    def test_the_restore_commands_after_a_child_failure_really_restore(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.fail("set", "tank/tree/b")
+        tree_db(run, db)
+        err = self.rename(run, db).stderr
+        commands = [
+            l.strip() for l in err.split("To put the previous values back run:")[1].splitlines()
+            if l.strip().startswith("zfs ")
+        ]
+        assert sorted(commands) == sorted([
+            f"zfs inherit -S {ANCHOR}offsite2 tank/tree",
+            f"zfs inherit -S {ANCHOR}offsite2 tank/tree/a",
+            f"zfs inherit -S {INFLIGHT}offsite2 tank/tree/a",
+        ])
+        for command in commands:
+            subprocess.run([str(fake_zfs.wrapper), *shlex.split(command)[1:]], check=True, env=dict(os.environ))
+        for name in ("tank/tree", "tank/tree/a"):
+            assert not any(p.endswith("offsite2") for p in fake_zfs.props(name))
+
+    def test_a_commit_that_fails_after_the_copies_gives_the_children_restore_commands(
+        self, run, tree, fake_zfs, monkeypatch
+    ):
+        def busy(*args, **kwargs):
+            raise ConfigBusy("database is locked by another process")
+
+        monkeypatch.setattr(rename, "commit_config", busy)
+        result = self.rename(run, tree)
+        assert result.exit_code == 75
+        tail = result.stderr.split("To put the previous values back run:")[1]
+        for name in ("tank/tree/a", "tank/tree/b", "tank/tree/b/deep"):
+            assert name in tail
+        assert "empty" not in tail
+        assert "offsite2" not in stored(tree).destinations
+
+    # -- dry run ----------------------------------------------------------
+
+    def test_a_dry_run_reads_the_children_and_changes_nothing(self, run, tree, fake_zfs):
+        state, gen = db_state(tree), generation(tree)
+        result = self.rename(run, tree, "--dry-run")
+        assert result.exit_code == 0, result.stderr
+        assert "[dry run] tank/tree/a: anchor.offsite2 would be set to A1 (copied from anchor.offsite)" in result.stdout
+        assert "[dry run] tank/tree/b/deep: inflight.offsite2 would be set to d1,d2" in result.stdout
+        assert (
+            "[dry run] 4 descendant(s) of 'tank/tree' send to 'offsite'; 3 had an anchor.offsite or "
+            "inflight.offsite to copy"
+        ) in result.stdout
+        assert db_state(tree) == state and generation(tree) == gen
+        assert fake_zfs.mutations == []
+
+    # -- a parent whose listing failed -----------------------------------
+
+    @pytest.mark.parametrize("failing", ["list", "get"])
+    def test_a_failed_listing_does_not_stop_the_rename_and_leaves_the_commands_and_a_reminder(
+        self, run, db, fake_zfs, failing
+    ):
+        grow_tree(fake_zfs)
+        fake_zfs.fail(failing, "tank/tree", "-r")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert "offsite2" in stored(db).destinations                     # the rename is done
+        assert fake_zfs.props("tank/tree")[ANCHOR + "offsite2"] == "P0"    # the parent itself was copied
+        assert not any(p.endswith("offsite2") for n in ("tank/tree/a", "tank/tree/b") for p in fake_zfs.props(n))
+        (warned,) = [w for w in warnings_in(result) if "could not be listed" in w]
+        assert "the descendants of 'tank/tree' could not be listed" in warned
+        err = result.stderr
+        assert f"zfs get -r -H -s local -o name,property,value {ANCHOR}offsite,{INFLIGHT}offsite tank/tree" in err
+        assert f"{ANCHOR}offsite2=<value>" in err and f"{INFLIGHT}offsite2=<value>" in err
+        # the reminder comes after the commit message
+        shown = interleaved(result)
+        reminder = shown.index("NOT handled: the anchors of the descendants of 'tank/tree'")
+        assert shown.index("Renamed destination 'offsite' -> 'offsite2'") < reminder
+        assert "the warning above has the commands" in shown[reminder:]
+
+    def test_a_failed_listing_is_reminded_in_a_dry_run_too(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.fail("list", "tank/tree", "-r")
+        tree_db(run, db)
+        state = db_state(db)
+        result = self.rename(run, db, "-d")
+        assert result.exit_code == 0, result.stderr
+        assert any("could not be listed" in w for w in warnings_in(result))
+        assert "[dry run] NOT handled: the anchors of the descendants of 'tank/tree'" in result.stderr
+        assert "[dry run] would rename destination 'offsite' -> 'offsite2'" in result.stdout
+        assert "descendant(s)" not in result.stdout
+        assert db_state(db) == state and fake_zfs.mutations == []
+
+    def test_a_failed_listing_of_one_parent_leaves_the_other_parents_children_copied(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/two", {ANCHOR + "offsite": "T0"})
+        fake_zfs.add("tank/two/c", {ANCHOR + "offsite": "C1"})
+        fake_zfs.fail("list", "tank/two", "-r")
+        tree_db(run, db, dataset_block("tank/two", recursive=True))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.props("tank/tree/a")[ANCHOR + "offsite2"] == "A1"
+        assert ANCHOR + "offsite2" not in fake_zfs.props("tank/two/c")
+        assert "could not be listed" in result.stderr and "'tank/two'" in result.stderr
+        assert "'tank/tree'" not in result.stderr.split("NOT handled")[-1]
+
+    # -- who owns which name ----------------------------------------------
+
+    def test_a_disabled_configured_subtree_is_not_copied_from_the_parent(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/off", {ANCHOR + "offsite": "O0"})            # configured, disabled: R-1
+        fake_zfs.add("tank/tree/off/x", {ANCHOR + "offsite": "X1"})
+        fake_zfs.add("tank/tree/off/x/y", {INFLIGHT + "offsite": "y1,y2"})
+        tree_db(run, db, dataset_block("tank/tree/off", enabled=False, remote=()))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        for name in ("tank/tree/off", "tank/tree/off/x", "tank/tree/off/x/y"):
+            assert not any(p.endswith("offsite2") for p in fake_zfs.props(name)), name
+        assert "tank/tree/off" not in result.stdout
+        assert fake_zfs.props("tank/tree/a")[ANCHOR + "offsite2"] == "A1"     # the rest still copied
+        assert "4 descendant(s) of 'tank/tree'" in result.stdout
+
+    def test_a_nested_configured_dataset_is_copied_once_as_itself_not_as_an_expanded_child(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/cfg", {ANCHOR + "offsite": "C0"})
+        tree_db(run, db, dataset_block("tank/tree/cfg"))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.props("tank/tree/cfg")[ANCHOR + "offsite2"] == "C0"
+        assert len([c for c in fake_zfs.calls_of("set") if c[-1] == "tank/tree/cfg"]) == 1
+        assert result.stdout.count("tank/tree/cfg: anchor.offsite2 set to C0") == 1
+        assert "4 descendant(s) of 'tank/tree'" in result.stdout          # a..empty, not cfg
+
+    def test_a_nested_enabled_recursive_dataset_with_no_remote_ends_the_walk(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/own", {ANCHOR + "offsite": "W0"})
+        fake_zfs.add("tank/tree/own/z", {ANCHOR + "offsite": "Z1"})
+        fake_zfs.add("tank/tree/own/z/zz", {INFLIGHT + "offsite": "q1,q2"})
+        tree_db(run, db, dataset_block("tank/tree/own", recursive=True, remote=()))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        for name in ("tank/tree/own", "tank/tree/own/z", "tank/tree/own/z/zz"):
+            assert not any(p.endswith("offsite2") for p in fake_zfs.props(name)), name
+        assert "4 descendant(s) of 'tank/tree'" in result.stdout
+
+    def test_a_nested_recursive_dataset_sending_elsewhere_owns_its_subtree(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/elsewhere", {})
+        fake_zfs.add("tank/tree/elsewhere/z", {ANCHOR + "offsite": "Z1"})
+        tree_db(run, db, dataset_block("tank/tree/elsewhere", recursive=True, remote=("spare",)))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert ANCHOR + "offsite2" not in fake_zfs.props("tank/tree/elsewhere/z")
+        assert {c[-1] for c in recursive_calls(fake_zfs)} == {"tank/tree"}     # never listed from `elsewhere`
+
+    def test_a_nested_recursive_dataset_that_sends_to_old_is_its_own_parent_with_its_own_summary(
+        self, run, db, fake_zfs
+    ):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/sub", {ANCHOR + "offsite": "S0"})
+        fake_zfs.add("tank/tree/sub/m", {ANCHOR + "offsite": "M1"})
+        fake_zfs.add("tank/tree/sub/n", {})
+        tree_db(run, db, dataset_block("tank/tree/sub", recursive=True))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.props("tank/tree/sub/m")[ANCHOR + "offsite2"] == "M1"
+        assert fake_zfs.props("tank/tree/sub")[ANCHOR + "offsite2"] == "S0"         # configured: copied once
+        summaries = [l for l in result.stdout.splitlines() if "descendant(s)" in l]
+        assert summaries == [
+            "4 descendant(s) of 'tank/tree' send to 'offsite'; 3 had an anchor.offsite or inflight.offsite to copy",
+            "2 descendant(s) of 'tank/tree/sub' send to 'offsite'; 1 had an anchor.offsite or inflight.offsite to copy",
+        ]
+        assert len([c for c in fake_zfs.calls_of("set") if c[-1] == "tank/tree/sub/m"]) == 1
+
+    def test_a_recursive_dataset_that_does_not_send_to_old_is_not_listed(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/spare", {})
+        fake_zfs.add("tank/spare/c", {ANCHOR + "offsite": "stray"})
+        tree_db(run, db, dataset_block("tank/spare", recursive=True, remote=("spare",)))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert {c[-1] for c in recursive_calls(fake_zfs, "list")} == {"tank/tree"}
+        assert {c[-1] for c in recursive_calls(fake_zfs, "get")} == {"tank/tree"}
+        assert ANCHOR + "offsite2" not in fake_zfs.props("tank/spare/c")
+
+    def test_a_disabled_recursive_dataset_sending_to_old_is_not_listed(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/dis", {ANCHOR + "offsite": "D0"})
+        fake_zfs.add("tank/dis/c", {ANCHOR + "offsite": "C1"})
+        tree_db(run, db, dataset_block("tank/dis", recursive=True, enabled=False))
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert {c[-1] for c in recursive_calls(fake_zfs, "list")} == {"tank/tree"}
+        assert ANCHOR + "offsite2" not in fake_zfs.props("tank/dis/c")
+
+    # -- --skip-missing ---------------------------------------------------
+
+    def test_a_missing_recursive_parent_is_not_expanded_under_skip_missing(self, run, db, fake_zfs):
+        fake_zfs.add("tank/tree/a", {ANCHOR + "offsite": "A1"})              # no tank/tree itself
+        tree_db(run, db)
+        state = db_state(db)
+        refused = self.rename(run, db)
+        assert refused.exit_code == 1 and "'tank/tree' send(s) to 'offsite' but does not exist" in refused.stderr
+        assert db_state(db) == state and fake_zfs.mutations == []
+        result = self.rename(run, db, "--skip-missing")
+        assert result.exit_code == 0, result.stderr
+        assert any("dataset 'tank/tree' does not exist in ZFS" in w for w in warnings_in(result))
+        assert recursive_calls(fake_zfs, "list") == [] and recursive_calls(fake_zfs, "get") == []
+        assert fake_zfs.mutations == []
+        assert "descendant(s)" not in result.stdout
+        assert "offsite2" in stored(db).destinations
+
+    def test_skip_missing_still_copies_the_children_of_a_parent_that_exists(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)                                                    # tank/other is missing
+        tree_db(run, db, dataset_block("tank/other"))
+        result = self.rename(run, db, "--skip-missing")
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.props("tank/tree/a")[ANCHOR + "offsite2"] == "A1"
+        assert any("dataset 'tank/other' does not exist" in w for w in warnings_in(result))
+
+    # -- backup copies, received and inherited values ----------------------
+
+    @pytest.mark.parametrize("source", ["local", "received"])
+    @pytest.mark.parametrize("prop", ["org.zfsbackup:client_id", "org.zfsbackup:source_dataset"])
+    def test_a_backup_copy_below_the_parent_is_not_touched(self, run, db, fake_zfs, source, prop):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/copy", {ANCHOR + "offsite": "K0"})
+        fake_zfs.set_prop("tank/tree/copy", prop, "host-9" if "client" in prop else "tank/src", source)
+        fake_zfs.add("tank/tree/copy/x", {ANCHOR + "offsite": "K1", INFLIGHT + "offsite": "k1,k2"})
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        for name in ("tank/tree/copy", "tank/tree/copy/x"):
+            assert not any(p.endswith("offsite2") for p in fake_zfs.props(name)), name
+        assert "tank/tree/copy" not in result.stdout
+        assert fake_zfs.props("tank/tree/a")[ANCHOR + "offsite2"] == "A1"     # its siblings still are
+        assert "4 descendant(s) of 'tank/tree'" in result.stdout
+
+    def test_a_parent_inside_a_copy_expands_to_nothing(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.set_prop("tank/tree", "org.zfsbackup:client_id", "host-9", "inherited from tank")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.props("tank/tree/a").get(ANCHOR + "offsite2") is None
+        assert "descendant(s)" not in result.stdout
+
+    def test_received_or_inherited_anchors_and_pins_are_not_copied(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree/rcv", {})
+        fake_zfs.set_prop("tank/tree/rcv", ANCHOR + "offsite", "R1", "received")
+        fake_zfs.set_prop("tank/tree/rcv", INFLIGHT + "offsite", "r1,r2", "received")
+        fake_zfs.add("tank/tree/inh", {})
+        fake_zfs.set_prop("tank/tree/inh", ANCHOR + "offsite", "I1", "inherited from tank/tree")
+        fake_zfs.set_prop("tank/tree/inh", INFLIGHT + "offsite", "i1,i2", "inherited from tank/tree")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        for name in ("tank/tree/rcv", "tank/tree/inh"):
+            assert not any(c[-1] == name for c in fake_zfs.calls_of("set")), name
+            assert not any(p.endswith("offsite2") for p in fake_zfs.props(name)), name
+        assert "tank/tree/rcv" not in result.stdout and "tank/tree/inh" not in result.stdout
+        assert "6 descendant(s) of 'tank/tree' send to 'offsite'; 3 had" in result.stdout
+
+    def test_a_received_anchor_on_a_configured_dataset_is_not_copied(self, run, db, fake_zfs):
+        """The intended local-only `copy_anchor_property` (A2b): a received anchor is another
+        host's progress and a rename must not make it this host's own evidence."""
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree", {})
+        fake_zfs.set_prop("tank/tree", ANCHOR + "offsite", "RCV", "received")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert not any(c[-1] == "tank/tree" for c in fake_zfs.calls_of("set"))
+        assert "tank/tree: has no anchor.offsite to copy" in result.stdout
+
+    def test_a_received_pin_on_a_configured_dataset_is_not_copied(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.add("tank/tree", {})
+        fake_zfs.set_prop("tank/tree", INFLIGHT + "offsite", "r1,r2", "received")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        assert not any(c[-1] == "tank/tree" for c in fake_zfs.calls_of("set"))
+        assert "tank/tree: inflight" not in result.stdout
+
+    def test_a_received_new_value_is_not_an_overwrite_and_a_local_one_replaces_it(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.set_prop("tank/tree/a", ANCHOR + "offsite2", "RCV", "received")
+        fake_zfs.set_prop("tank/tree/a", INFLIGHT + "offsite2", "x,y", "received")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        # not "was RCV, now A1": the received value is not the value being replaced
+        assert "tank/tree/a: anchor.offsite2 set to A1 (copied from anchor.offsite)" in result.stdout
+        assert "was RCV" not in result.stdout and "was x,y" not in result.stdout
+        assert fake_zfs.value("tank/tree/a", ANCHOR + "offsite2") == "A1"
+        assert fake_zfs.source("tank/tree/a", ANCHOR + "offsite2") == "local"
+
+    def test_a_received_new_value_is_restored_by_inherit_dash_S_and_it_really_comes_back(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.set_prop("tank/tree/a", ANCHOR + "offsite2", "RCV", "received")
+        fake_zfs.fail("set", "tank/tree/b")
+        tree_db(run, db)
+        err = self.rename(run, db).stderr
+        tail = err.split("To put the previous values back run:")[1]
+        assert f"zfs inherit -S {ANCHOR}offsite2 tank/tree/a" in tail
+        assert "zfs set" not in tail
+        # the rename's own copy replaced the received value with a local one (the received one stays underneath) ...
+        assert fake_zfs.value("tank/tree/a", ANCHOR + "offsite2") == "A1"
+        assert fake_zfs.source("tank/tree/a", ANCHOR + "offsite2") == "local"
+        for line in tail.splitlines():
+            if line.strip().startswith("zfs "):
+                subprocess.run(
+                    [str(fake_zfs.wrapper), *shlex.split(line.strip())[1:]], check=True, env=dict(os.environ)
+                )
+        # ... and the printed commands bring the RECEIVED value back (a plain `inherit` would have hidden it)
+        assert fake_zfs.value("tank/tree/a", ANCHOR + "offsite2") == "RCV"
+        assert fake_zfs.source("tank/tree/a", ANCHOR + "offsite2") == "received"
+        assert fake_zfs.value("tank/tree", ANCHOR + "offsite2") is None            # newly set: gone
+
+    # -- the writer lock and the generation check, unchanged ---------------
+
+    def test_the_writer_lock_is_held_during_every_copy_children_included(self, run, tree, monkeypatch):
+        import zfsbackup.backup_manager as bm
+
+        lock_path = writer_lock_path(resolve_config_path(str(tree)))
+        probes = []
+        real = bm.copy_anchor_property
+
+        def probing(*args, **kwargs):
+            probes.append(_try_exclusive_lock(lock_path))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(bm, "copy_anchor_property", probing)
+        assert self.rename(run, tree).exit_code == 0
+        assert probes == ["blocked"] * 5                      # the parent and its four children
+        assert _try_exclusive_lock(lock_path) == "acquired"
+
+    def test_the_commit_gets_the_held_writer_lock_and_the_lock_is_released_after(self, run, tree, monkeypatch):
+        seen = {}
+        real = rename.commit_config
+
+        def spy(resolved, snapshot, config, **kwargs):
+            seen["lock"] = kwargs.get("lock")
+            return real(resolved, snapshot, config, **kwargs)
+
+        monkeypatch.setattr(rename, "commit_config", spy)
+        assert self.rename(run, tree).exit_code == 0
+        assert seen["lock"] == writer_lock_path(resolve_config_path(str(tree)))
+        assert run("set", "check_interval", "10m", "-c", tree).exit_code == 0
+
+    def test_a_generation_that_moved_before_the_lock_is_75_and_no_child_is_touched(
+        self, run, tree, fake_zfs, monkeypatch
+    ):
+        done = move_generation_before_the_lock(monkeypatch, tree)
+        result = self.rename(run, tree)
+        assert done == [True]
+        assert result.exit_code == 75, result.stderr
+        assert "config changed underneath you" in result.stderr
+        assert fake_zfs.mutations == []
+        assert "To put the previous values back" not in result.stderr
+        assert "offsite2" not in stored(tree).destinations
+
+    def test_the_children_are_read_before_the_lock_and_nothing_is_written_by_a_listing(self, run, tree, fake_zfs):
+        """The expansion is name-only reads: no `set`/`inherit` outside the copy, and no value read
+        with `-s` other than the two exact LOCAL reads per property."""
+        assert self.rename(run, tree, "-d").exit_code == 0
+        assert fake_zfs.mutations == []
+        local_reads = [c for c in fake_zfs.calls_of("get") if c[:5] == ["get", "-H", "-o", "value", "-s"]]
+        assert local_reads and all(c[5] == "local" for c in local_reads)
+
+    def test_a_non_recursive_configuration_makes_no_recursive_call(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {ANCHOR + "offsite": "snapA"})
+        fake_zfs.add("tank/other", {ANCHOR + "offsite": "snapC"})
+        yaml_text = RENAME_YAML.replace("    recursive: true\n", "")
+        make_db_path = rich.parent / "plain.db"
+        make_db(run, make_db_path, yaml_text, name="plain.yaml")
+        result = run("rename", "destination", "offsite", "offsite2", "-c", make_db_path)
+        assert result.exit_code == 0, result.stderr
+        assert recursive_calls(fake_zfs, "list") == [] and recursive_calls(fake_zfs, "get") == []
+        assert "descendant(s)" not in result.stdout
+
+
+# --------------------------------------------------------------------------
+# A4: `rename dataset` notes for an enabled recursive dataset's descendants
+# --------------------------------------------------------------------------
+
+CID_NOTE = "host-1"
+
+LOCAL_TREE_YAML = """\
+snapshot_prefix: "autosnap"
+check_interval: "5m"
+datasets:
+  - name: "tank/tree"
+    frequency: "1h"
+    recursive: true
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "loc"
+  - name: "tank/flat"
+    frequency: "1h"
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "loc"
+      - destination: "offsite"
+  - name: "tank/off"
+    enabled: false
+    frequency: "1h"
+    recursive: true
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "offsite"
+destinations:
+  loc:
+    url: "zfs:backup/local"
+  offsite:
+    url: "https://offsite:8080"
+"""
+
+
+class TestFakeZfsInheritDashS:
+    """The fake's `inherit [-r] [-S]` (the CLI's restore and clearing advice is executed against it)."""
+
+    def zfs(self, fake, *argv):
+        subprocess.run([str(fake.wrapper), *argv], check=True, env=dict(os.environ))
+
+    def test_set_over_a_received_value_keeps_it_underneath(self, fake_zfs):
+        fake_zfs.set_prop("tank/x", ANCHOR + "d", "RCV", "received")
+        self.zfs(fake_zfs, "set", f"{ANCHOR}d=LOC", "tank/x")
+        assert (fake_zfs.value("tank/x", ANCHOR + "d"), fake_zfs.source("tank/x", ANCHOR + "d")) == ("LOC", "local")
+
+    def test_dash_S_reverts_a_local_value_to_the_received_one(self, fake_zfs):
+        fake_zfs.set_prop("tank/x", ANCHOR + "d", "LOC", received="RCV")
+        self.zfs(fake_zfs, "inherit", "-S", ANCHOR + "d", "tank/x")
+        assert (fake_zfs.value("tank/x", ANCHOR + "d"), fake_zfs.source("tank/x", ANCHOR + "d")) == ("RCV", "received")
+
+    def test_dash_S_leaves_a_received_only_value_alone(self, fake_zfs):
+        fake_zfs.set_prop("tank/x", ANCHOR + "d", "RCV", "received")
+        self.zfs(fake_zfs, "inherit", "-S", ANCHOR + "d", "tank/x")
+        assert (fake_zfs.value("tank/x", ANCHOR + "d"), fake_zfs.source("tank/x", ANCHOR + "d")) == ("RCV", "received")
+
+    def test_dash_S_without_a_received_value_is_a_plain_inherit(self, fake_zfs):
+        fake_zfs.set_prop("tank/x", ANCHOR + "d", "LOC")
+        self.zfs(fake_zfs, "inherit", "-S", ANCHOR + "d", "tank/x")
+        assert fake_zfs.value("tank/x", ANCHOR + "d") is None
+
+    def test_a_plain_inherit_hides_the_received_value(self, fake_zfs):
+        fake_zfs.set_prop("tank/x", ANCHOR + "d", "LOC", received="RCV")
+        self.zfs(fake_zfs, "inherit", ANCHOR + "d", "tank/x")
+        assert fake_zfs.value("tank/x", ANCHOR + "d") is None
+
+    def test_the_flags_may_come_before_or_after_the_property(self, fake_zfs):
+        for name in ("tank/a", "tank/b"):
+            fake_zfs.set_prop(name, ANCHOR + "d", "LOC", received="RCV")
+        self.zfs(fake_zfs, "inherit", "-S", ANCHOR + "d", "tank/a")
+        self.zfs(fake_zfs, "inherit", ANCHOR + "d", "-S", "tank/b")
+        assert fake_zfs.value("tank/a", ANCHOR + "d") == fake_zfs.value("tank/b", ANCHOR + "d") == "RCV"
+
+    def test_dash_r_dash_S_reaches_every_descendant_and_only_them(self, fake_zfs):
+        fake_zfs.set_prop("tank/r", ANCHOR + "d", "R0")
+        fake_zfs.set_prop("tank/r/c", ANCHOR + "d", "LOC", received="RCV")
+        fake_zfs.set_prop("tank/r/c/e", ANCHOR + "d", "RCV2", "received")
+        fake_zfs.set_prop("tank/r/c/e/f", ANCHOR + "d", "F0")
+        fake_zfs.set_prop("tank/rr", ANCHOR + "d", "NEIGHBOUR")           # a name-prefix sibling, not a descendant
+        self.zfs(fake_zfs, "inherit", "-r", "-S", ANCHOR + "d", "tank/r")
+        assert fake_zfs.value("tank/r", ANCHOR + "d") is None
+        assert (fake_zfs.value("tank/r/c", ANCHOR + "d"), fake_zfs.source("tank/r/c", ANCHOR + "d")) == ("RCV", "received")
+        assert fake_zfs.value("tank/r/c/e", ANCHOR + "d") == "RCV2"
+        assert fake_zfs.value("tank/r/c/e/f", ANCHOR + "d") is None
+        assert fake_zfs.value("tank/rr", ANCHOR + "d") == "NEIGHBOUR"
+
+    def test_the_recursive_property_listing_prints_only_the_requested_properties(self, fake_zfs):
+        fake_zfs.set_prop("tank/r", "org.zfsbackup:client_id", "h", "received")
+        fake_zfs.set_prop("tank/r", ANCHOR + "d", "x")
+        got = subprocess.run(
+            [str(fake_zfs.wrapper), "get", "-H", "-o", "name,property,source", "-s", "local,received,inherited",
+             "-r", "-t", "filesystem,volume", "org.zfsbackup:client_id,org.zfsbackup:source_dataset", "tank/r"],
+            capture_output=True, text=True, env=dict(os.environ), check=True,
+        ).stdout.splitlines()
+        assert got == ["tank/r\torg.zfsbackup:client_id\treceived"]
+
+
+class TestRenameDestinationExpansionRecords:
+    """`_expansion_records_as_warnings`: `expand_recursive`'s daemon-worded log records, re-voiced."""
+
+    LOGGER = "zfsbackup.backup_manager"
+
+    @pytest.fixture
+    def tree(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        return tree_db(run, db)
+
+    def rename(self, run, database, *extra):
+        return run("rename", "destination", "offsite", "offsite2", *extra, "-c", database)
+
+    @pytest.fixture
+    def logger(self):
+        import logging
+
+        log = logging.getLogger(self.LOGGER)
+        before = (log.level, list(log.filters), list(log.handlers))
+        log.setLevel(logging.DEBUG)
+
+        class Collect(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def emit(self, record):
+                self.records.append((record.levelname, record.getMessage()))
+
+        handler = Collect()
+        log.addHandler(handler)
+        log.handler = handler
+        yield log
+        log.removeHandler(handler)
+        log.setLevel(before[0])
+        assert list(log.filters) == before[1]            # nothing may leak out of a test either
+
+    # -- the CLI end to end ------------------------------------------------
+
+    def copy_below(self, fake_zfs, *names):
+        for name in names:
+            fake_zfs.add(name, {ANCHOR + "offsite": "K0"})
+            fake_zfs.set_prop(name, "org.zfsbackup:client_id", "host-9")
+
+    def test_a_skipped_backup_copy_is_a_warning_naming_the_consequence_never_an_error(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        self.copy_below(fake_zfs, "tank/tree/copy")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr
+        lines = stderr_lines(result)
+        (shown,) = [l for l in lines if l.startswith("warning: while looking for the descendants that send to 'offsite': ")]
+        assert "tank/tree/copy" in shown
+        assert shown.endswith(
+            "this rename copies no anchor.offsite or inflight.offsite (to 'offsite2') for the datasets skipped this way"
+        )
+        assert not [l for l in lines if l.startswith("error:")]
+        assert not any("Cannot list" in l for l in lines)
+        assert "warning: tank/tree/copy" not in result.stderr
+
+    def test_each_skipped_copy_root_is_reported_once(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        self.copy_below(fake_zfs, "tank/tree/copy", "tank/tree/copy2")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        shown = [l for l in stderr_lines(result) if "while looking for the descendants" in l]
+        assert len(shown) == 2 and not [l for l in stderr_lines(result) if l.startswith("error:")]
+
+    @pytest.mark.parametrize("failing", ["list", "get"])
+    def test_a_failed_listing_is_reported_exactly_once_and_as_no_error(self, run, db, fake_zfs, failing):
+        grow_tree(fake_zfs)
+        fake_zfs.fail(failing, "tank/tree", "-r")
+        tree_db(run, db)
+        result = self.rename(run, db)
+        lines = stderr_lines(result)
+        assert result.exit_code == 0, result.stderr
+        assert count_containing(lines, "could not be listed") == 1                   # the `_unlisted_text` one
+        assert count_containing(lines, "Cannot list the descendants") == 0         # the daemon's ERROR is dropped
+        assert count_containing(lines, "while looking for the descendants") == 0
+        assert count_containing(lines, "are not sent until this passes") == 0
+        assert not [l for l in lines if l.startswith("error:")]
+
+    def test_the_failed_listing_outcome_is_not_handled_and_still_exits_zero(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.fail("list", "tank/tree", "-r")
+        tree_db(run, db)
+        gen = generation(db)
+        result = self.rename(run, db)
+        assert result.exit_code == 0, result.stderr                                  # the configuration rename committed
+        assert "NOT handled: the anchors of the descendants of 'tank/tree'" in result.stderr
+        assert generation(db) == gen + 1 and "offsite2" in stored(db).destinations
+
+    def test_the_filter_is_gone_after_the_command_so_a_later_error_is_printed_normally(self, run, db, fake_zfs, logger):
+        grow_tree(fake_zfs)
+        fake_zfs.fail("list", "tank/tree", "-r")
+        tree_db(run, db)
+        assert self.rename(run, db).exit_code == 0
+        assert logger.filters == []
+        logger.error("a later problem")
+        assert ("ERROR", "a later problem") in logger.handler.records
+
+    # -- the context manager itself ---------------------------------------
+
+    def test_inside_the_block_warning_and_error_records_go_to_warn_and_not_to_the_handlers(self, logger):
+        import zfsbackup.backup_manager as bm
+
+        warned = []
+        with rename._expansion_records_as_warnings(bm, "old", "new", warned.append):
+            logger.error("x is at or below t, which receives copies")
+            logger.warning("w problem")
+            logger.info("fine")
+            logger.debug("detail")
+        assert warned == [
+            "while looking for the descendants that send to 'old': x is at or below t, which receives copies. "
+            "this rename copies no anchor.old or inflight.old (to 'new') for the datasets skipped this way",
+            "while looking for the descendants that send to 'old': w problem. "
+            "this rename copies no anchor.old or inflight.old (to 'new') for the datasets skipped this way",
+        ]
+        assert logger.handler.records == [("INFO", "fine"), ("DEBUG", "detail")]      # lower levels untouched
+
+    def test_the_listing_failure_error_is_dropped_without_a_warn(self, logger):
+        import zfsbackup.backup_manager as bm
+
+        warned = []
+        with rename._expansion_records_as_warnings(bm, "old", "new", warned.append):
+            logger.error("Cannot list the descendants of tank/tree, so they are not sent until this passes (X: y)")
+        assert warned == [] and logger.handler.records == []
+
+    def test_the_filter_is_removed_afterwards_even_when_the_block_raises(self, logger):
+        import zfsbackup.backup_manager as bm
+
+        with pytest.raises(RuntimeError):
+            with rename._expansion_records_as_warnings(bm, "old", "new", lambda m: None):
+                assert len(logger.filters) == 1
+                raise RuntimeError("boom")
+        assert logger.filters == []
+        logger.error("after")
+        assert logger.handler.records == [("ERROR", "after")]
+
+    def test_the_filter_only_touches_the_backup_managers_logger(self, logger):
+        import logging
+        import zfsbackup.backup_manager as bm
+
+        other = logging.getLogger("zfsbackup.other")
+        with rename._expansion_records_as_warnings(bm, "old", "new", lambda m: None):
+            assert other.filters == [] and logging.getLogger("zfsbackup").filters == []
+
+    def test_warn_none_is_a_no_op(self, logger):
+        import zfsbackup.backup_manager as bm
+
+        with rename._expansion_records_as_warnings(bm, "old", "new", None):
+            assert logger.filters == []
+            logger.error("still printed")
+        assert logger.handler.records == [("ERROR", "still printed")]
+
+    def test_sending_descendants_without_warn_leaves_the_records_alone(self, db, fake_zfs, run, logger):
+        import zfsbackup.backup_manager as bm
+
+        grow_tree(fake_zfs)
+        self.copy_below(fake_zfs, "tank/tree/copy")
+        path = tree_db(run, db)
+        config = stored(path)
+        pairs, failed = rename._sending_descendants(bm, config, "offsite")
+        assert failed == {} and "tank/tree/copy" not in {c for _, c in pairs}
+        assert any(level == "ERROR" and "tank/tree/copy" in msg for level, msg in logger.handler.records)
+
+
+class TestUnlistedTextCaveats:
+    """What `rename._unlisted_text` tells the operator who must carry the anchors over by hand."""
+
+    TEXT = rename._unlisted_text("old", "new", "tank/my data", "RuntimeError: boom")
+
+    def test_the_inherit_advice_clears_only_a_local_value(self):
+        assert "`zfs inherit -S org.zfsbackup:anchor.old <ds>` (`-S org.zfsbackup:inflight.old`; `-S` clears only a local value and leaves a received one alone)" in self.TEXT
+        assert "zfs inherit org.zfsbackup:anchor.old" not in self.TEXT.replace("zfs inherit -S", "")
+
+    def test_the_listing_is_said_to_include_backup_copies_to_skip(self):
+        assert (
+            "The listing also shows the backup copies below 'tank/my data': skip any dataset that is a "
+            "backup copy, i.e. one that carries org.zfsbackup:client_id or org.zfsbackup:source_dataset"
+        ) in self.TEXT
+
+    def test_the_listing_command_quotes_the_parent_and_names_both_properties(self):
+        assert "zfs get -r -H -s local -o name,property,value org.zfsbackup:anchor.old,org.zfsbackup:inflight.old 'tank/my data'" in self.TEXT
+        assert "anchor.new=<value>" in self.TEXT and "inflight.new=<value>" in self.TEXT
+        assert "(RuntimeError: boom)" in self.TEXT
+
+    def test_the_caveats_reach_the_operator_through_the_cli(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.fail("list", "tank/tree", "-r")
+        tree_db(run, db)
+        err = run("rename", "destination", "offsite", "offsite2", "-c", db).stderr
+        assert "`-S` clears only a local value and leaves a received one alone" in err
+        assert "skip any dataset that is a backup copy" in err
+
+
+class TestRenameDatasetRecursiveNotes:
+    @pytest.fixture
+    def local_tree(self, run, db):
+        make_db(run, db, LOCAL_TREE_YAML)
+        seed_client_id(db, CID_NOTE)
+        return db
+
+    def refusal(self, run, database, old, new):
+        result = run("rename", "dataset", old, new, "-c", database)
+        assert result.exit_code == 1, result.stdout
+        assert "Nothing was changed." in result.stderr
+        return " ".join(result.stderr.split())
+
+    def test_a_server_note_says_the_children_move_with_the_parent_copy_and_need_relabelling(self, run, rich):
+        seed_client_id(rich, CID_NOTE)
+        err = self.refusal(run, rich, "tank/data", "tank/data2")
+        assert f"the server keeps this dataset at <server target>/{CID_NOTE}/tank/data;" in err
+        assert (
+            f"its descendants are sent as copies of their own, below <server target>/{CID_NOTE}/tank/data/, "
+            "so on the receiver they move with the parent copy's `zfs rename` (they are below it)"
+        ) in err
+        assert "org.zfsbackup:source_dataset=tank/data/<child>, which must read tank/data2/<child> there" in err
+
+    def test_a_local_note_with_the_same_parent_says_to_relabel_every_child(self, run, local_tree):
+        err = self.refusal(run, local_tree, "tank/tree", "tank/tree2")
+        assert (
+            "its descendants are sent to 'loc' as copies of their own, below "
+            f"backup/local/{CID_NOTE}/tank/tree/, so they move with the parent copy's `zfs rename` "
+            "(they are below it); then re-label each one, for every descendant <child> (the part of its "
+            "name after tank/tree2/): `zfs set org.zfsbackup:source_dataset=tank/tree2/<child> "
+            f"backup/local/{CID_NOTE}/tank/tree2/<child>`"
+        ) in err
+        assert f"`zfs rename backup/local/{CID_NOTE}/tank/tree backup/local/{CID_NOTE}/tank/tree2`" in err
+        assert "<server target>" not in err
+
+    def test_a_local_note_with_a_changed_parent_says_the_children_are_resent_in_full(self, run, local_tree):
+        err = self.refusal(run, local_tree, "tank/tree", "pool2/tree")
+        assert (
+            "its descendants are sent to 'loc' as copies of their own, below "
+            f"backup/local/{CID_NOTE}/tank/tree/; they are sent in full into "
+            f"backup/local/{CID_NOTE}/pool2/tree/ and the copies below backup/local/{CID_NOTE}/tank/tree/ "
+            "stay with the orphaned parent copy"
+        ) in err
+        assert "re-label" not in err and "zfs rename" not in err
+
+    def test_a_dataset_with_both_kinds_of_destination_gets_the_children_note_per_kind(self, run, db):
+        make_db(run, db, LOCAL_TREE_YAML.replace(
+            '  - name: "tank/flat"\n', '  - name: "tank/flat"\n    recursive: true\n'))
+        seed_client_id(db, CID_NOTE)
+        err = self.refusal(run, db, "tank/flat", "tank/flat2")
+        assert err.count("its descendants are sent") == 2
+        assert "below <server target>" in err and "below backup/local/" in err
+
+    def test_a_non_recursive_dataset_has_no_children_note(self, run, local_tree):
+        err = self.refusal(run, local_tree, "tank/flat", "tank/flat2")
+        assert "its descendants are sent" not in err
+        assert "local destination 'loc'" in err and "<server target>" in err
+
+    def test_a_disabled_recursive_dataset_has_no_children_note(self, run, local_tree):
+        result = run("rename", "dataset", "tank/off", "tank/off2", "--force", "-c", local_tree)
+        assert result.exit_code == 0, result.stderr
+        assert "its descendants are sent" not in result.stderr
+        assert "tank/off2" in names(local_tree)
+
+    def test_force_carries_the_children_note_in_the_warning(self, run, local_tree):
+        result = run("rename", "dataset", "tank/tree", "tank/tree2", "--force", "-c", local_tree)
+        assert result.exit_code == 0, result.stderr
+        (warned,) = [w for w in warnings_in(result) if w.startswith("warning: --force:")]
+        assert "its descendants are sent to 'loc' as copies of their own" in warned
+        assert "tank/tree2" in names(local_tree)
+
+
+class TestRenameDatasetLeftInPlaceReceived:
+    """`--clear-stale-props`: an anchor or pin with no LOCAL value (received only) is another host's
+    progress, which the pruner still honours. It is not inherited (no `zfs inherit` runs for it),
+    not reported as cleared, and is listed on its own `Left in place on ...` line; a LOCAL value (also
+    one with a received value underneath) goes through `inherit -S`; `config` stays a plain inherit."""
+
+    LEFT = ("Left in place on 'tank/vm.01' because they are received (another host's values, "
+            "which the pruner still honours): ")
+
+    @pytest.fixture
+    def pool(self, fake_zfs):
+        fake_zfs.add("tank/vm.01", {CONFIG_PROP: "cfg", "compression": "lz4"})
+        fake_zfs.add("tank/vm.02", {})
+        return fake_zfs
+
+    def clear(self, run, rich, *extra):
+        return run("rename", "dataset", "tank/vm.01", "tank/vm.02", "--clear-stale-props", *extra, "-c", rich)
+
+    def inherited(self, fake):
+        return [inherit_property(c) for c in fake.calls if c[0] == "inherit"]
+
+    def test_a_received_only_anchor_and_pin_are_listed_and_never_inherited(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "RA", "received")
+        pool.set_prop("tank/vm.01", INFLIGHT + "offsite", "r1,r2", "received")
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert self.inherited(pool) == [CONFIG_PROP]                       # not even attempted
+        assert [pool.value("tank/vm.01", p) for p in (ANCHOR + "offsite", INFLIGHT + "offsite")] == ["RA", "r1,r2"]
+        assert [pool.source("tank/vm.01", p) for p in (ANCHOR + "offsite", INFLIGHT + "offsite")] == ["received"] * 2
+        lines = result.stdout.splitlines()
+        assert "Cleared on 'tank/vm.01': " + CONFIG_PROP in lines
+        assert self.LEFT + f"{ANCHOR}offsite, {INFLIGHT}offsite" in lines
+
+    def test_the_left_in_place_line_follows_the_cleared_line(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "RA", "received")
+        lines = self.clear(run, rich).stdout.splitlines()
+        cleared = next(i for i, l in enumerate(lines) if l.startswith("Cleared on 'tank/vm.01':"))
+        assert lines[cleared + 1] == self.LEFT + f"{ANCHOR}offsite"
+
+    def test_only_received_properties_leave_nothing_cleared_but_still_say_so(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/vm.01", {})
+        fake_zfs.set_prop("tank/vm.01", ANCHOR + "offsite", "RA", "received")
+        fake_zfs.add("tank/vm.02", {})
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert "Cleared on 'tank/vm.01': (nothing set)" in result.stdout
+        assert self.LEFT + f"{ANCHOR}offsite" in result.stdout
+        assert self.inherited(fake_zfs) == []
+
+    def test_a_local_value_is_inherited_with_dash_S_and_the_received_value_comes_back(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "LOCAL", received="RA")
+        pool.set_prop("tank/vm.01", INFLIGHT + "offsite", "l1,l2", received="r1,r2")
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        calls = [c for c in pool.calls if c[0] == "inherit" and inherit_property(c) != CONFIG_PROP]
+        assert calls == [["inherit", "-S", ANCHOR + "offsite", "tank/vm.01"],
+                         ["inherit", "-S", INFLIGHT + "offsite", "tank/vm.01"]]
+        for prop, value in ((ANCHOR + "offsite", "RA"), (INFLIGHT + "offsite", "r1,r2")):
+            assert (pool.value("tank/vm.01", prop), pool.source("tank/vm.01", prop)) == (value, "received")
+        # a local value was there, so both are "cleared" and nothing is "left in place"
+        assert f"Cleared on 'tank/vm.01': {ANCHOR}offsite, {CONFIG_PROP}, {INFLIGHT}offsite" in result.stdout
+        assert "Left in place" not in result.stdout
+
+    def test_the_config_property_is_a_plain_inherit(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "L")
+        self.clear(run, rich)
+        (config_call,) = [c for c in pool.calls if c[0] == "inherit" and inherit_property(c) == CONFIG_PROP]
+        assert config_call == ["inherit", CONFIG_PROP, "tank/vm.01"]
+
+    def test_a_mix_clears_the_local_and_keeps_the_received(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "dc.two", "L2")
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "RA", "received")
+        pool.set_prop("tank/vm.01", INFLIGHT + "dc.two", "r1,r2", "received")
+        pool.set_prop("tank/vm.01", INFLIGHT + "offsite", "l1,l2")
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert f"Cleared on 'tank/vm.01': {ANCHOR}dc.two, {CONFIG_PROP}, {INFLIGHT}offsite" in result.stdout
+        assert self.LEFT + f"{ANCHOR}offsite, {INFLIGHT}dc.two" in result.stdout
+        assert self.inherited(pool) == [ANCHOR + "dc.two", CONFIG_PROP, INFLIGHT + "offsite"]
+        assert pool.props("tank/vm.01").keys() == {
+            "compression", ANCHOR + "offsite", INFLIGHT + "dc.two"}
+
+    def test_nothing_received_means_no_left_in_place_line(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "L")
+        result = self.clear(run, rich)
+        assert result.exit_code == 0, result.stderr
+        assert "Left in place" not in result.stdout
+
+    def test_the_local_read_is_one_exact_get_per_anchor_or_pin_and_none_for_config(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "L")
+        pool.set_prop("tank/vm.01", INFLIGHT + "offsite", "a,b", "received")
+        self.clear(run, rich)
+        reads = [c for c in pool.calls if c[0] == "get" and "-s" in c and "local" in c[c.index("-s") + 1:c.index("-s") + 2]
+                 and "value" in c]
+        asked = [c[-2] for c in reads]
+        assert ANCHOR + "offsite" in asked and INFLIGHT + "offsite" in asked
+        assert CONFIG_PROP not in asked
+
+    def test_a_dry_run_changes_nothing_and_prints_no_left_in_place_line(self, run, rich, pool):
+        pool.set_prop("tank/vm.01", ANCHOR + "offsite", "RA", "received")
+        result = self.clear(run, rich, "-d")
+        assert result.exit_code == 0, result.stderr
+        assert pool.mutations == [] and "Left in place" not in result.stdout
+
+
+class TestRenameDestinationNotHandledIsAWarning:
+    """Both "NOT handled" reminders (the dry-run one and the one after the commit) are warnings:
+    `warning: ...` on stderr, exit status 0."""
+
+    @pytest.fixture
+    def broken(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        fake_zfs.fail("list", "tank/tree", "-r")
+        return tree_db(run, db)
+
+    def rename(self, run, database, *extra):
+        return run("rename", "destination", "offsite", "offsite2", *extra, "-c", database)
+
+    def reminders(self, result):
+        return [l for l in stderr_lines(result) if "NOT handled" in l]
+
+    def test_after_the_commit_the_reminder_is_a_warning_line_and_the_exit_is_zero(self, run, broken):
+        result = self.rename(run, broken)
+        assert result.exit_code == 0, result.stderr
+        (line,) = self.reminders(result)
+        assert line.startswith("warning: NOT handled: the anchors of the descendants of 'tank/tree'")
+        assert not line.startswith("error:")
+        assert "offsite2" in stored(broken).destinations
+
+    def test_in_a_dry_run_the_reminder_is_a_warning_line_with_the_prefix_and_the_exit_is_zero(self, run, broken):
+        result = self.rename(run, broken, "--dry-run")
+        assert result.exit_code == 0, result.stderr
+        (line,) = self.reminders(result)
+        assert line.startswith("warning: [dry run] NOT handled: the anchors of the descendants of 'tank/tree'")
+        assert "offsite2" not in stored(broken).destinations
+
+    def test_there_is_no_reminder_without_a_failed_listing(self, run, db, fake_zfs):
+        grow_tree(fake_zfs)
+        tree = tree_db(run, db)
+        assert self.reminders(self.rename(run, tree, "--dry-run")) == []
+        assert self.reminders(self.rename(run, tree)) == []

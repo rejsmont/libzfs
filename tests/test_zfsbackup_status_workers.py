@@ -429,6 +429,52 @@ class TestSnapshotWorkerRecords:
         assert (rec.kind, rec.dataset, rec.destination, rec.result) == ('snapshot', 'pool/a', None, 'ok')
         assert rec.detail == 'autosnap_20261025100000' and rec.last_success is not None
 
+    def test_a_mock_manager_adds_no_note_to_the_detail(self, run, sdir):
+        """`manager_for` is a MagicMock, whose `last_snapshot_note` is another MagicMock: not a string, so nothing
+        is appended."""
+        manager = manager_for(Dsi('pool/a'))
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
+        assert not isinstance(manager.last_snapshot_note, str)
+        run(snapshot_worker(sdir), manager)
+        assert status(sdir).records[0].detail == 'autosnap_20261025100000'
+
+    def test_the_managers_standing_warning_goes_on_the_record_after_the_snapshot_name(self, run, sdir):
+        manager = manager_for(
+            Dsi('pool/a'), last_snapshot_note='1 backup copy below was not snapshotted: pool/a/bk')
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
+        run(snapshot_worker(sdir), manager)
+        (rec,) = status(sdir).records
+        assert rec.detail == ('autosnap_20261025100000; WARNING: '
+                              '1 backup copy below was not snapshotted: pool/a/bk')
+        assert rec.result == 'ok' and rec.consecutive_failures == 0 and rec.last_error is None
+        assert rec.last_success is not None, 'a warning is not a failure'
+
+    def test_a_note_without_a_snapshot_name_is_the_whole_detail(self, run, sdir):
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note='backup copies below could not be told apart')
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='')
+        run(snapshot_worker(sdir), manager)
+        assert status(sdir).records[0].detail == 'WARNING: backup copies below could not be told apart'
+
+    @pytest.mark.parametrize('note', [None, '', 5, b'bytes', ['x']], ids=['none', 'empty', 'int', 'bytes', 'list'])
+    def test_no_usable_note_leaves_the_detail_alone(self, run, sdir, note):
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note=note)
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
+        run(snapshot_worker(sdir), manager)
+        assert status(sdir).records[0].detail == 'autosnap_20261025100000'
+
+    def test_a_failed_creation_never_carries_the_note(self, run, sdir):
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note='stale')
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = None
+        manager.last_snapshot_error = 'boom'
+        run(snapshot_worker(sdir), manager)
+        (rec,) = status(sdir).records
+        assert rec.result == 'error' and 'stale' not in (rec.detail or '') and rec.last_error == 'boom'
+
     def test_a_dataset_that_is_not_due_records_nothing(self, run, sdir):
         manager = manager_for(Dsi('pool/a'))
         run(snapshot_worker(sdir), manager)
@@ -462,6 +508,65 @@ class TestSnapshotWorkerRecords:
             run(snapshot_worker(sdir), manager)
         (rec,) = status(sdir).records
         assert rec.consecutive_failures == 0 and rec.result == 'ok' and rec.last_error == 'boom'
+
+
+@pytest.mark.unit
+class TestSnapshotWorkerInsideACopy:
+    """A2c: a configured dataset at or below a receive target is not snapshotted (`create_snapshot` is `None`
+    and `last_snapshot_error` says why). The REAL manager over a fake `zfs` (`_snapshot_world.SnapWorld`), so the
+    reason the worker records is the one the manager really produces; the dataset beside it is unaffected."""
+
+    def worker_and_manager(self, mocker, mock_subprocess, sdir):
+        from _snapshot_world import SnapWorld
+        world = SnapWorld(mock_subprocess)
+        world.add('pool/a').add('pool/a/c').add('bk').add('bk/x').add('bk/x/c')
+        config = BackupConfig(
+            datasets=[DatasetConfig(name='pool/a', recursive=True), DatasetConfig(name='bk/x', recursive=True)],
+            snapshot_prefix='autosnap', destinations={'local': Destination(url='zfs:bk')},
+        )
+        mocker.patch.object(SnapshotWorker, '_before_loop')
+        return world, snapshot_worker(sdir, config), DatasetManager(config)
+
+    def test_the_failure_is_recorded_with_the_reason_and_the_next_dataset_is_still_done(
+            self, run, sdir, mocker, mock_subprocess):
+        world, worker, manager = self.worker_and_manager(mocker, mock_subprocess, sdir)
+        run(worker, manager)
+        recs = {r.dataset: r for r in status(sdir).records}
+        assert recs['pool/a'].result == 'ok' and recs['pool/a'].detail.startswith('autosnap_')
+        bad = recs['bk/x']
+        assert (bad.kind, bad.result) == ('snapshot', 'error')
+        assert bad.last_error.startswith('Failed to create snapshot bk/x@autosnap_')
+        assert 'bk/x is itself inside a backup copy' in bad.last_error and 'receive target bk' in bad.last_error
+        assert world.snapshots_below('bk') == {}, 'nothing in the copy, the dataset itself included'
+        assert set(world.snapshots_below('pool/a')) == {'pool/a', 'pool/a/c'}
+
+    def test_a_copy_left_out_is_an_ok_record_with_the_warning_in_its_detail(
+            self, run, sdir, mocker, mock_subprocess):
+        """The real manager: `pool/a` has a backup copy below it; the snapshot is taken (an OK record), the copy is
+        left out, and the detail says so, so `check` shows it long after the journal line."""
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        world, worker, manager = self.worker_and_manager(mocker, mock_subprocess, sdir)
+        world.add('pool/a/bk', [(PROP_CLIENT_ID, 'h1', 'local')])
+        run(worker, manager)
+        rec = {r.dataset: r for r in status(sdir).records}['pool/a']
+        assert rec.result == 'ok' and rec.consecutive_failures == 0 and rec.last_error is None
+        name, _, note = rec.detail.partition('; WARNING: ')
+        assert name.startswith('autosnap_') and note == '1 backup copy below was not snapshotted: pool/a/bk'
+        assert world.snapshots_below('pool/a/bk') == {}
+
+    def test_a_plain_recursive_dataset_has_no_note(self, run, sdir, mocker, mock_subprocess):
+        world, worker, manager = self.worker_and_manager(mocker, mock_subprocess, sdir)
+        run(worker, manager)
+        rec = {r.dataset: r for r in status(sdir).records}['pool/a']
+        assert rec.detail.startswith('autosnap_') and 'WARNING' not in rec.detail
+
+    def test_it_counts_up_while_it_stays_true(self, run, sdir, mocker, mock_subprocess):
+        world, worker, manager = self.worker_and_manager(mocker, mock_subprocess, sdir)
+        run(worker, manager, cycles=3)
+        bad = {r.dataset: r for r in status(sdir).records}['bk/x']
+        assert bad.consecutive_failures == 3 and bad.last_success is None
+        cmds = world.commands_of('snapshot')
+        assert cmds and not any(t.startswith('bk') for a in cmds for t in a[1:])
 
 
 @pytest.mark.unit

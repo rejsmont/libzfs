@@ -1156,6 +1156,20 @@ class TestLocalCopyPruneTimeouts:
         assert verbs and all(t == (300.0 if v == 'destroy' else 60.0) for v, t in verbs), verbs
         assert any(v == 'destroy' for v, _ in verbs)
 
+    def test_a_copys_pass_never_reads_for_backup_copies(self, world):
+        """A2b: the copy read and the recursive snapshot listing are for a recursive SOURCE dataset. A local
+        copy is pruned non-recursively (its stamped `recursive` is dropped), so its pass issues neither, and
+        every destroy is non-recursive."""
+        mgr, found = self.copies(world)
+        start = len(world.argvs)
+        result = mgr.prune_snapshots(found['bk/A/tank/data'])
+        assert result.ok and result.pruned == len(OLD) - 1
+        issued = world.argvs[start:]
+        assert issued and not [a for a in issued if 'inherited' in ','.join(a)]
+        assert not [a for a in issued if '-r' in a], issued
+        assert all('-r' not in a for a in world.destroy_argvs)
+        assert mgr._copy_protect_noted == set()
+
     def test_a_source_dataset_is_pruned_untimed(self, world):
         world.add('tank/data')
         world.snaps['tank/data'] = list(OLD)

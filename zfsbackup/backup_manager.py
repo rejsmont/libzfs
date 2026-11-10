@@ -180,11 +180,13 @@ def _own_zfsbackup_rows(rows) -> Dict[str, Dict[str, str]]:
 
 
 def _read_own_properties_once(
-    ds: Dataset, recursive: bool, also: Tuple[str, ...] = ()
+    ds: Dataset, recursive: bool, also: Tuple[str, ...] = (),
+    sources: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Dict[str, Dict[str, str]]:
     """One attempt of `_read_own_properties` (two execs). `also` (own read only)
     names properties that are asked for in phase 2 whether or not phase 1 saw
-    them."""
+    them. `sources`, when given, is filled with `{object: {property: source}}`
+    (`local` or `received`) of the rows that were read."""
     prefix = ds.name + '/'
     if recursive:
         def in_scope(name: str) -> bool:
@@ -226,6 +228,10 @@ def _read_own_properties_once(
     if not recursive and not any(r.name == ds.name and r.property == 'type' for r in rows):
         raise ZFSOutputError(f"zfs get printed no usable rows for {ds.name!r}")
     got = _own_zfsbackup_rows(r for r in rows if in_scope(r.name))
+    if sources is not None:
+        for r in rows:
+            if in_scope(r.name) and r.property.startswith(PROP_PREFIX) and r.source in _OWN_SOURCES:
+                sources.setdefault(r.name, {})[r.property] = r.source
     seen = {(n, p) for n, props in got.items() for p in props}
     # A property of `also` that is here now but was not in phase 1 was set
     # between the two execs: it can only grow the protect-set, so it is kept.
@@ -244,7 +250,8 @@ def _read_own_properties_once(
 
 
 def _read_own_properties(
-    ds: Dataset, recursive: bool, also: Tuple[str, ...] = ()
+    ds: Dataset, recursive: bool, also: Tuple[str, ...] = (),
+    sources: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Dict[str, Dict[str, str]]:
     """`{object name: {org.zfsbackup:* property: value}}` for `ds` (or, with
     `recursive`, its descendants), local/received only. The two-phase read
@@ -262,10 +269,12 @@ def _read_own_properties(
         raise ValueError("`also` is for the own read only")
     also = tuple(dict.fromkeys(also))
     try:
-        return _read_own_properties_once(ds, recursive, also)
+        return _read_own_properties_once(ds, recursive, also, sources)
     except _PropertiesChanged as e:
         logger.debug(f"{e}; reading again")
-    return _read_own_properties_once(ds, recursive, also)
+    if sources is not None:
+        sources.clear()
+    return _read_own_properties_once(ds, recursive, also, sources)
 
 
 def read_zfsbackup_properties(ds: Dataset, also: Iterable[str] = ()) -> Dict[str, str]:
@@ -330,10 +339,11 @@ def copy_anchor_property(
     anything (the old property is left for the caller to clear once the rename
     has actually landed).
 
-    Both properties are read with `read_zfsbackup_properties` (local and
-    received sources; an inherited value is neither a source nor a blocker).
-    A caller that wants to show the two values (e.g. for a dry run) reads
-    them with that function beforehand; this function returns only the outcome.
+    Both properties are read with `zfs.get.value(..., sources='local')`: only
+    a LOCAL value is a source or a blocker (a received or inherited one is
+    neither, and is never copied into a local one). A caller that wants to
+    show the two values (e.g. for a dry run) reads them beforehand; this
+    function returns only the outcome. A failed read raises.
 
     Returns exactly one of:
 
@@ -362,20 +372,24 @@ def copy_anchor_property(
     """
     old_prop = f"{PROP_ANCHOR_PREFIX}{old_dest}"
     new_prop = f"{PROP_ANCHOR_PREFIX}{new_dest}"
-    props = read_zfsbackup_properties(ds)
-    if old_prop not in props:
+    # Exact LOCAL reads (`zfs get -H -o value -s local`): a received or
+    # inherited anchor is not this host's evidence (A1), so a rename must never
+    # turn one into a local value. An unset or non-local property reads as
+    # None; a failed read raises (never read as "no source").
+    value = zfs.get.value(ds, old_prop, sources='local')
+    if value is None:
         return 'no-source'
-    value = props[old_prop]
-    exists = new_prop in props
+    existing = zfs.get.value(ds, new_prop, sources='local')
+    exists = existing is not None
     if exists:
         if not overwrite:
             return 'exists'
-        if props[new_prop] == value:
+        if existing == value:
             return 'same'
     if dry_run:
         if exists:
             logger.info(
-                f"[DRY RUN] Would overwrite {new_prop}={props[new_prop]} "
+                f"[DRY RUN] Would overwrite {new_prop}={existing} "
                 f"with {value} on {ds.name}"
             )
         else:
@@ -420,10 +434,24 @@ def clear_zfsbackup_properties(
     destination names (clears `anchor.<name>` for each), or `True` for every
     `org.zfsbackup:anchor.*` AND `org.zfsbackup:inflight.*` currently set on
     `ds` (the in-flight pins go with the anchors they stand in for), or
-    `False`/empty for none.
-    Only properties that are actually set (local/received) are inherited, so
-    a clear is idempotent. Returns the property names cleared (or, under
-    `dry_run`, that would have been). Raises whatever `zfs` raises.
+    `False`/empty for none. Only properties that are actually set are touched,
+    so a clear is idempotent. Raises whatever `zfs` raises.
+
+    `anchor.*`/`inflight.*` go through `zfs inherit -S`: it reverts a LOCAL
+    value to the RECEIVED one when there is one (otherwise it acts as a plain
+    inherit), so it never HIDES a received anchor, which the pruner still
+    protects. A name that has only a RECEIVED value is therefore left alone:
+    no command is run for it and it is NOT in the result (it is still set, so
+    it is not "cleared"). The sources come from the same read as the names
+    (`local` wins over `received` when a property has both, and `-S` then
+    leaves the received value in effect: the LOCAL value is what was cleared).
+    `org.zfsbackup:config` keeps a plain inherit, which acts on a local or a
+    received value alike (a received one is masked), so it is returned
+    whenever it was set.
+
+    Returns the property names that were cleared: `config` if it was set, and
+    the `anchor.*`/`inflight.*` names that had a LOCAL value -- or, under
+    `dry_run`, that would have been.
 
     A non-empty bare `str` for `anchors` is rejected with `TypeError`: iterating it
     would treat each character as a destination name and silently clear
@@ -435,7 +463,9 @@ def clear_zfsbackup_properties(
             "anchors must be True, False or an iterable of destination names, "
             f"not a bare string {anchors!r}; pass [name]"
         )
-    present = read_zfsbackup_properties(ds)
+    sources: Dict[str, Dict[str, str]] = {}
+    present = _read_own_properties(ds, False, (), sources).get(ds.name, {})
+    source_of = sources.get(ds.name, {})
     wanted: List[str] = []
     if config and PROP_CONFIG in present:
         wanted.append(PROP_CONFIG)
@@ -449,11 +479,13 @@ def clear_zfsbackup_properties(
             name = f"{PROP_ANCHOR_PREFIX}{dest}"
             if name in present and name not in wanted:
                 wanted.append(name)
+    # `-S` leaves a value that is only received where it is: not cleared.
+    wanted = [n for n in wanted if n == PROP_CONFIG or source_of.get(n) == 'local']
     for name in wanted:
         if dry_run:
             logger.info(f"[DRY RUN] Would inherit {name} on {ds.name}")
         else:
-            zfs.inherit(ds, name)
+            zfs.inherit(ds, name, received=(name != PROP_CONFIG))
             logger.debug(f"Cleared {name} on {ds.name}")
     return wanted
 
@@ -507,7 +539,8 @@ class DatasetInfo:
         #: The enabled recursive configured dataset this one was expanded from
         #: (`DatasetManager.expand_recursive`), else `None`. An expanded child
         #: is a SENDING pair only: it is never snapshotted or pruned by its own
-        #: entry (the parent's `zfs snapshot -r` and recursive prune cover it).
+        #: entry (the parent's `_snapshot_tree`, which keeps backup copies out,
+        #: and its recursive prune, which spares names a copy holds, cover it).
         self.expanded_from: Optional[str] = None
 
     @property
@@ -547,6 +580,35 @@ class Expansion(NamedTuple):
     failed: Dict[str, str]
 
 
+#: The start of the error `zfs.list(strict=True)` raises for output it cannot trust.
+_UNTRUSTED_LISTING = 'zfs list output could not be trusted'
+
+
+class _CopyTops(Dict[str, str]):
+    """The topmost backup copies `DatasetManager._copy_tops` found below (or at)
+    a recursive dataset, `{dataset: why}`, plus two attributes (absent from a
+    plain dict, so read them with `getattr`): `inside` is `(origin, source)`
+    when the dataset ITSELF carries or inherits a copy marker (`source` is
+    what zfs printed: `local`, `received`, `inherited from <dataset>`;
+    `origin` the dataset the marker comes from, the dataset itself for a local
+    or received one), and `covered` the tops that exist only because of that:
+    every child inherits the marker, so each one is a top, and one message
+    about the dataset replaces one per child."""
+
+    inside: Optional[Tuple[str, str]] = None
+    covered: FrozenSet[str] = frozenset()
+
+
+class _InsideReceiveTarget(RuntimeError):
+    """A recursive dataset to snapshot is itself at or below a receive target
+    (`DatasetManager._snapshot_tree`). `first` is False after the first one of
+    an episode: the caller logs the repeats quietly."""
+
+    def __init__(self, message: str, first: bool):
+        super().__init__(message)
+        self.first = first
+
+
 class DatasetManager:
     """Manages datasets based on configuration."""
 
@@ -572,6 +634,28 @@ class DatasetManager:
         # Datasets whose descendant evaluation failed and was announced at
         # ERROR (once while it persists; the per-cycle repeat is DEBUG).
         self._descendant_error_noted: Set[str] = set()
+        # (recursive dataset, topmost backup copy below it) pairs whose ERROR
+        # was logged (`_copy_protection`); a pair that is not found again logs
+        # an INFO and leaves the set.
+        self._copy_protect_noted: Set[Tuple[str, str]] = set()
+        # The SNAPSHOT worker's own episode memory (`create_snapshot`): the
+        # snapshot and the pruning worker are different processes, each with
+        # its own manager, and even in one manager neither set feeds the
+        # other's decision (they only gate log lines). (recursive dataset,
+        # topmost copy below it) pairs whose "not snapshotted" ERROR was
+        # logged, and the datasets whose copy read or atomic snapshot fell
+        # back to a plain `snapshot -r` (ERROR once while it persists).
+        self._snapshot_copy_noted: Set[Tuple[str, str]] = set()
+        self._snapshot_fallback_noted: Set[str] = set()
+        # (recursive dataset, origin) pairs, per worker like the sets above,
+        # whose "this dataset itself sits inside a backup copy" ERROR was logged
+        # (a copy marker it has or inherits: `_CopyTops.inside`), and the
+        # datasets whose "itself at or below a receive target" refusal was
+        # (`_snapshot_tree`). Each is announced once per episode and ends with
+        # an INFO.
+        self._snapshot_inside_copy_noted: Set[Tuple[str, str]] = set()
+        self._snapshot_inside_target_noted: Set[str] = set()
+        self._copy_protect_inside_noted: Set[Tuple[str, str]] = set()
         #: Datasets whose protect-set read is failing, so the ERROR is logged
         #: once while it persists (re-armed by the next successful read).
         self._anchor_error_noted: Set[str] = set()
@@ -602,6 +686,11 @@ class DatasetManager:
         # timeout of a local copy's listing).
         self._last_list_failure: Optional[BaseException] = None
         self.last_snapshot_error: Optional[str] = None
+        #: A short standing warning from the last `create_snapshot` that DID
+        #: create the snapshot: backup copies below a recursive dataset were
+        #: left out of it, or could not be told apart (`None`: nothing to say).
+        #: The snapshot worker puts it in the dataset's status record.
+        self.last_snapshot_note: Optional[str] = None
         #: Why the last `received_datasets()` could not enumerate the target
         #: (`None`: it could, or remote backup is off).
         self.last_received_error: Optional[str] = None
@@ -627,6 +716,9 @@ class DatasetManager:
         # True while `prune_snapshots` runs a local copy under timeouts.
         self._prune_timed = False
         self._reread_error: Optional[str] = None
+        # (dataset, snapshot name or None for the read failure) already logged
+        # at the normal level in the current pruning pass (`_pass_logged_once`).
+        self._reread_logged: Set[Tuple[str, Optional[str]]] = set()
         # `expand_recursive`: the parents whose discovery is failing (ERROR
         # once per episode, INFO when it works again) and the (parent, target)
         # pairs whose descendants under a receive target were announced.
@@ -678,7 +770,8 @@ class DatasetManager:
         Needs no daemon: the workers and the CLI (`check`, `rename`) call it
         on a `DatasetManager` built from a `BackupConfig`. Nothing is stored
         on the manager's `datasets`: the snapshot and pruning workers never see
-        a child (the parent's `zfs snapshot -r` and recursive prune cover it).
+        a child (the parent's `_snapshot_tree`, which keeps backup copies out
+        of the snapshot, and its recursive prune cover it).
 
         * **Discovery** is a name-only `zfs list -r -t filesystem,volume` of
           each such parent, UNTIMED (source datasets never are). It names no
@@ -843,16 +936,29 @@ class DatasetManager:
         (`local`, `received` or `inherited from <dataset>`; a local or
         received one wins over an inherited one). One recursive, value-free
         `zfs get -H -o name,property,source -s local,received,inherited -r -t
-        filesystem,volume all <parent>` filtered by property prefix, so a
-        hostile value cannot disturb it, and names libzfseasy cannot
-        represent still count. `inherited` also puts `parent` itself in the
+        filesystem,volume org.zfsbackup:client_id,org.zfsbackup:source_dataset
+        <parent>` (just the two properties: `all` would print a row for every
+        inherited native property of every dataset) filtered by property
+        prefix, so a hostile value cannot disturb it, and names libzfseasy
+        cannot represent still count. `inherited` also puts `parent` itself in the
         map when an ancestor ABOVE it carries them: the parent is then inside
-        a copy. Raises on any failure (the caller then does not expand)."""
-        rows = zfs.get.property_sources(
-            Dataset(parent), types='filesystem,volume',
-            sources=['local', 'received', 'inherited'], recursive=True,
-            prefix=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
-        )
+        a copy. Raises on any failure (the caller then does not expand): a
+        `ZFSTimeoutError` unchanged, anything else as a `RuntimeError` that
+        names `parent` and chains the cause."""
+        try:
+            rows = zfs.get.property_sources(
+                Dataset(parent), types='filesystem,volume',
+                sources=['local', 'received', 'inherited'], recursive=True,
+                prefix=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
+                properties=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
+            )
+        except ZFSTimeoutError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"cannot read the backup-copy markers ({PROP_CLIENT_ID}, {PROP_SOURCE_DATASET}) "
+                f"at or below {parent}: {e}"
+            ) from e
         found: Dict[str, str] = {}
         for r in rows:
             if r.property not in (PROP_CLIENT_ID, PROP_SOURCE_DATASET):
@@ -866,10 +972,17 @@ class DatasetManager:
     def _copy_root_message(parent: str, copy_root: str, source: str) -> str:
         """The ERROR for a copy root met while expanding `parent`: what it is,
         that it and everything below it is not sent, and the remedy that fits
-        where the marker comes from. `zfs inherit` clears only a LOCAL value:
-        a RECEIVED one stays (`zfs inherit -S` merely reverts a local
-        override to it), so for that the remedy is to move the copy out."""
+        where the marker comes from. `zfs inherit` clears only a LOCAL value.
+        On a RECEIVED one it merely MASKS it (`zfs inherit -S` only reverts a
+        local override to it): the property then reads as inherited or unset,
+        which `_copy_roots` does not see, so the copy would stop being
+        recognised as one. For a received marker the remedy is therefore to
+        move the copy out, never to inherit it."""
         props = f"{PROP_CLIENT_ID} or {PROP_SOURCE_DATASET}"
+        mask = (
+            "a plain `zfs inherit` of a received value only masks it, and a masked marker "
+            "makes this check stop seeing the copy"
+        )
         if source.startswith('inherited'):
             origin = source[len('inherited from '):] or 'an ancestor'
             return (
@@ -878,14 +991,14 @@ class DatasetManager:
                 f"{parent} out of it (zfs rename) or stop it being recursive; if it is really a "
                 f"source, clear the properties on {origin} (zfs inherit {PROP_CLIENT_ID} "
                 f"{origin}; zfs inherit {PROP_SOURCE_DATASET} {origin}), which works only for "
-                "local values, not received ones"
+                f"local values ({mask})"
             )
         if source == 'received':
             return (
                 f"{copy_root} carries a received {props}: it is a replicated backup copy, so it "
                 f"and its descendants (under {parent}) are not sent. A received value is not "
-                f"removed by `zfs inherit` (`zfs inherit -S` only reverts a local override to "
-                f"it): move the copy out of {parent} (zfs rename {copy_root} <a name outside "
+                f"removed by `zfs inherit` (`zfs inherit -S` only reverts a local override to it; "
+                f"{mask}): move the copy out of {parent} (zfs rename {copy_root} <a name outside "
                 f"{parent}>)"
             )
         return (
@@ -1099,10 +1212,12 @@ class DatasetManager:
             return False
 
     def clear_anchor(self, dsi: DatasetInfo, destination: str) -> None:
-        """Clear the anchor snapshot for a destination (inherit removes user property)."""
+        """Clear the LOCAL anchor snapshot for a destination (`zfs inherit -S`:
+        removes the local value, or reverts it to the received one, which a
+        plain inherit would hide from the pruner's protect set)."""
         prop = f"{PROP_ANCHOR_PREFIX}{destination}"
         try:
-            zfs.inherit(dsi.dataset, prop)
+            zfs.inherit(dsi.dataset, prop, received=True)
             logger.debug(f"Cleared anchor for {dsi.name} -> {destination}")
         except Exception as e:
             logger.warning(f"Failed to clear anchor property for {dsi.name}: {e}")
@@ -1140,12 +1255,12 @@ class DatasetManager:
             return False
 
     def clear_inflight(self, dsi: DatasetInfo, destination: str) -> bool:
-        """Remove `inflight.<destination>` (inherit removes a user property).
-        `True` if cleared, `False` (after a WARNING) if not: a stale pin only
+        """Remove the LOCAL `inflight.<destination>` (`zfs inherit -S`, which
+        reverts to a received value instead of hiding it). `True` if cleared, `False` (after a WARNING) if not: a stale pin only
         over-protects two snapshots until the next send overwrites it."""
         prop = f"{PROP_INFLIGHT_PREFIX}{destination}"
         try:
-            zfs.inherit(dsi.dataset, prop)
+            zfs.inherit(dsi.dataset, prop, received=True)
             logger.debug(f"Cleared in-flight pin for {dsi.name} -> {destination}")
             return True
         except Exception as e:
@@ -1893,8 +2008,13 @@ class DatasetManager:
 
     def create_snapshot(self, dsi: DatasetInfo) -> Optional['SnapshotInfo']:
         """Create a new snapshot for the dataset. `None` when it could not be
-        created (`last_snapshot_error` says why) and in a dry run."""
+        created (`last_snapshot_error` says why) and in a dry run. A recursive
+        dataset is snapshotted by `_snapshot_tree`, which keeps the backup
+        copies below it out of the snapshot (`last_snapshot_note` then says so,
+        for the status record). Nothing here depends on what `zfs.snapshot`
+        returns: the snapshot object is built from `dsi` and the name."""
         self.last_snapshot_error = None
+        self.last_snapshot_note = None
         snap_name = self._generate_snapshot_name(dsi)
         full_name = f"{dsi.name}@{snap_name}"
         try:
@@ -1902,9 +2022,21 @@ class DatasetManager:
             if self.config.dry_run:
                 logger.info(f"[DRY RUN] Would create snapshot: {full_name}")
                 return None
-            result = zfs.snapshot(dsi.dataset, snap_name, recursive=dsi.recursive)
-            snapshot = result[0] if isinstance(result, list) else result
+            if dsi.recursive:
+                self._snapshot_tree(dsi, snap_name)
+            else:
+                zfs.snapshot(dsi.dataset, snap_name, recursive=False)
+            snapshot = ZFSSnapshot(dsi.dataset, snap_name)
             logger.info(f"Successfully created snapshot: {full_name}")
+        except _InsideReceiveTarget as e:
+            self.last_snapshot_error = f"Failed to create snapshot {full_name}: {e}"
+            # The refusal repeats every cycle until the configuration or the
+            # layout changes: ERROR for the first, DEBUG for the rest.
+            logger.log(
+                logging.ERROR if e.first else logging.DEBUG,
+                f"Failed to create snapshot {full_name}: {e}",
+            )
+            return None
         except Exception as e:
             self.last_snapshot_error = f"Failed to create snapshot {full_name}: {e}"
             logger.error(f"Failed to create snapshot {full_name}: {e}")
@@ -1920,6 +2052,272 @@ class DatasetManager:
         except Exception as e:
             logger.warning(f"Created {full_name} but could not re-list {dsi.name}: {e}")
         return SnapshotInfo(snapshot, self.prefix)
+
+    def _snapshot_tree(self, dsi: DatasetInfo, snap_name: str) -> None:
+        """Run the snapshot command for the RECURSIVE `dsi`, never snapshotting
+        INTO a backup copy below it (A2c). Returns nothing: only that the
+        command succeeded is guaranteed (it raises otherwise), and the caller
+        builds the snapshot object itself, so no shape of `zfs.snapshot`'s
+        return value (a list, in listing order, that may have dropped a row)
+        is relied on.
+
+        * No copy below it (`_copy_tops`): plain `zfs snapshot -r`, as always.
+        * Copies found: ONE atomic `zfs snapshot dsi@s child@s ...` (`zfs.snapshot.many`)
+          over `dsi` and every source descendant (`_snapshot_sources`: a
+          strict, name-only listing minus every copy top's subtree). One
+          ERROR per (dsi, copy top) per episode names the copy, why it is one
+          and the remedy; an INFO when it is gone. When `dsi` ITSELF has or
+          inherits a copy marker (every child inherits it, so every child is a
+          top) there is ONE ERROR per (dsi, origin of the marker) instead, and
+          only `dsi` is snapshotted.
+        * If the copy read or the listing FAILS (any `Exception`: a
+          `RuntimeError` from the wrapped reads, a timeout, an untrusted
+          listing outside the copies; a stop or interrupt is a
+          `BaseException` and is not caught), or `many` refuses the list
+          BEFORE running zfs (a `ValueError`: more than
+          `SnapshotCommand.MANY_MAX_ARGV_BYTES` of argv, ~1000 datasets, which
+          is never split because it would not be atomic), fall back to plain
+          `snapshot -r` with one ERROR per episode. Deliberate (user
+          decision): a stray snapshot in a copy is recoverable, a missed
+          source snapshot is not. A zfs FAILURE of `many` itself is not
+          caught (a plain `-r` would fail the same way): it ends the cycle as
+          before.
+        * `dsi` itself at or below a receive target (`validate_config`
+          refuses such a configuration; `_copy_tops` then makes `dsi` the top):
+          nothing is snapshotted and this raises `_InsideReceiveTarget`
+          (ERROR once per episode, INFO when it is over). Everything there is
+          a copy, so any snapshot, `dsi` alone included, would be one INTO a
+          copy, and there is no source whose snapshot could be missed.
+
+        `last_snapshot_note` is set to a short standing warning whenever copies
+        were left out or could not be told apart.
+
+        The command is atomic and fails as a whole: a collision on one child
+        (a name that exists there), or a source child destroyed or renamed
+        between the listing and the snapshot, fails the whole command, so
+        NOTHING is snapshotted that cycle (the next one lists again and
+        retries; `snapshot -r` has the same all-or-nothing behaviour for a
+        collision). A child created in that window misses this one snapshot
+        (the next period catches up), and a copy created in it gets one stray
+        snapshot. Source datasets are never timed."""
+        tops: Dict[str, str] = {}
+        sources: Optional[List[Dataset]] = None
+        failure: Optional[str] = None
+        try:
+            tops = self._copy_tops(dsi)
+            if tops and dsi.name not in tops:
+                sources = self._snapshot_sources(dsi, tops)
+        except Exception as e:
+            failure = f"{type(e).__name__}: {e}"
+        if failure is None:
+            if dsi.name in tops:
+                first = dsi.name not in self._snapshot_inside_target_noted
+                self._snapshot_inside_target_noted.add(dsi.name)
+                raise _InsideReceiveTarget(
+                    f"{dsi.name} is itself inside a backup copy ({tops[dsi.name]}): not snapshotting "
+                    "it (a configured dataset must be outside every receive target; remove it from "
+                    "the configuration or move it out with zfs rename)",
+                    first,
+                )
+            if dsi.name in self._snapshot_inside_target_noted:
+                self._snapshot_inside_target_noted.discard(dsi.name)
+                logger.info(f"{dsi.name} is no longer at or below a receive target")
+        if failure is None and sources is not None:
+            try:
+                zfs.snapshot.many(sources, snap_name)
+            except ValueError as e:
+                # Raised before zfs runs (argv bound, names): nothing was created.
+                failure = f"ValueError: {e}"
+        if failure is not None:
+            if dsi.name not in self._snapshot_fallback_noted:
+                self._snapshot_fallback_noted.add(dsi.name)
+                logger.error(
+                    f"Cannot keep the backup copies out of the snapshot of {dsi.name} ({failure}); "
+                    f"falling back to `zfs snapshot -r`, which also snapshots into any copy below it "
+                    "(a stray snapshot in a copy is recoverable, a missed source snapshot is not). "
+                    "This repeats until the read passes"
+                )
+            else:
+                logger.debug(f"Still cannot tell the copies below {dsi.name} apart: {failure}")
+            self.last_snapshot_note = (
+                "backup copies below could not be told apart, so `zfs snapshot -r` was used and may "
+                f"have snapshotted into one ({failure})"
+            )
+            zfs.snapshot(dsi.dataset, snap_name, recursive=True)
+            return
+        if dsi.name in self._snapshot_fallback_noted:
+            self._snapshot_fallback_noted.discard(dsi.name)
+            logger.info(
+                f"The backup copies below {dsi.name} can be told apart again"
+                + ("; they are kept out of its snapshot again" if tops else " (none was found)")
+            )
+        if sources is None:
+            # No copy below it.
+            zfs.snapshot(dsi.dataset, snap_name, recursive=True)
+        self._snapshot_copy_episodes(dsi, snap_name, tops)
+        inside = getattr(tops, 'inside', None)
+        if inside is not None and getattr(tops, 'covered', None):
+            self.last_snapshot_note = (
+                f"{dsi.name} sits inside a backup copy ({inside[0]}): the datasets below it "
+                "were not snapshotted"
+            )
+        elif tops:
+            names = sorted(tops)
+            shown = ', '.join(names[:3]) + (f" (+{len(names) - 3} more)" if len(names) > 3 else '')
+            self.last_snapshot_note = (
+                f"{len(names)} backup cop{'y' if len(names) == 1 else 'ies'} below "
+                f"{'was' if len(names) == 1 else 'were'} not snapshotted: {shown}"
+            )
+
+    def _snapshot_copy_episodes(self, dsi: DatasetInfo, snap_name: str, tops: Dict[str, str]) -> None:
+        """The once-per-episode ERROR / INFO lines of a successful
+        `_snapshot_tree`: one per copy top (those that exist only because
+        `dsi` itself has or inherits a marker are in `tops.covered` and get
+        the one `dsi`-level message instead), and the INFOs for what is gone."""
+        covered = getattr(tops, 'covered', frozenset())
+        for top, why in tops.items():
+            if top in covered:
+                continue
+            key = (dsi.name, top)
+            if key in self._snapshot_copy_noted:
+                continue
+            self._snapshot_copy_noted.add(key)
+            logger.error(
+                f"{top} is a backup copy ({why}) below the recursive dataset {dsi.name}: it and "
+                f"everything below it is NOT snapshotted (the rest of {dsi.name} is, as "
+                f"{dsi.name}@{snap_name}, in one atomic command). Move it out of {dsi.name} "
+                f"(zfs rename {top} <a name outside {dsi.name}>) or make {dsi.name} non-recursive"
+            )
+        for key in [
+            k for k in self._snapshot_copy_noted
+            if k[0] == dsi.name and (k[1] not in tops or k[1] in covered)
+        ]:
+            self._snapshot_copy_noted.discard(key)
+            logger.info(f"{key[1]}, a backup copy below {dsi.name}, is gone; {dsi.name} is "
+                        "snapshotted recursively again")
+        self._inside_episode(
+            dsi, tops, self._snapshot_inside_copy_noted,
+            f"only {dsi.name} itself is snapshotted (as {dsi.name}@{snap_name}); nothing below it is",
+        )
+
+    def _inside_episode(
+        self, dsi: DatasetInfo, tops: Dict[str, str], noted: Set[Tuple[str, str]], effect: str,
+    ) -> None:
+        """ERROR once per (`dsi`, origin) while `dsi` itself has or inherits a
+        copy marker (`tops.inside`) and children below it are copies by that
+        inheritance (`tops.covered`), INFO when that is over. Replaces one
+        message per child, whose `zfs rename <child>` remedy would be wrong:
+        the children are copies only by inheritance."""
+        inside = getattr(tops, 'inside', None)
+        # Only when something below it is a copy by inheritance: a dataset that
+        # has no children has nothing to say.
+        now = {(dsi.name, inside[0])} if inside is not None and getattr(tops, 'covered', None) else set()
+        for key in sorted(now - noted):
+            noted.add(key)
+            logger.error(self._inside_copy_message(dsi.name, inside[0], inside[1], effect))
+        for key in [k for k in noted if k[0] == dsi.name and k not in now]:
+            noted.discard(key)
+            logger.info(f"Nothing below {dsi.name} is a backup copy by inheritance from {key[1]} "
+                        "any more")
+
+    @staticmethod
+    def _inside_copy_message(dsi: str, origin: str, source: str, effect: str) -> str:
+        """The ERROR for a recursive `dsi` that itself sits inside a backup copy:
+        it has (`local`/`received`) or inherits `source` the copy markers, and
+        so does everything below it."""
+        props = f"{PROP_CLIENT_ID} or {PROP_SOURCE_DATASET}"
+        where = (
+            f"it inherits {props} from {origin}" if source.startswith('inherited')
+            else f"it carries a {source} {props}"
+        )
+        return (
+            f"{dsi} itself sits inside a backup copy: {where}, so everything below it is a copy by "
+            f"inheritance; {effect}. If {origin} is a backup copy, move {dsi} out of it (zfs "
+            f"rename) or make {dsi} non-recursive; if it is really a source, clear the markers on "
+            f"{origin} (zfs inherit {PROP_CLIENT_ID} {origin}; zfs inherit {PROP_SOURCE_DATASET} "
+            f"{origin}), which works only for local values (a plain `zfs inherit` of a received "
+            "one only masks it, and a masked marker hides the copy from this check)"
+        )
+
+    def _snapshot_sources(self, dsi: DatasetInfo, tops: Dict[str, str]) -> List[Dataset]:
+        """`dsi` (first) and every descendant that is not at or below one of
+        `tops`, from strict, name-only `zfs list -H -t filesystem,volume -o
+        name,type` reads, UNTIMED (source datasets never are). Strict so that
+        a name libzfseasy cannot represent never silently misses its snapshot
+        (the caller then falls back to `snapshot -r`), but only OUTSIDE the
+        copies: a bad name inside a copy is none of this snapshot's business.
+
+        One recursive listing of `dsi` first (the usual case). Only if it is
+        refused as untrusted (a name libzfseasy cannot represent: its error
+        does not say which, and the non-strict list does not report skipped
+        names) the tree is walked instead (`_walk_sources`): every dataset
+        that has a copy top below it is listed one level (`-d 1`), every other
+        child recursively, and no top is ever listed, so a bad name below a top
+        is never read and one anywhere else is still refused. A bad name that
+        is itself a copy top cannot be told from a source's, so that falls back
+        to `snapshot -r` too. Raises a `RuntimeError` naming `dsi` (cause
+        chained) on any failure or a listing that does not contain `dsi` or has
+        a name outside it."""
+        try:
+            try:
+                listed = list(zfs.list(
+                    roots=dsi.dataset, types='filesystem,volume', recursive=True, strict=True,
+                ))
+            except Exception as e:
+                if not str(e).startswith(_UNTRUSTED_LISTING):
+                    raise
+                logger.debug(f"The listing of {dsi.name} was refused ({e}); walking it around the copies")
+                listed = self._walk_sources(dsi, tops)
+        except Exception as e:
+            raise RuntimeError(f"cannot list the datasets of {dsi.name}: {e}") from e
+        prefix = dsi.name + '/'
+        own: Optional[Dataset] = None
+        below: List[Dataset] = []
+        for item in listed:
+            name = item.name
+            if name == dsi.name:
+                own = item
+            elif not name.startswith(prefix):
+                raise RuntimeError(f"the listing of {dsi.name} contains {name}, which is outside it")
+            elif not any(name == t or name.startswith(t + '/') for t in tops):
+                below.append(item)
+        if own is None:
+            raise RuntimeError(f"the listing of {dsi.name} does not contain {dsi.name} itself")
+        return [own] + below
+
+    @staticmethod
+    def _walk_sources(dsi: DatasetInfo, tops: Dict[str, str]) -> List[Dataset]:
+        """The datasets of `dsi` outside every top of `tops`, listed without
+        ever listing a top (`_snapshot_sources`). Each listing is strict, so a
+        name libzfseasy cannot represent anywhere outside the copies raises.
+        Raises whatever a listing raises."""
+        def inside(name: str) -> bool:
+            return any(name == t or name.startswith(t + '/') for t in tops)
+
+        def above(name: str) -> bool:
+            return any(t.startswith(name + '/') for t in tops)
+
+        found: List[Dataset] = []
+
+        def visit(node: str) -> None:
+            for item in zfs.list(
+                roots=Dataset(node), types='filesystem,volume', depth=1, strict=True,
+            ):
+                if item.name == node:
+                    found.append(item)
+                elif not item.name.startswith(node + '/'):
+                    raise RuntimeError(f"the listing of {node} contains {item.name}, which is outside it")
+                elif inside(item.name):
+                    continue
+                elif above(item.name):
+                    visit(item.name)
+                else:
+                    found.extend(zfs.list(
+                        roots=item, types='filesystem,volume', recursive=True, strict=True,
+                    ))
+
+        visit(dsi.name)
+        return found
 
     def _descendant_anchor_protection(self, dsi: DatasetInfo) -> Dict[str, str]:
         """For a RECURSIVE dataset: `{snapshot name: reason}` pinned by any
@@ -1965,6 +2363,171 @@ class DatasetManager:
             for sni in snaps:
                 if id(sni) not in pruned:
                     protected.setdefault(sni.name, f"retention of {child.name} keeps it")
+        return protected
+
+    def _copy_tops(self, dsi: DatasetInfo) -> Dict[str, str]:
+        """The TOPMOST backup copies below the recursive `dsi`, as `{dataset:
+        why}` (`why` is a clause for the ERROR), shallowest first. The result
+        is a `_CopyTops`: it also says whether `dsi` itself sits inside a copy
+        (`inside`, `covered`). Two sources:
+
+        * a dataset STRICTLY below `dsi` with a local, received or inherited
+          `org.zfsbackup:client_id`/`source_dataset` (`_copy_roots`: one
+          value-free recursive `zfs get`; an inherited marker covers the whole
+          subtree, so the topmost one is enough). `dsi` itself is not "a copy
+          below it": if it is inside one, every child inherits the marker and
+          counts;
+        * every name at or below one of `_receive_targets()` that is strictly
+          below `dsi` (the target itself is then the top). It needs no `zfs`
+          call, matches `expand_recursive`, and covers a copy without markers
+          under a known target (a `send -R` replica, a copy whose properties
+          were cleared). A target that does not exist yet holds nothing and is
+          dropped (one `zfs.exists` per such candidate). If `dsi` itself is at
+          or below a target (a configuration `validate_config` refuses),
+          everything below it is a copy and `dsi` is the top.
+
+        The limit that remains: a copy with no markers that is not under a
+        known target is indistinguishable from a source child, and is
+        treated as one. Raises (a `RuntimeError` naming `dsi`; a
+        `ZFSTimeoutError` unchanged)."""
+        found = self._copy_roots(dsi.name)
+        prefix = dsi.name + '/'
+        why: Dict[str, str] = {}
+        for name, source in found.items():
+            if name.startswith(prefix):
+                why[name] = f"it has {PROP_CLIENT_ID} or {PROP_SOURCE_DATASET}, source: {source}"
+        # `dsi` itself has or inherits a marker: every child inherits it.
+        inside: Optional[Tuple[str, str]] = None
+        child_source = ''
+        own = found.get(dsi.name)
+        if own is not None:
+            if own.startswith('inherited'):
+                inside = (own[len('inherited from '):] or 'an ancestor', own)
+                child_source = own
+            else:
+                inside = (dsi.name, own)
+                child_source = f"inherited from {dsi.name}"
+        from_target: Set[str] = set()
+        for target in self._receive_targets():
+            top = None
+            if target.startswith(prefix):
+                top = target
+                reason = f"it is the receive target {target}"
+            elif dsi.name == target or dsi.name.startswith(target + '/'):
+                top = dsi.name
+                reason = (
+                    f"{dsi.name} is itself at or below the receive target {target}, so "
+                    "everything below it is a copy"
+                )
+            if top is not None and top not in why:
+                why[top] = reason
+                from_target.add(top)
+        tops: List[str] = []
+        # Sorted, so an ancestor always precedes its descendants.
+        for name in sorted(why):
+            if not any(name.startswith(t + '/') for t in tops):
+                tops.append(name)
+        result: Dict[str, str] = {}
+        for top in tops:
+            if top in from_target:
+                try:
+                    present = zfs.exists(Dataset(top))
+                except ZFSTimeoutError:
+                    raise
+                except Exception as e:
+                    raise RuntimeError(
+                        f"cannot check whether {top}, which receives copies, exists below "
+                        f"{dsi.name}: {e}"
+                    ) from e
+                if not present:
+                    continue
+            result[top] = why[top]
+        tops = _CopyTops(result)
+        tops.inside = inside
+        tops.covered = frozenset(
+            top for top in result
+            if inside is not None and top not in from_target and found.get(top) == child_source
+        )
+        return tops
+
+    def _copy_protection(self, dsi: DatasetInfo) -> Dict[str, str]:
+        """For a RECURSIVE dataset: `{snapshot name: reason}` for every name
+        held by a BACKUP COPY below it. `zfs destroy -r ds@snap` also destroys
+        `@snap` in every descendant, a copy included, and a copy carries the
+        very names its source has (the copies of a `zfs:` destination that
+        was removed from the config, a `send -R` replica of a server's tree,
+        another host's copy with the same prefix). Those names are therefore
+        never destroyed recursively. Source children are still pruned, but
+        only for a name the copy does NOT have. The snapshot worker no longer
+        snapshots into a copy (`_snapshot_tree`, A2c), but names a copy got
+        from earlier versions or from the fallback to `snapshot -r` stay held
+        back until it is moved out. (Chosen over "no recursive destroy while a copy exists": that
+        would let the whole tree grow for ever, and needs the same copy read;
+        the extra listing below is strict, so the protect-set is complete or
+        the pass does not act.)
+
+        The copies are `_copy_tops`: markers (local, received or inherited
+        `client_id`/`source_dataset`) and everything strictly below `dsi`
+        that is at or below a receive target. Remaining limit: a copy with no
+        markers that is not under a known target is indistinguishable from a
+        source child. One recursive `zfs list -t snapshot` per TOPMOST copy
+        root. Logs one ERROR per (`dsi`, copy root) episode naming the copy
+        and the remedy, one INFO when it is gone; when `dsi` ITSELF has or
+        inherits a copy marker (every child is then a copy by inheritance) one
+        ERROR per (`dsi`, origin of the marker) instead of one per child. Raises (`zfs` failure, an
+        untrusted listing: a `RuntimeError` naming the copy, a
+        `ZFSTimeoutError` unchanged) so that the caller does not prune."""
+        tops = self._copy_tops(dsi)
+        covered = getattr(tops, 'covered', frozenset())
+        prefix = dsi.name + '/'
+        protected: Dict[str, str] = {}
+        for top in tops:
+            try:
+                listed = list(zfs.list(
+                    roots=Dataset(top), types='snapshot', recursive=True, strict=True,
+                ))
+            except ZFSTimeoutError:
+                raise
+            except Exception as e:
+                raise RuntimeError(
+                    f"cannot list the snapshots of the backup copy {top} below {dsi.name}: {e}"
+                ) from e
+            for snap in listed:
+                # (`dsi` itself can be a top only when it is inside a receive
+                # target: its own snapshots are not the copy's.)
+                if isinstance(snap, ZFSSnapshot) and snap.name.partition('@')[0].startswith(prefix):
+                    protected.setdefault(snap.short, f"it is also held by the backup copy {snap.name}")
+        for top, why in tops.items():
+            if top in covered:
+                continue
+            key = (dsi.name, top)
+            if key in self._copy_protect_noted:
+                continue
+            self._copy_protect_noted.add(key)
+            logger.error(
+                f"{top} is a backup copy ({why}) below the recursive dataset {dsi.name}: a "
+                f"recursive destroy of {dsi.name}@<snapshot> would destroy the copy's snapshot of "
+                f"that name, so every snapshot name the copy holds is kept in {dsi.name} until "
+                f"the copy is gone. Move it out of {dsi.name} (zfs rename {top} <a name outside "
+                f"{dsi.name}>) or make {dsi.name} non-recursive. A zfs snapshot -r of {dsi.name} "
+                "(older versions; the snapshot worker's fallback when it cannot read the copies) "
+                "also snapshots into the copy, and on a live replica that stops its incremental "
+                f"receives. Such a stray has the SAME createtxg as {dsi.name}@<name> (check: zfs "
+                f"get -H -o name,value createtxg {dsi.name}@<name> {top}@<name>); every other "
+                "snapshot in the copy is received backup history, which must never be destroyed"
+            )
+        for key in [
+            k for k in self._copy_protect_noted
+            if k[0] == dsi.name and (k[1] not in tops or k[1] in covered)
+        ]:
+            self._copy_protect_noted.discard(key)
+            logger.info(f"{key[1]}, a backup copy below {dsi.name}, is gone; recursive pruning of "
+                        f"{dsi.name} is no longer held back by it")
+        self._inside_episode(
+            dsi, tops, self._copy_protect_inside_noted,
+            f"a recursive destroy of {dsi.name}@<snapshot> would destroy that name in every copy "
+            f"below it, so every snapshot name they hold is kept in {dsi.name}",
+        )
         return protected
 
     def prune_snapshots(self, dsi: DatasetInfo) -> PruneResult:
@@ -2041,6 +2604,7 @@ class DatasetManager:
 
     def _prune_snapshots(self, dsi: DatasetInfo) -> PruneResult:
         self._reread_error = None
+        self._reread_logged = set()
         snapshots = self.list_snapshots(dsi, recursive=False)
         if not snapshots:
             if self.last_list_error is not None:
@@ -2092,6 +2656,8 @@ class DatasetManager:
             try:
                 for name, reason in self._descendant_retention_protection(dsi).items():
                     desc_protected.setdefault(name, reason)
+                for name, reason in self._copy_protection(dsi).items():
+                    desc_protected.setdefault(name, reason)
             except Exception as e:
                 msg = f"Cannot evaluate descendants of {dsi.name}; skipping pruning this cycle: {e}"
                 if dsi.name in self._descendant_error_noted:
@@ -2100,7 +2666,11 @@ class DatasetManager:
                     self._descendant_error_noted.add(dsi.name)
                     logger.error(msg)
                 return PruneResult(skipped=f"cannot evaluate the descendants: {e}")
-            self._descendant_error_noted.discard(dsi.name)
+            if dsi.name in self._descendant_error_noted:
+                self._descendant_error_noted.discard(dsi.name)
+                logger.info(
+                    f"The descendants of {dsi.name} can be evaluated again; pruning resumes"
+                )
             all_candidates = to_prune
             kept = []
             for sni in to_prune:
@@ -2128,7 +2698,18 @@ class DatasetManager:
             self._descendant_protect_noted = {
                 key for key in self._descendant_protect_noted if key[0] != dsi.name
             }
-            self._descendant_error_noted.discard(dsi.name)
+            if not dsi.recursive:
+                # (A recursive dataset with nothing to prune did not read the
+                # copies this pass: its episode memory stays.)
+                self._copy_protect_noted = {
+                    key for key in self._copy_protect_noted if key[0] != dsi.name
+                }
+            if dsi.name in self._descendant_error_noted:
+                self._descendant_error_noted.discard(dsi.name)
+                logger.info(
+                    f"Nothing is due for pruning in {dsi.name}, so its descendants are not "
+                    "evaluated this cycle; pruning resumes when something is due"
+                )
         # A name that is no longer a candidate (destroyed, gone, now kept)
         # leaves the stuck memory.
         self._forget_stuck(dsi, {sni.name for sni in to_prune})
@@ -2208,7 +2789,8 @@ class DatasetManager:
         pass began, read IMMEDIATELY before a destroy call (a batch, or one
         snapshot of the fallback): the anchors and in-flight pins
         (`get_anchors`, local and received) and, for a recursive dataset, the
-        descendants' anchors and pins. The pass's first read goes stale: the
+        descendants' anchors and pins and the snapshot names held by backup copies
+        below it. The pass's first read goes stale: the
         remote worker pins a pair, sends, writes the anchor and re-pins the
         next pair while this pass retries a failed batch (a send in progress
         makes a destroy fail with EBUSY, which is exactly the fallback's
@@ -2225,8 +2807,11 @@ class DatasetManager:
         created in that window is not, the same race as any set after the
         read), one per configured destination (`get_anchor`)
         and, for a recursive dataset, two recursive `zfs get`s (one when no
-        descendant has a property of ours) and no `zfs list`; no snapshot
-        listing. A re-read after a property changed between the two execs
+        descendant has a property of ours), one more recursive value-free `zfs
+        get` for the backup copies below it (`_copy_protection`), one
+        `zfs list -t snapshot -r` per topmost copy root and one existence
+        check per marker-less receive target below it (`_copy_tops`); no listing of the
+        dataset's own snapshots. A re-read after a property changed between the two execs
         adds two more. If the read fails nothing is
         destroyed (-> `[]`). (A `zfs hold` on the in-flight pair would be the
         airtight alternative; it is deferred because holds left by a crash
@@ -2239,25 +2824,52 @@ class DatasetManager:
             # an in-flight pin shows) LAST, so that a whole chain step cannot
             # fit between the read and the destroy but for the destroy's own
             # start-up. The sender additionally keeps its pin between steps.
-            protected = set(self._descendant_anchor_protection(dsi)) if dsi.recursive else set()
+            protected: Set[str] = set()
+            if dsi.recursive:
+                # A backup copy that appeared since the decision (or a
+                # snapshot it received since) is seen here, before the
+                # destroy. First: it is independent of the pins below, so
+                # the time-critical reads keep their order.
+                protected |= set(self._copy_protection(dsi))
+                protected |= set(self._descendant_anchor_protection(dsi))
             protected |= set(self.get_anchors(dsi, own_properties_last=True))
         except Exception as e:
             if self._prune_timed and isinstance(e, ZFSTimeoutError):
                 raise
             self._reread_error = str(e)
-            logger.error(
-                f"Cannot re-read the anchors of {dsi.name}; not destroying "
-                f"{', '.join(s.full_name for s in group)} now: {e}"
+            msg = (
+                f"Cannot re-read what protects the snapshots of {dsi.name} (its anchors and "
+                f"in-flight pins and, for a recursive dataset, the backup copies below it); "
+                f"not destroying {', '.join(s.full_name for s in group)} now: {e}"
             )
+            # ERROR the first time in a pass; the batch's one-at-a-time retry
+            # and the next batches would only repeat it.
+            if self._pass_logged_once((dsi.name, None)):
+                logger.error(msg)
+            else:
+                logger.debug(msg)
             return []
         kept = [s for s in group if s.name not in protected]
         for sni in group:
             if sni.name in protected:
-                logger.info(
-                    f"Dataset {dsi.name}: not pruning {sni.full_name}: it became an "
-                    "anchor or in-flight snapshot during this pass"
+                msg = (
+                    f"Dataset {dsi.name}: not pruning {sni.full_name}: it became protected "
+                    "(an anchor, an in-flight pin, or a backup copy below it) during this pass"
                 )
+                if self._pass_logged_once((dsi.name, sni.name)):
+                    logger.info(msg)
+                else:
+                    logger.debug(msg)
         return kept
+
+    def _pass_logged_once(self, key: Tuple[str, Optional[str]]) -> bool:
+        """True the first time `key` is seen in this pruning pass (the set is
+        reset by `_prune_snapshots`), so a re-read message is logged once per
+        dataset (and snapshot) per pass and repeats go to DEBUG."""
+        if key in self._reread_logged:
+            return False
+        self._reread_logged.add(key)
+        return True
 
     @staticmethod
     def _busy_reason(sni: 'SnapshotInfo') -> Optional[str]:

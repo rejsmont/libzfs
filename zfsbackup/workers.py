@@ -862,10 +862,14 @@ class SnapshotWorker(BaseWorker):
             logger.info(f"Dataset {dsi.name} needs snapshot")
             created = manager.create_snapshot(dsi)
             if created is not None:
-                self._record(
-                    health.KIND_SNAPSHOT, dsi.name, ok=True,
-                    detail=str(getattr(created, 'name', '') or ''),
-                )
+                detail = str(getattr(created, 'name', '') or '')
+                # A standing warning (backup copies below a recursive dataset
+                # left out of the snapshot, or not told apart): on the record,
+                # so `check` shows it long after the journal line.
+                note = getattr(manager, 'last_snapshot_note', None)
+                if isinstance(note, str) and note:
+                    detail = f"{detail}; WARNING: {note}" if detail else f"WARNING: {note}"
+                self._record(health.KIND_SNAPSHOT, dsi.name, ok=True, detail=detail)
             else:
                 reason = getattr(manager, 'last_snapshot_error', None)
                 self._record(

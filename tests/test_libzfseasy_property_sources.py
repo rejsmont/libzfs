@@ -18,6 +18,7 @@ guard in conftest only objects to a real zfs/zpool). Nothing here needs a pool: 
 """
 
 import io
+import re
 import subprocess
 import sys
 
@@ -26,8 +27,17 @@ import pytest
 import libzfseasy
 import libzfseasy as zfs
 from libzfseasy import zfs as zfs_module
-from libzfseasy.types import Bookmark, Filesystem, Snapshot, Volume
+from libzfseasy.types import Bookmark, Dataset, Filesystem, Snapshot, Volume
 from libzfseasy.zfs import GetCommand, PropertySource, ZFSOutputError, ZFSTimeoutError
+
+from _openzfs_fixtures import VERSIONS, load_section
+
+
+def _stable_id(value, limit=60):
+    """A parametrize id from `repr(value)` with any ` at 0x…` address removed:
+    a generator's or iterator's repr differs between processes, and
+    pytest-xdist refuses a run whose workers collect different test ids."""
+    return re.sub(r' at 0x[0-9a-fA-F]+', '', repr(value))[:limit]
 
 pytestmark = pytest.mark.unit
 
@@ -431,7 +441,7 @@ class TestMalformedRows:
         (('p', 'compression', 'inherited from ' + 'a' * 256), 'invalid source'),
         (('p', 'compression', 'inheritedfrom p'), 'invalid source'),
         (('p', 'compression', 'default from p'), 'invalid source'),
-    ], ids=lambda x: repr(x)[:60])
+    ], ids=lambda x: _stable_id(x, 60))
     def test_each_malformed_row_raises_and_names_its_problem(self, feed, row, problem):
         message = refused(feed, row, problem=problem)
         assert 'could not be trusted' in message
@@ -807,6 +817,537 @@ class TestForgeryIsImpossible:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# an explicit property list: `properties=[...]`
+# ---------------------------------------------------------------------------------------------------------------------
+
+PROPS = ['compression', 'used', 'org.t:v', 'org.t:w']
+
+
+class TestExplicitArgv:
+    BASE = ['get', '-H', '-o', 'name,property,source']
+
+    @pytest.mark.parametrize('kwargs', [{}, {'properties': None}])
+    def test_omitted_or_none_is_byte_for_byte_the_old_argv(self, feed, kwargs):
+        run(feed, **kwargs)
+        assert feed.argv == self.BASE + ['-t', 'all', 'all']
+
+    def test_omitted_with_every_other_option_is_the_old_argv(self, feed):
+        run(feed, ds=[Filesystem('p/b'), Volume('p/a')], sources='local', recursive=True, depth=3, types='all',
+            prefix='org.')
+        assert feed.argv == self.BASE + ['-s', 'local', '-r', '-d', '3', '-t', 'all', 'all', 'p/b', 'p/a']
+
+    def test_the_comma_joined_names_replace_all(self, feed):
+        run(feed, properties=['compression', 'org.t:v'])
+        assert feed.argv == self.BASE + ['-t', 'all', 'compression,org.t:v']
+        assert 'all' not in feed.argv[feed.argv.index('-t') + 2:]
+
+    def test_the_order_of_the_names_is_kept(self, feed):
+        run(feed, properties=['org.t:v', 'used', 'compression'])
+        assert feed.argv[-1] == 'org.t:v,used,compression'
+
+    def test_a_single_name_in_a_list(self, feed):
+        run(feed, properties=['org.t:v'])
+        assert feed.argv == self.BASE + ['-t', 'all', 'org.t:v']
+
+    def test_a_bare_string_is_one_name(self, feed):
+        run(feed, properties='org.zfsbackup:config')
+        assert feed.argv == self.BASE + ['-t', 'all', 'org.zfsbackup:config']
+
+    def test_a_tuple_is_accepted_like_a_list(self, feed):
+        run(feed, properties=('compression', 'used'))
+        assert feed.argv[-1] == 'compression,used'
+
+    def test_the_datasets_still_come_last_after_the_names(self, feed):
+        run(feed, ds=[Filesystem('p/b'), Volume('p/a')], properties=['compression', 'org.t:v'], sources='local',
+            recursive=True, depth=3, types='filesystem,volume')
+        assert feed.argv == self.BASE + ['-s', 'local', '-r', '-d', '3', '-t', 'filesystem,volume',
+                                         'compression,org.t:v', 'p/b', 'p/a']
+
+    def test_dash_s_is_still_allowed(self, feed):
+        run(feed, properties=['org.t:v'], sources=['local', 'received'])
+        assert feed.argv[4:6] == ['-s', 'local,received']
+
+    def test_still_no_value_or_received_column_and_one_command(self, feed):
+        run(feed, properties=PROPS, ds=Filesystem('p'), recursive=True)
+        assert feed.argv[feed.argv.index('-o') + 1] == 'name,property,source'
+        assert '-p' not in feed.argv and feed.argv.count('-o') == 1 and len(feed.calls) == 1
+
+    def test_prefix_still_never_reaches_zfs(self, feed):
+        run(feed, properties=['org.t:v'], prefix='org.t:')
+        assert feed.argv == self.BASE + ['-t', 'all', 'org.t:v']
+
+    def test_a_user_property_with_every_allowed_character(self, feed):
+        run(feed, properties=['org.zfsbackup:anchor.d-1_x'])
+        assert feed.argv[-1] == 'org.zfsbackup:anchor.d-1_x'
+
+
+class TestExplicitNames:
+    @pytest.mark.parametrize('properties', [
+        'all', ['all'], ['compression', 'all'], ['all', 'compression'], 'ALL', ['All'],
+        '-o:x', ['-o:x'], ['compression', '-x:y'], '-', ['-'], '-r', ['-all'],
+        [], (),
+        ['compression', 'compression'], ['org.t:v', 'org.t:v'], ['used', 'compression', 'used'],
+        [5], ['compression', 5], [None], [b'compression'], [['compression']], [''], ['compression', ''], '',
+        5, 1.5, True, b'compression', {'compression'}, frozenset(['compression']), {'compression': 1},
+        {'compression': 1}.keys(), (n for n in ['compression']), iter(['compression']),
+        ['nocolon'], ['org t:x'], ['org.t:x y'], ['a/b'], ['org.t:\n'], ['org.t:x\n'], ['org.t:\t'],
+        ['org.t:' + 'x' * 300], ['\u00fc:x'], 'compression,used', ['compression,used'], ['org.t:a,b'],
+        ['org.t:v', 'COMPRESSION'], ['not_a_native_property'],
+    ], ids=lambda x: _stable_id(x, 50))
+    def test_an_invalid_list_is_a_value_error_and_nothing_is_executed(self, feed, properties):
+        with pytest.raises(ValueError):
+            zfs.get.property_sources(properties=properties)
+        assert feed.calls == []
+
+    def test_all_is_refused_by_name(self, feed):
+        with pytest.raises(ValueError, match="'all' is not a valid ZFS property name"):
+            zfs.get.property_sources(properties=['all'])
+
+    def test_an_empty_list_is_refused_not_treated_as_all(self, feed):
+        with pytest.raises(ValueError, match='must not be empty'):
+            zfs.get.property_sources(properties=[])
+        assert feed.calls == []
+
+    def test_a_duplicate_is_refused_by_name(self, feed):
+        with pytest.raises(ValueError, match='twice'):
+            zfs.get.property_sources(properties=['org.t:v', 'org.t:v'])
+
+    def test_a_later_bad_name_refuses_the_whole_list(self, feed):
+        with pytest.raises(ValueError):
+            zfs.get.property_sources(properties=['compression', 'used', '-bad:x'])
+        assert feed.calls == []
+
+    def test_a_native_name_zfs_knows_is_accepted(self, feed):
+        run(feed, properties=['compression', 'used', 'available', 'mountpoint', 'type'])
+        assert len(feed.calls) == 1
+
+    def test_the_default_for_properties_is_none(self):
+        import inspect
+        assert inspect.signature(GetCommand.property_sources).parameters['properties'].default is None
+
+
+class TestExplicitRows:
+    def test_set_rows_pass_in_zfss_order(self, feed):
+        rows = [('p', 'compression', 'default'), ('p', 'org.t:v', 'local'), ('p/c', 'compression', 'inherited from p'),
+                ('p/c', 'org.t:v', 'inherited from p'), ('p/c', 'org.t:w', 'received')]
+        got = run(feed, *rows, properties=['compression', 'org.t:v', 'org.t:w'], recursive=True)
+        assert got == [PropertySource(*r) for r in rows]
+
+    def test_an_unset_user_row_is_dropped(self, feed):
+        got = run(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:w', 'local'), properties=['org.t:v', 'org.t:w'])
+        assert got == [PropertySource('p', 'org.t:w', 'local')]
+
+    def test_unset_rows_of_every_object_are_dropped_and_the_others_kept_in_order(self, feed):
+        rows = [('p/a', 'org.t:v', '-'), ('p/a', 'org.t:w', 'local'),
+                ('p/b', 'org.t:v', 'inherited from p'), ('p/b', 'org.t:w', '-'),
+                ('p/c', 'org.t:v', '-'), ('p/c', 'org.t:w', '-')]
+        got = run(feed, *rows, properties=['org.t:v', 'org.t:w'], ds=Filesystem('p'), recursive=True)
+        assert got == [PropertySource('p/a', 'org.t:w', 'local'), PropertySource('p/b', 'org.t:v', 'inherited from p')]
+
+    def test_all_rows_unset_gives_an_empty_list(self, feed):
+        assert run(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:w', '-'), properties=['org.t:v', 'org.t:w']) == []
+
+    def test_no_rows_at_all_is_an_empty_list(self, feed):
+        assert run(feed, properties=['org.t:v']) == []
+
+    def test_a_dropped_row_has_no_source_in_the_result(self, feed):
+        got = run(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:w', 'local'), properties=['org.t:v', 'org.t:w'])
+        assert not any(r.source == '-' and ':' in r.property for r in got)
+
+    def test_a_native_dash_row_is_kept(self, feed):
+        got = run(feed, ('p', 'used', '-'), ('p', 'compression', 'default'), properties=['used', 'compression'])
+        assert got == [PropertySource('p', 'used', '-'), PropertySource('p', 'compression', 'default')]
+
+    def test_a_native_dash_row_is_kept_next_to_a_dropped_user_row(self, feed):
+        got = run(feed, ('p', 'used', '-'), ('p', 'org.t:v', '-'), properties=['used', 'org.t:v'])
+        assert got == [PropertySource('p', 'used', '-')]
+
+    def test_a_native_dash_row_on_a_snapshot_is_kept(self, feed):
+        got = run(feed, ('p@s', 'used', '-'), ('p@s', 'org.t:v', '-'), properties=['used', 'org.t:v'], types='snapshot',
+                  ds=Snapshot.from_name('p@s'))
+        assert got == [PropertySource('p@s', 'used', '-')]
+
+    def test_the_same_dash_row_is_kept_when_the_list_is_omitted(self, feed):
+        """Without `properties` nothing is dropped: an unset user property never shows up under `all`, and a `-` source
+        row is returned as before."""
+        got = run(feed, ('p', 'org.t:v', '-'), ('p', 'used', '-'))
+        assert got == [PropertySource('p', 'org.t:v', '-'), PropertySource('p', 'used', '-')]
+
+    def test_only_source_dash_is_dropped_never_a_set_user_row(self, feed):
+        rows = [('p', 'org.t:v', source) for source in ('local', 'received', 'temporary', 'inherited from p', 'default')]
+        # one object cannot repeat a property: one row per object
+        got = [run(feed, row, properties=['org.t:v'])[0] for row in rows]
+        assert got == [PropertySource(*r) for r in rows]
+
+    # -- an unrequested property --------------------------------------------------------------------------------
+
+    def test_a_row_for_an_unrequested_property_is_refused(self, feed):
+        refused(feed, ('p', 'compression', 'default'), ('p', 'used', '-'), properties=['compression'],
+                problem='a property that was not requested')
+
+    def test_an_unrequested_user_row_is_refused(self, feed):
+        refused(feed, ('p', 'org.t:v', 'local'), properties=['org.t:w'], problem='a property that was not requested')
+
+    def test_an_unrequested_unset_user_row_is_refused_not_dropped(self, feed):
+        refused(feed, ('p', 'org.t:w', '-'), properties=['org.t:v'], problem='a property that was not requested')
+
+    def test_a_prefix_cannot_whitelist_an_unrequested_row(self, feed):
+        refused(feed, ('p', 'org.t:v', 'local'), properties=['org.t:w'], prefix='org.t:',
+                problem='a property that was not requested')
+
+    def test_a_requested_name_is_matched_exactly(self, feed):
+        for other in ('org.t:v2', 'org.t:V', 'org.t:'):
+            refused(feed, ('p', other, 'local'), properties=['org.t:v'], problem='a property that was not requested')
+
+    def test_the_same_row_is_fine_when_the_list_is_omitted(self, feed):
+        assert len(run(feed, ('p', 'compression', 'default'), ('p', 'used', '-'))) == 2
+
+    def test_each_unrequested_row_is_counted(self, feed):
+        refused(feed, ('p', 'a1:x', 'local'), ('p', 'compression', 'default'), ('p', 'a2:x', 'local'),
+                properties=['compression'], count=2)
+
+    def test_an_unrequested_row_names_the_requested_one_nowhere_it_should_not(self, feed):
+        message = refused(feed, ('p', 'org.t:w', 'local'), properties=['org.t:v'])
+        assert 'could not be trusted' in message
+
+    def test_an_unrequested_row_raises_only_after_zfs_exited_and_the_output_was_drained(self, redirect):
+        kids = redirect(
+            'import sys\n'
+            'sys.stdout.write("p\\torg.t:w\\tlocal\\n")\n'
+            'for i in range(20000):\n'
+            '    sys.stdout.write("p\\torg.t:p%d\\tlocal\\n" % i)\n'
+        )
+        with pytest.raises(ZFSOutputError, match='20001 rows refused'):
+            zfs.get.property_sources(properties=['org.t:v'])
+        (proc,) = kids.procs
+        assert proc.returncode == 0
+        assert kids.argvs[0][1:] == ['get', '-H', '-o', 'name,property,source', '-t', 'all', 'org.t:v']
+
+    def test_a_non_zero_exit_wins_over_an_unrequested_row(self, feed):
+        feed.set(text(('p', 'org.t:w', 'local')), b'boom: pool I/O is currently suspended\n', 1)
+        with pytest.raises(Exception) as excinfo:
+            zfs.get.property_sources(properties=['org.t:v'])
+        assert type(excinfo.value) is Exception and 'boom' in str(excinfo.value).lower()
+
+    def test_a_good_explicit_run_with_real_children(self, redirect):
+        kids = redirect('import sys\nsys.stdout.write("p\\torg.t:v\\t-\\np\\torg.t:w\\tlocal\\n")\n')
+        assert zfs.get.property_sources(properties=['org.t:v', 'org.t:w']) == [PropertySource('p', 'org.t:w', 'local')]
+        assert kids.procs[0].poll() == 0
+
+    def test_a_timeout_applies_to_an_explicit_call(self, redirect):
+        redirect('import time\ntime.sleep(120)\n')
+        with zfs.timeout(1):
+            with pytest.raises(ZFSTimeoutError):
+                zfs.get.property_sources(properties=['org.t:v'])
+
+
+# Every check that holds for `all` holds under an explicit list too. The rows use requested names only, so the first
+# problem named is the row check itself and never "not requested".
+EXPLICIT = ['compression', 'used', 'org.t:v', 'org.t:w']
+
+
+class TestExplicitEveryRowCheck:
+    @pytest.mark.parametrize('row, problem', [
+        (('p', 'compression'), 'expected 3 columns, got 2'),
+        (('p', 'compression', 'default', 'x'), 'expected 3 columns, got 4'),
+        (('p', 'compression', 'default', 'x', 'y'), 'expected 3 columns, got 5'),
+        (('p', 'org.t:v', 'x', 'local'), 'expected 3 columns, got 4'),
+        ('p\tcompression\tdefault\t', 'expected 3 columns, got 4'),
+        ('not a row at all', 'expected 3 columns, got 1'),
+        (('\u00fc',), 'expected 3 columns, got 1'),
+        ('\tcompression\tdefault', 'empty name'),
+        (('p/a\rb', 'compression', 'default'), 'a control character or an invalid byte in a name'),
+        (('p/a\x00b', 'compression', 'default'), 'a control character or an invalid byte in a name'),
+        (('p/\udcff', 'compression', 'default'), 'a control character or an invalid byte in a name'),
+        (('p/' + 'a' * 254, 'compression', 'default'), 'a name longer than 255 bytes'),
+        (('p', 'Bad Prop', 'default'), 'invalid property name'),
+        (('p', '', 'default'), 'invalid property name'),
+        (('p', 'org.t:v\r', 'default'), 'invalid property name'),
+        (('p', 'compression', 'bogus'), 'invalid source'),
+        (('p', 'compression', ''), 'invalid source'),
+        (('p', 'compression', 'Local'), 'invalid source'),
+        (('p', 'org.t:v', 'local '), 'invalid source'),
+        (('p', 'compression', 'inherited from'), 'invalid source'),
+        (('p', 'compression', 'inherited from p@s'), 'invalid source'),
+        (('p', 'org.t:v', 'inherited from p/\udcff'), 'invalid source'),
+        (('p', 'org.t:v', 'inheritedfrom p'), 'invalid source'),
+    ], ids=lambda x: _stable_id(x, 60))
+    def test_each_malformed_row_raises_and_names_its_problem(self, feed, row, problem):
+        message = refused(feed, row, problem=problem, properties=EXPLICIT)
+        assert 'could not be trusted' in message
+
+    def test_a_forged_row_for_another_object_is_out_of_scope(self, feed):
+        refused(feed, ('p/a', 'org.t:v', 'local'), ('p/victim', 'org.t:v', 'FORGED'), ds=Filesystem('p/a'),
+                properties=EXPLICIT, problem='name outside the requested objects')
+
+    def test_a_forged_name_outside_the_request(self, feed):
+        refused(feed, ('q/a', 'org.t:v', 'local'), ds=Filesystem('p/a'), properties=EXPLICIT,
+                problem='name outside the requested objects')
+
+    def test_a_string_prefix_sibling_is_outside_the_scope(self, feed):
+        refused(feed, ('p/ab', 'org.t:v', 'local'), ds=Filesystem('p/a'), recursive=True, properties=EXPLICIT,
+                problem='name outside the requested objects')
+
+    def test_a_child_without_recursion_is_refused(self, feed):
+        refused(feed, ('p/a/b', 'org.t:v', 'local'), ds=Filesystem('p/a'), properties=EXPLICIT, problem='name outside')
+
+    def test_descendants_with_recursion_are_in_scope(self, feed):
+        rows = [('p/a', 'org.t:v', 'local'), ('p/a/b', 'org.t:v', 'inherited from p/a'), ('p/a/b/c', 'org.t:v', '-')]
+        got = run(feed, *rows, ds=Filesystem('p/a'), recursive=True, properties=EXPLICIT)
+        assert got == [PropertySource(*r) for r in rows[:2]]
+
+    def test_depth_limits_the_scope(self, feed):
+        assert len(run(feed, ('p/a', 'compression', 'local'), ('p/a/b', 'compression', 'local'), ds=Filesystem('p/a'),
+                       depth=1, properties=EXPLICIT)) == 2
+        refused(feed, ('p/a/b/c', 'compression', 'local'), ds=Filesystem('p/a'), depth=1, properties=EXPLICIT,
+                problem='name outside')
+
+    def test_a_snapshot_row_when_only_filesystems_were_requested(self, feed):
+        refused(feed, ('p@s', 'compression', 'local'), types='filesystem', properties=EXPLICIT,
+                problem='a snapshot was not requested')
+
+    def test_a_plain_row_when_only_snapshots_were_requested(self, feed):
+        refused(feed, ('p', 'compression', 'local'), types='snapshot', properties=EXPLICIT,
+                problem='a dataset was not requested')
+
+    def test_a_bookmark_row_when_only_snapshots_were_requested(self, feed):
+        refused(feed, ('p#b', 'compression', 'local'), types='snapshot', properties=EXPLICIT,
+                problem='a bookmark was not requested')
+
+    def test_the_same_property_twice_for_one_object_is_refused(self, feed):
+        refused(feed, ('p', 'org.t:v', 'local'), ('p', 'org.t:v', 'local'), properties=EXPLICIT,
+                problem="property 'org.t:v' appears twice")
+
+    def test_the_same_property_twice_with_another_in_between_is_refused(self, feed):
+        refused(feed, ('p', 'org.t:v', 'local'), ('p', 'used', '-'), ('p', 'org.t:v', 'local'), properties=EXPLICIT,
+                problem="property 'org.t:v' appears twice")
+
+    def test_a_returning_object_is_refused(self, feed):
+        refused(feed, ('p/a', 'used', '-'), ('p/b', 'used', '-'), ('p/a', 'compression', 'local'),
+                ds=Filesystem('p'), recursive=True, properties=EXPLICIT, problem="the rows of 'p/a' are not contiguous")
+
+    def test_two_objects_may_have_the_same_property(self, feed):
+        rows = [('p/a', 'org.t:v', 'local'), ('p/b', 'org.t:v', 'default'), ('p/c', 'org.t:v', 'received')]
+        assert run(feed, *rows, ds=Filesystem('p'), recursive=True, properties=EXPLICIT) == \
+            [PropertySource(*r) for r in rows]
+
+    def test_a_snapshot_and_its_dataset_are_different_objects(self, feed):
+        rows = [('p/a', 'compression', 'local'), ('p/a@s', 'compression', 'inherited from p/a'),
+                ('p/a#b', 'used', '-')]
+        assert len(run(feed, *rows, ds=Filesystem('p/a'), types='all', properties=EXPLICIT)) == 3
+
+    def test_a_good_row_next_to_a_bad_one_does_not_save_the_result(self, feed):
+        refused(feed, ('p', 'compression', 'default'), ('p', 'used', 'nonsense'), ('p', 'org.t:v', 'local'),
+                properties=EXPLICIT, problem='invalid source')
+
+    def test_the_quoted_row_is_clipped_and_credentials_are_hidden(self, feed):
+        message = refused(feed, ('p', 'org.t:v', 'https://user:secret@host/' + 'x' * 5000), properties=EXPLICIT)
+        assert 'secret' not in message and len(message) < 1500
+
+    def test_a_failure_takes_precedence_over_malformed_rows(self, feed):
+        feed.set(text(('p', 'used')), b'cannot open: dataset does not exist\n', 1)
+        with pytest.raises(Exception) as excinfo:
+            zfs.get.property_sources(properties=EXPLICIT)
+        assert not isinstance(excinfo.value, (ZFSOutputError, ValueError))
+        assert 'does not exist' in str(excinfo.value)
+
+
+class TestExplicitUnsetRowsStillCount:
+    """An unset user row is dropped from the result but is a row like any other for the checks."""
+
+    def test_a_duplicate_of_an_unset_row_is_refused(self, feed):
+        refused(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:v', '-'), properties=EXPLICIT,
+                problem="property 'org.t:v' appears twice")
+
+    def test_a_set_row_after_an_unset_one_of_the_same_property_is_refused(self, feed):
+        refused(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:v', 'local'), properties=EXPLICIT,
+                problem="property 'org.t:v' appears twice")
+
+    def test_an_unset_row_after_a_set_one_of_the_same_property_is_refused(self, feed):
+        refused(feed, ('p', 'org.t:v', 'local'), ('p', 'org.t:w', 'local'), ('p', 'org.t:v', '-'), properties=EXPLICIT,
+                problem="property 'org.t:v' appears twice")
+
+    def test_a_returning_object_whose_first_rows_were_unset_is_refused(self, feed):
+        refused(feed, ('p/a', 'org.t:v', '-'), ('p/b', 'org.t:v', 'local'), ('p/a', 'org.t:w', 'local'),
+                ds=Filesystem('p'), recursive=True, properties=EXPLICIT, problem="the rows of 'p/a' are not contiguous")
+
+    def test_a_returning_object_whose_returning_row_is_unset_is_refused(self, feed):
+        refused(feed, ('p/a', 'org.t:v', 'local'), ('p/b', 'org.t:v', 'local'), ('p/a', 'org.t:w', '-'),
+                ds=Filesystem('p'), recursive=True, properties=EXPLICIT, problem="the rows of 'p/a' are not contiguous")
+
+    def test_an_object_that_has_only_unset_rows_is_still_one_group(self, feed):
+        refused(feed, ('p/a', 'org.t:v', '-'), ('p/b', 'org.t:v', 'local'), ('p/a', 'org.t:w', '-'),
+                ds=Filesystem('p'), recursive=True, properties=EXPLICIT, problem="the rows of 'p/a' are not contiguous")
+
+    def test_an_unset_row_with_a_bad_scope_is_refused(self, feed):
+        refused(feed, ('q', 'org.t:v', '-'), ds=Filesystem('p'), properties=EXPLICIT, problem='name outside')
+
+    def test_an_unset_row_with_a_bad_shape_is_refused(self, feed):
+        refused(feed, ('p', 'org.t:v', '-', 'extra'), properties=EXPLICIT, problem='expected 3 columns, got 4')
+
+    def test_an_unset_row_for_the_wrong_type_is_refused(self, feed):
+        refused(feed, ('p@s', 'org.t:v', '-'), types='filesystem', properties=EXPLICIT,
+                problem='a snapshot was not requested')
+
+    def test_unset_rows_do_not_mask_a_refused_row_beside_them(self, feed):
+        refused(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:w', 'bogus'), properties=EXPLICIT, problem='invalid source')
+
+    def test_two_unset_user_rows_of_different_properties_are_fine(self, feed):
+        assert run(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:w', '-'), properties=EXPLICIT) == []
+
+    def test_a_native_dash_row_counts_for_duplicates_too(self, feed):
+        refused(feed, ('p', 'used', '-'), ('p', 'used', '-'), properties=EXPLICIT,
+                problem="property 'used' appears twice")
+
+
+class TestExplicitPrefix:
+    ROWS = [
+        ('p', 'org.zfsbackup:config', 'local'),
+        ('p', 'org.zfsbackup:anchor.d', '-'),
+        ('p', 'org.t:v', 'local'),
+        ('p', 'used', '-'),
+        ('p/c', 'org.zfsbackup:config', 'inherited from p'),
+        ('p/c', 'org.zfsbackup:anchor.d', 'local'),
+        ('p/c', 'org.t:v', '-'),
+        ('p/c', 'used', '-'),
+    ]
+    NAMES = ['org.zfsbackup:config', 'org.zfsbackup:anchor.d', 'org.t:v', 'used']
+
+    def test_prefix_applies_on_top_of_the_explicit_list_and_the_unset_drop(self, feed):
+        got = run(feed, *self.ROWS, properties=self.NAMES, prefix='org.zfsbackup:', ds=Filesystem('p'), recursive=True)
+        assert got == [PropertySource('p', 'org.zfsbackup:config', 'local'),
+                       PropertySource('p/c', 'org.zfsbackup:config', 'inherited from p'),
+                       PropertySource('p/c', 'org.zfsbackup:anchor.d', 'local')]
+
+    def test_a_native_dash_row_survives_a_matching_prefix_only(self, feed):
+        got = run(feed, *self.ROWS, properties=self.NAMES, prefix=['org.t:', 'used'], ds=Filesystem('p'), recursive=True)
+        assert [(r.name, r.property) for r in got] == [('p', 'org.t:v'), ('p', 'used'), ('p/c', 'used')]
+
+    def test_a_prefix_nothing_matches_gives_an_empty_list(self, feed):
+        assert run(feed, *self.ROWS, properties=self.NAMES, prefix='com.example:', ds=Filesystem('p'),
+                   recursive=True) == []
+
+    def test_the_prefix_never_hides_a_malformed_row(self, feed):
+        refused(feed, ('p', 'org.t:v', 'local'), ('p', 'used'), properties=self.NAMES, prefix='org.zfsbackup:',
+                problem='expected 3 columns, got 2')
+
+    def test_the_prefix_never_hides_an_unrequested_row(self, feed):
+        refused(feed, ('p', 'org.t:v', 'local'), ('p', 'org.t:other', 'local'), properties=['org.t:v'],
+                prefix='org.zfsbackup:', problem='a property that was not requested')
+
+    def test_the_prefix_never_hides_a_duplicate_of_an_unset_row(self, feed):
+        refused(feed, ('p', 'org.t:v', '-'), ('p', 'org.t:v', 'local'), properties=self.NAMES, prefix='org.zfsbackup:',
+                problem="property 'org.t:v' appears twice")
+
+    def test_an_invalid_prefix_is_still_refused_before_exec(self, feed):
+        with pytest.raises(ValueError):
+            zfs.get.property_sources(properties=['org.t:v'], prefix='a b')
+        assert feed.calls == []
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the captured unset user-property rows, through the explicit-list path
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _captured_explicit_reads():
+    """`(version, case id, record)` of every capture in M5_Z1 that read named properties with a `source` column."""
+    out = []
+    for version in VERSIONS:
+        for rid, rec in load_section(version, 'M5_Z1').items():
+            parts = rec.cmd.split()
+            if parts[:3] != ['zfs', 'get', '-H'] or rec.rc != 0:
+                continue
+            columns = parts[parts.index('-o') + 1].split(',')
+            if columns[:2] != ['name', 'property'] or columns[-1] != 'source':
+                continue            # the shape does not allow it: no `source` column to project to
+            out.append(pytest.param(version, rec, id='%s-%s' % (version, rid.split('/', 1)[1])))
+    return out
+
+
+class TestCapturedUnsetUserRows:
+    """What OpenZFS 2.1.5, 2.2.2, 2.3.9 and 2.4.1 print for a requested user property that is not set.
+
+    Adaptation: the captures asked for `-o name,property,value[,received],source`; `property_sources` asks for
+    `name,property,source`. Each captured row is projected to its first two columns and its LAST one (the source), which
+    is what zfs prints for those columns whatever the others are, and the list of requested names and the datasets are
+    read from the captured command line. A capture with no `source` column (`M5_Z1/.._ ... -o name,property,value`)
+    is left out. Cases with a failing exit status are not replayed.
+    """
+
+    @staticmethod
+    def project(rec):
+        parts = rec.cmd.split()
+        # `zfs get -H -o <cols> <props> <ds> [<ds> ...]`: the props are the argument right after the -o columns, the
+        # rest are datasets
+        i = parts.index('-o')
+        props = parts[i + 2].split(',')
+        datasets = parts[i + 3:]
+        rows = []
+        for line in rec.stdout.split('\n'):
+            if line:
+                cols = line.split('\t')
+                rows.append((cols[0], cols[1], cols[-1]))
+        return props, datasets, rows
+
+    @staticmethod
+    def _with_unset_rows(version):
+        for param in _captured_explicit_reads():
+            if param.values[0] == version and any(
+                    c[2] == '-' and ':' in c[1] for c in TestCapturedUnsetUserRows.project(param.values[1])[2]):
+                return param.values[1]
+        raise AssertionError('no capture with an unset user row in ' + version)
+
+    def _call(self, feed, rec):
+        props, datasets, rows = self.project(rec)
+        feed.set(text(*rows))
+        got = zfs.get.property_sources(ds=[Dataset(d) for d in datasets], properties=props, types='all')
+        return props, datasets, rows, got
+
+    @pytest.mark.parametrize('version, rec', _captured_explicit_reads())
+    def test_the_captured_rows_are_accepted_and_only_unset_user_rows_are_dropped(self, feed, version, rec):
+        props, datasets, rows, got = self._call(feed, rec)
+        expected = [PropertySource(*r) for r in rows if not (r[2] == '-' and ':' in r[1])]
+        assert got == expected
+        assert feed.argv == ['get', '-H', '-o', 'name,property,source', '-t', 'all', ','.join(props)] + datasets
+
+    @pytest.mark.parametrize('version, rec', _captured_explicit_reads())
+    def test_every_native_dash_row_in_the_capture_is_kept(self, feed, version, rec):
+        _, _, rows, got = self._call(feed, rec)
+        native_dash = [PropertySource(*r) for r in rows if r[2] == '-' and ':' not in r[1]]
+        assert all(r in got for r in native_dash)
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_the_captures_really_hold_unset_user_rows(self, version):
+        """Without these the replay above would prove nothing: the dropped rows exist in every version."""
+        dropped = 0
+        for rid, rec in load_section(version, 'M5_Z1').items():
+            if not rec.cmd.startswith('zfs get -H -o name,property,value,received,source'):
+                continue
+            for line in rec.stdout.split('\n'):
+                cols = line.split('\t')
+                if len(cols) == 5 and ':' in cols[1] and cols[2:] == ['-', '-', '-']:
+                    dropped += 1
+        assert dropped >= 10, dropped
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_the_same_capture_with_an_extra_unrequested_row_is_refused(self, feed, version):
+        rec = self._with_unset_rows(version)
+        props, datasets, rows = self.project(rec)
+        feed.set(text(*rows, (rows[0][0], 'org.t:forged', 'local')))
+        with pytest.raises(ZFSOutputError, match='1 row refused'):
+            zfs.get.property_sources(ds=[Dataset(d) for d in datasets], properties=props)
+
+    @pytest.mark.parametrize('version', VERSIONS)
+    def test_a_captured_unset_row_repeated_is_refused(self, feed, version):
+        rec = self._with_unset_rows(version)
+        props, datasets, rows = self.project(rec)
+        unset = next(r for r in rows if r[2] == '-' and ':' in r[1])
+        feed.set(text(*rows, unset))
+        with pytest.raises(ZFSOutputError):
+            zfs.get.property_sources(ds=[Dataset(d) for d in datasets], properties=props)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # exports
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -826,5 +1367,5 @@ class TestExports:
     def test_the_signature(self):
         import inspect
         params = inspect.signature(GetCommand.property_sources).parameters
-        assert list(params) == ['ds', 'types', 'sources', 'recursive', 'depth', 'prefix']
-        assert [p.default for p in params.values()] == [None, 'all', 'all', False, 0, None]
+        assert list(params) == ['ds', 'types', 'sources', 'recursive', 'depth', 'prefix', 'properties']
+        assert [p.default for p in params.values()] == [None, 'all', 'all', False, 0, None, None]

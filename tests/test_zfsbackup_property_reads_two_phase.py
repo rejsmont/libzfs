@@ -442,7 +442,7 @@ class TestThroughThePruner:
         assert group, 'the control: there is something to destroy, so [] is the read\'s doing'
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             assert manager._still_prunable(dsi, group) == []
-        (error,) = records(caplog, logging.ERROR, 'Cannot re-read the anchors')
+        (error,) = records(caplog, logging.ERROR, 'Cannot re-read what protects')
         assert 'changed while they were being read' in error
         assert prune_pool.calls == []
 

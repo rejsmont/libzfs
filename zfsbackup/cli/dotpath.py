@@ -108,17 +108,18 @@ __all__ = [
     "destination_change_warnings",
     "destination_name_problem",
     "format_path",
-    "prefix_change_warnings",
     "get_lines",
-    "pin_change_warnings",
-    "url_change_warnings",
-    "raw_change_warnings",
     "kind_of",
     "parse_dict",
+    "pin_change_warnings",
+    "prefix_change_warnings",
+    "raw_change_warnings",
     "resolve",
     "set_value",
+    "stale_anchor_warnings",
     "to_dict",
     "unset_value",
+    "url_change_warnings",
 ]
 
 Segs = Tuple[str, ...]
@@ -910,11 +911,82 @@ def destination_change_warnings(
     return messages
 
 
+def _anchor_url(url: str) -> str:
+    """`url` as compared for "does this destination point elsewhere": a `zfs:`
+    target without surrounding blanks or a trailing `/` (`zfs:tank/bk/` and
+    `zfs:tank/bk` are the same dataset); any other URL verbatim."""
+    text = url.strip()
+    return text.rstrip("/") if text.startswith("zfs:") else url
+
+
+def stale_anchor_warnings(name: str, old: Destination, new: Destination, config: BackupConfig) -> List[str]:
+    """When destination `name`'s URL (for a local destination its `zfs:` target;
+    a trailing `/` on a `zfs:` target does not count) changed: its anchors are
+    keyed by the destination's NAME, so `org.zfsbackup:anchor.<name>` stays on
+    every dataset that sends to it (descendants of recursive datasets included)
+    and still describes the OLD copy. If the destination now points to a
+    DIFFERENT copy, a dataset whose anchor is fresh reads as "sent" and is
+    skipped as not due for up to one period, so the first send to the new copy
+    may wait. But the same server under a new name, address or port is the same
+    copy: its old anchor is the incremental base, and clearing it lets the
+    pruner remove that snapshot, after which negotiate finds no common snapshot
+    and sends stop until someone intervenes. So the advice is conditional and
+    says so first; for https to https with an unchanged `server_fingerprint` it
+    leads with "the server certificate is the same, so this is likely the same
+    server". Nothing is changed automatically: the commands use `zfs inherit
+    -S` (it clears the LOCAL value and leaves a received one alone; plain
+    `zfs inherit` would hide a received anchor, which the pruner still
+    protects). Empty when no dataset sends to `name` (no anchor can exist) or
+    the URL is unchanged."""
+    if _anchor_url(old.url) == _anchor_url(new.url):
+        return []
+    senders = [d for d in config.datasets if any(r.destination == name for r in d.remote)]
+    if not senders:
+        return []
+    prop = f"org.zfsbackup:anchor.{name}"
+    commands = "\n".join(
+        f"  zfs inherit {'-r ' if d.recursive else ''}-S {prop} {shlex.quote(d.name)}"
+        for d in senders
+    )
+    recursive = any(d.recursive for d in senders)
+    roots = ", ".join(shlex.quote(d.name) for d in senders if d.recursive)
+    same_certificate = bool(
+        old.server_fingerprint and old.server_fingerprint == new.server_fingerprint
+    )
+    lead = (
+        "the server certificate is the same, so this is likely the same server under a new "
+        "address: if so, do NOT clear anything. "
+        if same_certificate else ""
+    )
+    return [
+        lead
+        + f"destinations[{name}] now points to a different place, but the anchors for it "
+        f"({prop}, kept on the datasets that send to it"
+        + (", and on every descendant of a recursive one" if recursive else "")
+        + ") stay in place and still describe the OLD copy: a dataset whose anchor is recent "
+        "counts as already sent and is skipped as not due for up to one period, so the first "
+        "send(s) to a new copy may be delayed. Clear them ONLY if this destination now points "
+        "to a DIFFERENT copy (another server or pool); if it is the same server under a new "
+        "name or address, do NOT clear anything: the old anchor is the incremental base, and "
+        "once it is gone the pruner may remove that snapshot, the next send finds no common "
+        "snapshot, and sends stop until you intervene. To make the datasets due at once for "
+        "a different copy, clear the anchors (this tool changes no ZFS property itself)"
+        + (", with `-r` reaching the descendants of a recursive dataset" if recursive else "")
+        + f" (`-S` clears only local values; it does not touch received values):\n{commands}"
+        + (
+            f"\nBefore using `-r`, check that no backup copy below {roots} carries a local "
+            f"anchor.{name} you want to keep (the daemon reports the copies it skips)"
+            if recursive else ""
+        )
+    ]
+
+
 def url_change_warnings(
     old: BackupConfig, new: BackupConfig, client_id: Optional[str] = None,
     *, own_id_bound: Optional[Callable[[], bool]] = None,
 ) -> List[str]:
-    """`destination_change_warnings` for every destination present in both.
+    """`destination_change_warnings` for every destination present in both,
+    followed by `stale_anchor_warnings` when its URL (or `zfs:` target) changed.
     `own_id_bound()` (called at most once, only when a destination switches
     from a server to the shared target) says whether this host's client id is
     bound in the trust tables; without it the answer is "no"."""
@@ -936,6 +1008,7 @@ def url_change_warnings(
                 name, before, after, client_id, shared=shared, own_id_bound=bool(bound)
             )
         )
+        messages.extend(stale_anchor_warnings(name, before, after, new))
     return messages
 
 

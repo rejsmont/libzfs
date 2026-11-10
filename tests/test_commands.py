@@ -506,6 +506,31 @@ class TestInheritCommand:
 
     @pytest.mark.unit
     @pytest.mark.subprocess
+    @pytest.mark.parametrize('kwargs, expected', [
+        ({}, ['inherit', 'compression', 'testpool/filesystem']),
+        ({'recursive': True}, ['inherit', '-r', 'compression', 'testpool/filesystem']),
+        ({'received': True}, ['inherit', '-S', 'compression', 'testpool/filesystem']),
+        ({'recursive': True, 'received': True}, ['inherit', '-r', '-S', 'compression', 'testpool/filesystem']),
+    ], ids=['plain', 'recursive', 'received', 'recursive+received'])
+    def test_inherit_argv_puts_options_before_the_property(self, mock_subprocess, sample_filesystem, kwargs, expected):
+        """BSD/macOS/illumos getopt stops at the first operand: `inherit <prop> -S <ds>` fails there, so every
+        option must come before the property name."""
+        mock_subprocess.setup()
+        InheritCommand()(sample_filesystem, 'compression', **kwargs)
+        assert _argv(mock_subprocess) == expected
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    def test_inherit_argv_for_several_properties_repeats_the_options_each_time(self, mock_subprocess,
+                                                                               sample_filesystem):
+        mock_subprocess.setup_multi(('',), ('',))
+        InheritCommand()(sample_filesystem, ['compression', 'org.t:k'], recursive=True, received=True)
+        assert mock_subprocess.call_count == 2
+        assert _argv(mock_subprocess, 0) == ['inherit', '-r', '-S', 'compression', 'testpool/filesystem']
+        assert _argv(mock_subprocess, 1) == ['inherit', '-r', '-S', 'org.t:k', 'testpool/filesystem']
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
     def test_inherit_partial_failure_commits_processed_props_only(self, mock_subprocess, sample_pool):
         """InheritCommand._inherit() now commits ds.update({prop: None}) for
         each property right after its own `zfs inherit` call succeeds
@@ -3507,13 +3532,13 @@ class TestRecursiveSnapshotChildListing:
     @pytest.mark.subprocess
     def test_child_listing_uses_filesystem_and_volume_types(self, mock_subprocess, sample_filesystem):
         mock_subprocess.setup_multi(
-            (['testpool/filesystem\tfilesystem', 'testpool/filesystem/vol\tvolume'],),
             ('',),
+            (['testpool/filesystem\tfilesystem', 'testpool/filesystem/vol\tvolume'],),
         )
         result = SnapshotCommand()(sample_filesystem, 'snap1', recursive=True)
 
         assert mock_subprocess.call_count == 2
-        listing = _argv(mock_subprocess, 0)
+        listing = _argv(mock_subprocess, 1)
         assert listing[0] == 'list'
         assert listing[listing.index('-t') + 1] == 'filesystem,volume'
         assert '-r' in listing
@@ -3524,11 +3549,11 @@ class TestRecursiveSnapshotChildListing:
     @pytest.mark.subprocess
     def test_snapshot_argv_is_unchanged(self, mock_subprocess, sample_filesystem):
         mock_subprocess.setup_multi(
-            (['testpool/filesystem\tfilesystem'],),
             ('',),
+            (['testpool/filesystem\tfilesystem'],),
         )
         SnapshotCommand()(sample_filesystem, 'snap1', recursive=True)
-        assert _argv(mock_subprocess, 1) == ['snapshot', '-r', 'testpool/filesystem@snap1']
+        assert _argv(mock_subprocess, 0) == ['snapshot', '-r', 'testpool/filesystem@snap1']
 
     @pytest.mark.unit
     @pytest.mark.subprocess

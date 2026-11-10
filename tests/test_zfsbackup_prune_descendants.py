@@ -20,7 +20,7 @@ import pytest
 import libzfseasy as zfs
 from libzfseasy.types import Filesystem, Snapshot as ZFSSnapshot
 from libzfseasy.zfs import ZFSOutputError
-from _get_support import GetReader, ZfsWorld, explicit_lines, get_lines, list_lines as list_lines_, source_lines
+from _get_support import GetReader, ZfsWorld, copy_read_argv, explicit_lines, get_lines, list_lines as list_lines_, source_lines
 from _snapshot_support import listed_snapshot
 from _prune_support import (  # noqa: F401
     VERSIONS, PrunePool, hourly_name, prune_manager, prune_pool, records,
@@ -180,6 +180,21 @@ def prune(manager, dsi):
     manager.prune_snapshots(dsi)
 
 
+#: What `DatasetManager._copy_roots` runs (the argv after the binary): the value-free read of every backup copy
+#: marker, inherited ones included.
+COPY_READ = copy_read_argv(PARENT)
+
+
+def copy_reads(fz):
+    """The argv (after the binary) of every backup-copy read the fake saw."""
+    return [c[1:] for c in fz.source_calls if 'local,received,inherited' in c]
+
+
+def descendant_reads(fz):
+    """The argv of every recursive read of the descendants' own properties (phase 1: the anchors' discovery)."""
+    return [c[1:] for c in fz.source_calls if '-r' in c and 'local,received' in c]
+
+
 class TestUnconfiguredDescendants:
     def test_a_child_without_anchors_protects_nothing(self, fz):
         fz.props[CHILD] = []
@@ -188,8 +203,14 @@ class TestUnconfiguredDescendants:
         assert fz.destroyed == [B, C]
         call = fz.destroy.call_args
         assert call.kwargs == {'destroy': True, 'recursive': True}
-        # one `zfs get -r` for the pass and one immediately before the single destroy call
-        assert len(fz.recursive_gets) == 1 + len(fz.destroy.call_args_list)
+        # one `zfs get -r` of the descendants' anchors for the pass and one immediately before the single
+        # destroy call, and each time one more `zfs get -r` for the backup copies below the dataset
+        calls = len(fz.destroy.call_args_list)
+        assert calls == 1
+        assert len(descendant_reads(fz)) == 1 + calls
+        assert copy_reads(fz) == [COPY_READ] * (1 + calls)
+        assert len(fz.recursive_gets) == 2 * (1 + calls)
+        assert fz.list_recursive == [(PARENT, False)], 'no copy below it: no listing but the dataset\'s own'
 
     def test_a_local_child_anchor_keeps_that_snapshot_and_only_that(self, fz, caplog):
         fz.props[CHILD] = [(ANCHOR + 'x', C, 'local')]
@@ -356,7 +377,10 @@ class TestParentAnchorsUnchanged:
         prune(manager, dsi)
         # the recursive read does return the parent's rows; only the parent path may use them
         assert fz.destroyed == [B]
-        assert len(fz.recursive_gets) == 1 + len(fz.destroy.call_args_list)     # the pass + the re-read
+        calls = len(fz.destroy.call_args_list)
+        assert len(descendant_reads(fz)) == 1 + calls                           # the pass + the re-read
+        assert copy_reads(fz) == [COPY_READ] * (1 + calls)                      # and the same for the copies
+        assert len(fz.recursive_gets) == 2 * (1 + calls)
 
     def test_parent_and_child_anchors_combine(self, fz):
         fz.props[PARENT] = [(ANCHOR + 'offsite', B, 'local')]
@@ -771,6 +795,24 @@ class TestReceivedDatasetsArePrunedNonRecursively:
         assert fz.recursive_gets == []
         assert self.RECEIVED_CHILD not in fz.list_roots
         assert fz.list_recursive == [(self.RECEIVED, False)]
+
+    def test_pruning_one_never_reads_for_backup_copies(self, fz):
+        """A2b: the copy read (and its recursive listing) belongs to a RECURSIVE source dataset. A received
+        dataset is pruned non-recursively whatever its client configured, so a child that carries the server's
+        own markers (`client_id`, as every received child does) is not a copy to protect, and nothing is read."""
+        self.received_ds(fz, recursive=True)
+        fz.snaps[self.RECEIVED] = [A, B, C]
+        fz.snaps[self.RECEIVED_CHILD] = [A, B, C]
+        fz.props[self.RECEIVED_CHILD] = [(PROP_CLIENT_ID, 'c1', 'local')]
+        manager = self.manager()
+        (dsi,) = manager.received_datasets()
+        fz.get_cmds.clear()
+        del fz.source_calls[:]
+        manager.prune_snapshots(dsi)
+        assert fz.destroyed == [B, C]
+        assert copy_reads(fz) == [] and [c for c in fz.source_calls if '-r' in c] == []
+        assert all('inherited' not in ','.join(c) for c in fz.get_cmds)
+        assert manager._copy_protect_noted == set()
 
 
 class TestRecursiveConfiguredDescendant:

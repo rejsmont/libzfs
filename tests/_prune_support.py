@@ -18,6 +18,14 @@ follows what the captures under tests/fixtures/openzfs/*/M3_Z8.txt show on OpenZ
 * a successful call returns one `destroy` line per object destroyed (a recursive one also lists the
   descendants' copies), so a test that counted returned lines would be off.
 
+The backup-copy protection of a recursive dataset (`DatasetManager._copy_protection`) is answered from the same
+state: a dataset below the root that carries `org.zfsbackup:client_id`/`source_dataset` in `props` with source
+`local`, `received` or `inherited from <ds>` is a copy (the read is `zfs get ... -s local,received,inherited -r`,
+counted in `copy_reads`, recorded as the event `('copies', root)`), and a RECURSIVE snapshot listing
+(`zfs list -r -t snapshot <copy root>`, event `('list', root, True)`) returns the root's and every descendant's
+snapshots. `copy_read_error` / `list_errors` make those two raise, `on_copy_read(pool, n)` runs as the Nth copy
+read starts (inject a copy that appears between the decision and the destroy).
+
 Every destroy call is recorded in `calls`; `empty_calls` collects any call made with no snapshot (the
 `prune_pool` fixture fails the test at teardown if there was one). Nothing here touches ZFS.
 """
@@ -91,6 +99,13 @@ class PrunePool(GetReader):
         self.on_read: Optional[Callable[[str, str, bool], None]] = None
         #: the Nth (1-based) and later snapshot listings raise.
         self.list_fails_from: Optional[int] = None
+        #: the copy read (`-s local,received,inherited`): how many ran, an exception to raise from the next
+        #: ones, and `fn(pool, n)` run as the Nth (1-based) starts, before it is answered.
+        self.copy_reads = 0
+        self.copy_read_error: Optional[Exception] = None
+        self.on_copy_read: Optional[Callable[['PrunePool', int], None]] = None
+        #: snapshot listings of these roots raise (the exception to raise).
+        self.list_errors: Dict[str, Exception] = {}
         mocker.patch('zfsbackup.backup_manager.zfs.destroy', side_effect=self._destroy)
         mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=self._list)
         # `zfs.get.rows` is a classmethod: it reaches `_exec_lines` through the CLASS, so patch it there.
@@ -162,16 +177,21 @@ class PrunePool(GetReader):
             return [Filesystem(roots.name)]
         assert types == 'snapshot', f'unexpected zfs.list(types={types!r})'
         self.snapshot_lists.append((roots.name, recursive))
+        if recursive:
+            self.events.append(('list', roots.name, True))
         if self.list_fails_from is not None and len(self.snapshot_lists) >= self.list_fails_from:
             raise RuntimeError(f"cannot open '{roots.name}': pool I/O is currently suspended")
+        if roots.name in self.list_errors:
+            raise self.list_errors[roots.name]
         rows = []
-        for name in self.snaps.get(roots.name, []):
-            key = (roots.name, name)
-            rows.append(listed_snapshot(
-                name, roots.name,
-                userrefs=str(self.holds.get(key, 0)),
-                clones=','.join(self.clones[key]) if self.clones.get(key) else '-',
-            ))
+        for dataset in [roots.name] + (self._descendants(roots.name) if recursive else []):
+            for name in self.snaps.get(dataset, []):
+                key = (dataset, name)
+                rows.append(listed_snapshot(
+                    name, dataset,
+                    userrefs=str(self.holds.get(key, 0)),
+                    clones=','.join(self.clones[key]) if self.clones.get(key) else '-',
+                ))
         return rows
 
     def _note_get(self, root, recursive, cmd):
@@ -179,7 +199,23 @@ class PrunePool(GetReader):
         if self.on_read is not None:
             self.on_read('get', root, recursive)
 
+    @staticmethod
+    def _is_copy_read(cmd) -> bool:
+        return '-s' in cmd and 'inherited' in cmd[cmd.index('-s') + 1].split(',')
+
+    def _sources(self, cmd):
+        if self._is_copy_read(cmd):
+            self.copy_reads += 1
+            if self.on_copy_read is not None:
+                self.on_copy_read(self, self.copy_reads)
+            if self.copy_read_error is not None:
+                raise self.copy_read_error
+        return super()._sources(cmd)
+
     def _note_discover(self, root, recursive, cmd):
+        if self._is_copy_read(cmd):                 # not a property read of the pruner's: its own event, no hook
+            self.events.append(('copies', root))
+            return
         self.events.append(('discover', root, recursive))
         if self.on_read is not None:
             self.on_read('discover', root, recursive)

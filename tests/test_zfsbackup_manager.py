@@ -14,7 +14,7 @@ from zfsbackup.backup_manager import (
 from zfsbackup.config import (
     BackupConfig, DatasetConfig, RetentionRule, RemoteServerConfig, RemoteDatasetConfig, Duration,
 )
-from _get_support import ZfsWorld, explicit_lines, get_lines, reads as reads_, source_lines
+from _get_support import ZfsWorld, copy_read_argv, explicit_lines, get_lines, reads as reads_, source_lines
 from _snapshot_support import NO_TXG, list_row, listed_info, listed_snapshot
 from _prune_support import (  # noqa: F401
     VERSIONS, PrunePool, hourly_name, prune_manager, prune_pool, records,
@@ -408,7 +408,8 @@ class TestPropertyHelpers:
         dsi = manager.datasets[0]
         mock_inherit = mocker.patch('zfsbackup.backup_manager.zfs.inherit')
         manager.clear_anchor(dsi, 'offsite')
-        mock_inherit.assert_called_once()
+        # `received=True` (`-S`): a local anchor reverts to the received one instead of hiding it
+        mock_inherit.assert_called_once_with(dsi.dataset, 'org.zfsbackup:anchor.offsite', received=True)
 
     def test_get_anchors_empty_when_no_remote(self, mock_subprocess):
         # No remote destinations and no anchor property on the dataset: nothing
@@ -843,6 +844,16 @@ class TestPruneBatchFallbackAndStuck:
             assert ('descendant' in reason) is expected
 
 
+def _copy_read_argv(dataset):
+    """The argv (after the binary) of the recursive backup-copy read of `dataset`: value-free, every marker
+    source, filesystems and volumes."""
+    return copy_read_argv(dataset)
+
+
+def _copy_reads(pool):
+    return [c[1:] for c in pool.source_calls if 'local,received,inherited' in c]
+
+
 class TestPruneReReadsProtectionsBeforeEveryDestroy:
     """The pass's first read of the anchors and in-flight pins goes stale: the remote worker pins, sends,
     anchors and re-pins while the fallback retries a failed batch. `_still_prunable` re-reads them right
@@ -889,7 +900,7 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         assert sorted(singles) == sorted(set(olds) - protected)       # the others were still retried
         assert prune_pool.names_of(self.DS) == {fresh, olds[0]} | protected     # olds[0]: the sender holds it
         assert not (protected & {k[1] for k in manager._prune_stuck})  # protected is not "stuck"
-        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == len(protected)
+        assert len(records(caplog, logging.INFO, 'it became protected')) == len(protected)
 
     def test_without_the_re_read_the_race_destroys_the_protected_snapshot(self, prune_pool, mocker):
         """The control: the same race against a pass that keeps its first protect-set."""
@@ -935,13 +946,15 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
             # the last zfs call: phase 2 of the dataset's own read (the values), right after its discovery
             assert events[i - 1] == ('get', self.DS, False), events[max(0, i - 6):i + 1]
             assert events[i - 2] == ('discover', self.DS, False), events[max(0, i - 6):i + 1]
-            # before them: the per-destination reads, and (recursive) the descendants' read first of all. No
-            # descendant has a property of ours here, so that read is its discovery alone (one exec).
+            # before them: the per-destination reads, and (recursive) the backup copies' read, then the
+            # descendants' read, first of all. No descendant has a property of ours here, so that read is its
+            # discovery alone (one exec); no copy: no listing after the copy read.
             tail = events[:i - 2]
             for dest in reversed(sorted(dests)):         # configured destinations are read sorted
                 assert tail.pop() == ('value', self.DS, PROP_ANCHOR_PREFIX + dest)
             if recursive:
                 assert tail.pop() == ('discover', self.DS, True)
+                assert tail.pop() == ('copies', self.DS)
 
     @pytest.mark.parametrize('dests', [(), ('offsite', 'cold')])
     def test_the_own_read_is_still_the_last_when_a_descendant_has_properties(self, prune_pool, dests):
@@ -961,7 +974,7 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
             tail = events[:i - 2]
             for dest in reversed(sorted(dests)):
                 assert tail.pop() == ('value', self.DS, PROP_ANCHOR_PREFIX + dest)
-            assert tail[-2:] == [('discover', self.DS, True), ('get', self.DS, True)]
+            assert tail[-3:] == [('copies', self.DS), ('discover', self.DS, True), ('get', self.DS, True)]
 
     def test_the_default_order_of_get_anchors_is_unchanged_and_the_flag_reverses_the_own_read(self, prune_pool):
         manager, dsi = prune_manager(self.DS, destinations=('offsite', 'cold'))
@@ -1003,7 +1016,9 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         def get(cmd):
             if cmd[1] == 'get' and '-r' in cmd:
                 recursive_reads.append(cmd)
-                if len(recursive_reads) == 2:       # the re-read's descendant read (the pass made the first)
+                # the pass made two (the descendants' anchors, the backup copies); the re-read makes the copies'
+                # again, then the descendants': the fourth
+                if len(recursive_reads) == 4:
                     prune_pool.props[self.DS] = [(PROP_ANCHOR_PREFIX + 'offsite', new_anchor, 'local')]
             return real_exec(cmd)
 
@@ -1013,7 +1028,7 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         for ds in (self.DS, self.CH):
             assert new_anchor in prune_pool.names_of(ds), ds       # the new anchor survived
             assert old_base in prune_pool.names_of(ds), ds         # the old base was not a candidate
-        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == 1
+        assert len(records(caplog, logging.INFO, 'it became protected')) == 1
         # the next pass: the old base is free now and goes, the anchor stays; the one after is stable
         manager.prune_snapshots(dsi)
         assert prune_pool.names_of(self.DS) == {fresh, new_anchor}
@@ -1051,7 +1066,7 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
             manager.prune_snapshots(dsi)
         assert prune_pool.calls == [] and prune_pool.empty_calls == []
         assert prune_pool.names_of(self.DS) == set(olds) | {fresh}
-        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == 3
+        assert len(records(caplog, logging.INFO, 'it became protected')) == 3
         assert records(caplog, logging.INFO, 'Successfully pruned') == []
 
     def test_a_re_read_that_raises_destroys_nothing_logs_an_error_and_leaves_the_stuck_memory(
@@ -1069,7 +1084,7 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         assert prune_pool.calls == []
         assert manager._prune_stuck == stuck
         (error,) = records(caplog, logging.ERROR)
-        assert 'Cannot re-read the anchors of pool/data' in error and 'pool I/O suspended' in error
+        assert 'Cannot re-read what protects the snapshots of pool/data' in error and 'pool I/O suspended' in error
         assert olds[0] in error
 
     def test_a_re_read_that_raises_after_a_failed_batch_issues_no_single_destroy(self, prune_pool, mocker, caplog):
@@ -1077,11 +1092,13 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         prune_pool.send(self.DS, olds[0])
         mocker.patch.object(
             manager, 'get_anchors', side_effect=[set(), set()] + [RuntimeError('boom')] * 3)
-        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
             manager.prune_snapshots(dsi)
         assert prune_pool.sizes == [3]                   # the batch only; every single was refused
         assert manager._prune_stuck == {}
-        assert len(records(caplog, logging.ERROR, 'Cannot re-read the anchors')) == 3
+        # one ERROR for the pass; the other two refusals are repeats (DEBUG)
+        assert len(records(caplog, logging.ERROR, 'Cannot re-read what protects')) == 1
+        assert len(records(caplog, logging.DEBUG, 'Cannot re-read what protects')) == 2
         assert prune_pool.names_of(self.DS) == set(olds) | {fresh}
 
     @pytest.mark.parametrize('recursive', [False, True])
@@ -1095,7 +1112,11 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         still.assert_not_called()
         assert anchors.call_count == 1                    # the pass's own read
         # its own two execs, + the discovery `get -r` of a recursive pass (no descendant has a property: one exec)
-        assert len(prune_pool.source_calls) == (2 if recursive else 1)
+        # + the recursive copy read (`-s local,received,inherited`; no copy: no listing after it)
+        assert len(prune_pool.source_calls) == (3 if recursive else 1)
+        assert prune_pool.copy_reads == (1 if recursive else 0)
+        assert _copy_reads(prune_pool) == ([_copy_read_argv(self.DS)] if recursive else [])
+        assert prune_pool.snapshot_lists == [(self.DS, False)]
         assert len(prune_pool.get_calls) == 1
 
     @pytest.mark.parametrize('recursive', [False, True])
@@ -1109,7 +1130,13 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         assert len(prune_pool.get_calls) == 1 + len(prune_pool.calls)           # phase 2 of the own read
         if recursive:
             gets = [c for c in prune_pool.source_calls if '-r' in c]
-            assert len(gets) == 1 + len(prune_pool.calls)       # (and no phase 2: no descendant has a property)
+            # the descendants' anchors and the backup copies are read each time (and no phase 2: no
+            # descendant has a property of ours)
+            assert len(gets) == 2 * (1 + len(prune_pool.calls))
+            assert _copy_reads(prune_pool) == [_copy_read_argv(self.DS)] * (1 + len(prune_pool.calls))
+            assert prune_pool.copy_reads == 1 + len(prune_pool.calls)
+        else:
+            assert prune_pool.copy_reads == 0
 
     @pytest.mark.parametrize('kind', ['child anchor', 'child inflight pin'])
     def test_a_descendants_protection_appearing_after_the_batch_failed_stops_the_single(
@@ -1125,7 +1152,7 @@ class TestPruneReReadsProtectionsBeforeEveryDestroy:
         assert protected.isdisjoint(c.names[0] for c in prune_pool.calls[1:])
         assert prune_pool.names_of(self.DS) == {fresh, olds[0]} | protected
         assert prune_pool.names_of(self.CH) == {fresh, olds[0]} | protected     # nor the child's copy
-        assert len(records(caplog, logging.INFO, 'became an anchor or in-flight snapshot')) == len(protected)
+        assert len(records(caplog, logging.INFO, 'it became protected')) == len(protected)
 
 
 class TestDatasetReport:
@@ -1162,6 +1189,30 @@ class TestSyncConfigPropertyException:
         mocker.patch.object(manager, 'sync_config_property', side_effect=lambda dsi: calls.append(dsi.name))
         manager.sync_all_config_properties()
         assert calls == ['pool/a', 'pool/b']
+
+
+class TestClearAnchorAndInflightArgv:
+    """`clear_anchor` / `clear_inflight` through the real libzfseasy `inherit`: `zfs inherit -S <prop> <ds>` (every option before the property)."""
+
+    def test_clear_anchor_argv(self, mock_subprocess):
+        manager = DatasetManager(_make_config())
+        mock_subprocess.setup(stdout=[])
+        manager.clear_anchor(manager.datasets[0], 'offsite')
+        assert [c[1:] for c in _raw_cmds(mock_subprocess)] == [
+            ['inherit', '-S', 'org.zfsbackup:anchor.offsite', 'pool/data']]
+
+    def test_clear_inflight_argv_and_result(self, mock_subprocess):
+        manager = DatasetManager(_make_config())
+        mock_subprocess.setup(stdout=[])
+        assert manager.clear_inflight(manager.datasets[0], 'offsite') is True
+        assert [c[1:] for c in _raw_cmds(mock_subprocess)] == [
+            ['inherit', '-S', 'org.zfsbackup:inflight.offsite', 'pool/data']]
+
+    def test_a_dotted_destination_name_is_one_property(self, mock_subprocess):
+        manager = DatasetManager(_make_config())
+        mock_subprocess.setup(stdout=[])
+        manager.clear_anchor(manager.datasets[0], 'off.site')
+        assert _raw_cmds(mock_subprocess)[0][2:] == ['-S', 'org.zfsbackup:anchor.off.site', 'pool/data']
 
 
 class TestAnchorExceptions:
@@ -2289,6 +2340,7 @@ def _subcommands(mock_subprocess):
 
 
 A = PROP_ANCHOR_PREFIX
+IF = PROP_INFLIGHT_PREFIX
 
 
 class TestReadZfsbackupProperties:
@@ -2591,146 +2643,338 @@ class TestReadZfsbackupPropertiesRowReader:
         ]
 
 
+# Exact LOCAL reads: `zfs get -H -o value -s local <prop> <ds>`, the old property first, the new one only when the
+# old one is local. The fake `zfs` is `ZfsWorld`: it prints nothing for a property whose source is not in `-s`.
+SOURCES = {
+    'local': 'local',
+    'received': 'received',
+    'inherited': 'inherited from pool',
+}
+
+
+def _anchor_world(mock_subprocess, old=None, new=None, old_source='local', new_source='local'):
+    """A `ZfsWorld` with `pool/data` carrying `old` / `new` anchors (None: unset) from the given sources."""
+    props = []
+    if old is not None:
+        props.append((A + 'old', old, SOURCES.get(old_source, old_source)))
+    if new is not None:
+        props.append((A + 'new', new, SOURCES.get(new_source, new_source)))
+    return ZfsWorld(mock_subprocess).add('pool/data', props)
+
+
+def _local_read(prop):
+    return ['get', '-H', '-o', 'value', '-s', 'local', prop, 'pool/data']
+
+
 class TestCopyAnchorProperty:
     DS = staticmethod(lambda: Filesystem('pool/data'))
 
     def test_copy_anchor_property_copies_the_value_and_reports_copied(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [(A + 'old', 'autosnap_20240101120000', 'local')]),
-            ('',),
-        )
+        world = _anchor_world(mock_subprocess, 'autosnap_20240101120000')
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
-        get_cmd, set_cmd = _cmds(mock_subprocess)
-        assert get_cmd[1] == 'get'
-        assert set_cmd[1:] == ['set', f'{A}new=autosnap_20240101120000', 'pool/data']
+        assert world.argvs == [
+            _local_read(A + 'old'), _local_read(A + 'new'),
+            ['set', f'{A}new=autosnap_20240101120000', 'pool/data'],
+        ]
 
     def test_copy_anchor_property_never_deletes_the_old_property(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [(A + 'old', 'snap', 'local')]),
-            ('',),
-        )
+        world = _anchor_world(mock_subprocess, 'snap')
         copy_anchor_property(self.DS(), 'old', 'new')
-        assert _subcommands(mock_subprocess) == ['get', 'set']
-        for cmd in _cmds(mock_subprocess):
-            assert 'inherit' not in cmd and 'destroy' not in cmd
-            assert f'{A}old' not in cmd[2:], 'the old property is not touched'
+        assert [a[0] for a in world.argvs] == ['get', 'get', 'set']
+        for argv in world.argvs:
+            assert 'inherit' not in argv and 'destroy' not in argv
+        assert f'{A}old' not in world.argvs[2], 'the old property is not touched'
 
     def test_copy_anchor_property_sets_only_the_new_property(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [(A + 'old', 'snap', 'local'), (A + 'other', 'x', 'local')]),
-            ('',),
-        )
+        world = _anchor_world(mock_subprocess, 'snap')
+        world.datasets['pool/data'][1].append((A + 'other', 'x', 'local'))
         copy_anchor_property(self.DS(), 'old', 'new')
-        set_cmd = _cmds(mock_subprocess)[1]
-        assert [a for a in set_cmd if '=' in a] == [f'{A}new=snap']
+        (set_argv,) = world.verbs('set')
+        assert [a for a in set_argv if '=' in a] == [f'{A}new=snap']
+        assert not any(A + 'other' in a for a in world.argvs), 'unrelated anchors are never read'
+
+    def test_copy_anchor_property_reads_only_the_two_named_properties_not_the_whole_set(self, mock_subprocess):
+        """It no longer runs the two-phase `read_zfsbackup_properties`: no discovery, no explicit-list read."""
+        world = _anchor_world(mock_subprocess, 'snap')
+        copy_anchor_property(self.DS(), 'old', 'new')
+        assert world.discoveries == [] and world.value_reads == [] and world.verify_lists == []
+        assert world.values == [_local_read(A + 'old'), _local_read(A + 'new')]
 
     def test_copy_anchor_property_no_source(self, mock_subprocess):
-        mock_subprocess.setup_multi(*_reads('pool/data', [(PROP_CONFIG, 'c', 'local')]))
+        world = _anchor_world(mock_subprocess)
+        world.datasets['pool/data'][1].append((PROP_CONFIG, 'c', 'local'))
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
-        assert _subcommands(mock_subprocess) == ['get']
+        assert world.argvs == [_local_read(A + 'old')], 'nothing to copy: the target is not even read'
 
     def test_copy_anchor_property_no_source_even_if_the_destination_exists(self, mock_subprocess):
         """Nothing to copy takes precedence over "target already there"."""
-        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'new', 'x', 'local')]))
+        world = _anchor_world(mock_subprocess, None, 'x')
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
-        assert _subcommands(mock_subprocess) == ['get']
+        assert world.argvs == [_local_read(A + 'old')]
 
     def test_copy_anchor_property_exists_is_left_alone(self, mock_subprocess):
-        mock_subprocess.setup_multi(*_reads('pool/data', [
-            (A + 'old', 'from-old', 'local'),
-            (A + 'new', 'already-there', 'local'),
-        ]))
+        world = _anchor_world(mock_subprocess, 'from-old', 'already-there')
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'exists'
-        assert _subcommands(mock_subprocess) == ['get'], 'must not overwrite'
+        assert world.verbs('set') == [], 'must not overwrite'
+        assert world.argvs == [_local_read(A + 'old'), _local_read(A + 'new')]
 
     def test_copy_anchor_property_an_inherited_old_value_is_not_a_source(self, mock_subprocess):
-        mock_subprocess.setup_multi(*_reads('pool/data', [
-            (A + 'old', 'ancestors', 'inherited from pool'),
-        ]))
+        world = _anchor_world(mock_subprocess, 'ancestors', None, old_source='inherited')
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
+        assert world.verbs('set') == []
 
-    def test_copy_anchor_property_an_inherited_new_value_does_not_block_the_copy(
-        self, mock_subprocess
-    ):
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [
-                (A + 'old', 'mine', 'local'),
-                (A + 'new', 'ancestors', 'inherited from pool'),
-            ]),
-            ('',),
-        )
+    def test_copy_anchor_property_an_inherited_new_value_does_not_block_the_copy(self, mock_subprocess):
+        world = _anchor_world(mock_subprocess, 'mine', 'ancestors', new_source='inherited')
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+        assert world.verbs('set') == [['set', f'{A}new=mine', 'pool/data']]
 
-    def test_copy_anchor_property_a_received_old_value_is_a_source(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [(A + 'old', 'snap', 'received')]),
-            ('',),
-        )
+    def test_copy_anchor_property_a_received_old_value_is_not_a_source(self, mock_subprocess):
+        """A received anchor is not this host's evidence (A1): a rename must never turn it into a LOCAL value
+        under the new name, so it reads as "no source" and nothing is set."""
+        world = _anchor_world(mock_subprocess, 'snap', None, old_source='received')
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'no-source'
+        assert world.argvs == [_local_read(A + 'old')]
+
+    def test_copy_anchor_property_a_received_new_value_does_not_block_the_copy(self, mock_subprocess):
+        world = _anchor_world(mock_subprocess, 'mine', 'theirs', new_source='received')
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+        assert world.verbs('set') == [['set', f'{A}new=mine', 'pool/data']]
 
     def test_copy_anchor_property_dry_run_issues_no_zfs_set(self, mock_subprocess, caplog):
-        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'old', 'snap', 'local')]))
+        world = _anchor_world(mock_subprocess, 'snap')
         with caplog.at_level(logging.INFO):
             result = copy_anchor_property(self.DS(), 'old', 'new', dry_run=True)
         assert result == 'dry-run'
-        assert _subcommands(mock_subprocess) == ['get']
+        assert [a[0] for a in world.argvs] == ['get', 'get']
         assert 'DRY RUN' in caplog.text and f'{A}new=snap' in caplog.text
 
-    def test_copy_anchor_property_dry_run_does_not_change_the_other_outcomes(
-        self, mock_subprocess
-    ):
-        mock_subprocess.setup_multi(*_reads('pool/data', []))
+    def test_copy_anchor_property_dry_run_does_not_change_the_other_outcomes(self, mock_subprocess):
+        world = _anchor_world(mock_subprocess)
         assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'no-source'
-        mock_subprocess.setup_multi(*_reads('pool/data', [
-            (A + 'old', 'a', 'local'), (A + 'new', 'b', 'local'),
-        ]))
+        world.set_props('pool/data', [(A + 'old', 'a', 'local'), (A + 'new', 'b', 'local')])
         assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'exists'
-        assert 'set' not in _subcommands(mock_subprocess)
+        assert world.verbs('set') == []
 
     def test_copy_anchor_property_dry_run_is_keyword_only(self):
         with pytest.raises(TypeError):
             copy_anchor_property(self.DS(), 'old', 'new', True)
 
     def test_copy_anchor_property_dotted_destination_names(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [(A + 'off.site-1', 'snap', 'local')]),
-            ('',),
-        )
+        world = ZfsWorld(mock_subprocess).add('pool/data', [(A + 'off.site-1', 'snap', 'local')])
         assert copy_anchor_property(self.DS(), 'off.site-1', 'off.site-2') == 'copied'
-        assert _cmds(mock_subprocess)[1][2] == f'{A}off.site-2=snap'
+        assert world.argvs == [
+            _local_read(A + 'off.site-1'), _local_read(A + 'off.site-2'),
+            ['set', f'{A}off.site-2=snap', 'pool/data'],
+        ]
 
     def test_copy_anchor_property_same_name_is_exists(self, mock_subprocess):
-        mock_subprocess.setup_multi(*_reads('pool/data', [(A + 'same', 'snap', 'local')]))
+        world = ZfsWorld(mock_subprocess).add('pool/data', [(A + 'same', 'snap', 'local')])
         assert copy_anchor_property(self.DS(), 'same', 'same') == 'exists'
-        assert _subcommands(mock_subprocess) == ['get']
+        assert world.verbs('set') == []
 
     def test_copy_anchor_property_a_set_failure_propagates(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [(A + 'old', 'snap', 'local')]),
-            ([], 'cannot set property: permission denied', 1),
-        )
+        world = _anchor_world(mock_subprocess, 'snap')
+        world.fail(lambda argv: argv[0] == 'set', 'cannot set property: permission denied')
         with pytest.raises(Exception, match='permission denied'):
             copy_anchor_property(self.DS(), 'old', 'new')
 
-    def test_copy_anchor_property_a_get_failure_propagates_and_nothing_is_set(
-        self, mock_subprocess
-    ):
-        _fail_get(mock_subprocess, 'dataset does not exist')
-        with pytest.raises(Exception, match='does not exist'):
-            copy_anchor_property(self.DS(), 'old', 'new')
-        # the discovery (phase 1) failed: that is the only exec, and nothing was set
-        assert [c[1] for c in _raw_cmds(mock_subprocess)] == ['get']
-
     def test_copy_anchor_property_is_idempotent(self, mock_subprocess):
-        """Second run sees the destination and does nothing."""
-        mock_subprocess.setup_multi(
-            *_reads('pool/data', [(A + 'old', 'snap', 'local')]),
-            ('',),
-            *_reads('pool/data', [(A + 'old', 'snap', 'local'), (A + 'new', 'snap', 'local')]),
-        )
+        """Second run sees the destination and does nothing. (`ZfsWorld` does not apply the set: the world is
+        changed by hand, as the first run's set would.)"""
+        world = _anchor_world(mock_subprocess, 'snap')
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+        world.set_props('pool/data', [(A + 'old', 'snap', 'local'), (A + 'new', 'snap', 'local')])
         assert copy_anchor_property(self.DS(), 'old', 'new') == 'exists'
-        assert _subcommands(mock_subprocess) == ['get', 'set', 'get']
+        assert [a[0] for a in world.argvs] == ['get', 'get', 'set', 'get', 'get']
+
+
+class TestCopyAnchorPropertyReads:
+    """The read side of the local-only `copy_anchor_property`: the exact argv sequence, the whole
+    {local, received, inherited, unset} x {local, received, inherited, unset} x overwrite matrix, and what a
+    failed read does (it raises: never "no source", never a set)."""
+
+    DS = staticmethod(lambda: Filesystem('pool/data'))
+    STATES = ('local', 'received', 'inherited', 'unset')
+
+    @staticmethod
+    def expected(old, new, overwrite, same_value):
+        """The outcome and the number of reads for one cell of the matrix."""
+        if old != 'local':
+            return 'no-source', 1               # only a LOCAL old value is a source; the target is never read
+        if new == 'local':
+            if not overwrite:
+                return 'exists', 2
+            return ('same' if same_value else 'overwritten'), 2
+        return 'copied', 2                      # received / inherited / unset: not a blocker
+
+    @pytest.mark.parametrize('overwrite', [False, True], ids=['no-overwrite', 'overwrite'])
+    @pytest.mark.parametrize('new', STATES)
+    @pytest.mark.parametrize('old', STATES)
+    @pytest.mark.parametrize('same_value', [False, True], ids=['different', 'equal'])
+    def test_the_matrix(self, mock_subprocess, old, new, overwrite, same_value):
+        world = _anchor_world(
+            mock_subprocess,
+            None if old == 'unset' else 'v-old',
+            None if new == 'unset' else ('v-old' if same_value else 'v-new'),
+            old_source=old, new_source=new)
+        result = copy_anchor_property(self.DS(), 'old', 'new', overwrite=overwrite)
+        outcome, reads = self.expected(old, new, overwrite, same_value)
+        assert result == outcome
+        wanted = [_local_read(A + 'old'), _local_read(A + 'new')][:reads]
+        if outcome in ('copied', 'overwritten'):
+            wanted.append(['set', f'{A}new=v-old', 'pool/data'])
+        assert world.argvs == wanted
+
+    @pytest.mark.parametrize('overwrite', [False, True], ids=['no-overwrite', 'overwrite'])
+    @pytest.mark.parametrize('new', STATES)
+    @pytest.mark.parametrize('old', STATES)
+    def test_a_dry_run_reads_the_same_and_never_sets(self, mock_subprocess, old, new, overwrite):
+        world = _anchor_world(
+            mock_subprocess, None if old == 'unset' else 'v-old', None if new == 'unset' else 'v-new',
+            old_source=old, new_source=new)
+        result = copy_anchor_property(self.DS(), 'old', 'new', overwrite=overwrite, dry_run=True)
+        outcome, reads = self.expected(old, new, overwrite, False)
+        assert result == ('dry-run' if outcome in ('copied', 'overwritten') else outcome)
+        assert world.argvs == [_local_read(A + 'old'), _local_read(A + 'new')][:reads]
+
+    def test_the_old_read_failing_raises_and_is_not_no_source(self, mock_subprocess):
+        world = _anchor_world(mock_subprocess, 'snap')
+        world.fail(lambda argv: argv[0] == 'get', 'cannot open pool/data: pool I/O is currently suspended')
+        with pytest.raises(Exception, match='pool I/O is currently suspended'):
+            copy_anchor_property(self.DS(), 'old', 'new')
+        assert world.argvs == [_local_read(A + 'old')]
+
+    def test_the_new_read_failing_raises_and_nothing_is_set(self, mock_subprocess):
+        world = _anchor_world(mock_subprocess, 'snap')
+        world.fail(lambda argv: argv[:1] == ['get'] and A + 'new' in argv, 'cannot open pool/data: busy')
+        for overwrite in (False, True):
+            with pytest.raises(Exception, match='busy'):
+                copy_anchor_property(self.DS(), 'old', 'new', overwrite=overwrite)
+        assert world.verbs('set') == []
+        assert world.argvs == [_local_read(A + 'old'), _local_read(A + 'new')] * 2
+
+    def test_a_missing_dataset_raises(self, mock_subprocess):
+        world = ZfsWorld(mock_subprocess)
+        with pytest.raises(Exception, match='does not exist'):
+            copy_anchor_property(Filesystem('pool/gone'), 'old', 'new')
+        assert world.verbs('set') == []
+
+    @pytest.mark.parametrize('value', ['a\nb', 'a\tb', 'a\rb'], ids=['newline', 'tab', 'carriage-return'])
+    def test_a_local_value_zfs_output_cannot_frame_is_refused_before_any_set(self, mock_subprocess, value):
+        """`zfs.get.value` returns ALL of stdout as the value, so the multi-line value is read whole; the setter
+        then refuses to write an unframeable value (`Validate.value`) and nothing is set."""
+        world = _anchor_world(mock_subprocess, value)
+        with pytest.raises(ValueError):
+            copy_anchor_property(self.DS(), 'old', 'new')
+        assert world.verbs('set') == []
+
+    def test_no_property_read_ever_asks_for_a_received_or_inherited_value(self, mock_subprocess):
+        world = _anchor_world(mock_subprocess, 'snap', 'other', new_source='received')
+        copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
+        assert all(a[a.index('-s') + 1] == 'local' for a in world.values)
+        assert len(world.values) == 2
+
+
+class TestCopyAnchorPropertyOverwrite:
+    DS = staticmethod(lambda: Filesystem('pool/data'))
+
+    def props(self, mock_subprocess, old=None, new=None, new_source='local'):
+        return _anchor_world(mock_subprocess, old, new, new_source=new_source)
+
+    def test_overwrite_with_an_absent_target_is_copied(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'snap')
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
+        assert world.argvs[2] == ['set', f'{A}new=snap', 'pool/data']
+
+    def test_overwrite_replaces_a_different_value(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'newer', 'older')
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
+        assert [a[0] for a in world.argvs] == ['get', 'get', 'set']
+        assert world.argvs[2][1] == f'{A}new=newer'
+
+    def test_overwrite_with_an_equal_value_is_same_and_sets_nothing(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'snap', 'snap')
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
+        assert world.verbs('set') == []
+
+    def test_without_overwrite_any_existing_value_is_exists(self, mock_subprocess):
+        for new in ('different', 'snap'):  # equal or not: left alone
+            for kwargs in ({}, {'overwrite': False}):
+                world = self.props(mock_subprocess, 'snap', new)
+                assert copy_anchor_property(self.DS(), 'old', 'new', **kwargs) == 'exists'
+                assert world.verbs('set') == []
+
+    def test_no_source_is_decided_first_whatever_overwrite_says(self, mock_subprocess):
+        world = self.props(mock_subprocess, None, 'something')
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'no-source'
+        assert world.argvs == [_local_read(A + 'old')]
+
+    def test_dry_run_with_an_absent_target_is_dry_run(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'snap')
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'dry-run'
+        assert world.verbs('set') == []
+
+    def test_dry_run_with_a_different_target_names_the_overwrite(self, mock_subprocess, caplog):
+        world = self.props(mock_subprocess, 'newer', 'older')
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            result = copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True)
+        assert result == 'dry-run'
+        assert world.verbs('set') == []
+        assert 'Would overwrite' in caplog.text and 'older' in caplog.text and 'newer' in caplog.text
+
+    def test_dry_run_with_an_equal_target_is_still_same(self, mock_subprocess):
+        self.props(mock_subprocess, 'snap', 'snap')
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'same'
+
+    def test_dry_run_without_overwrite_on_an_existing_target_is_exists(self, mock_subprocess):
+        self.props(mock_subprocess, 'a', 'b')
+        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'exists'
+
+    def test_overwrite_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            copy_anchor_property(self.DS(), 'old', 'new', False, True)
+        with pytest.raises(TypeError):
+            copy_anchor_property(self.DS(), 'old', 'new', True)
+
+    def test_overwrite_defaults_to_false(self):
+        import inspect
+
+        parameter = inspect.signature(copy_anchor_property).parameters['overwrite']
+        assert parameter.default is False and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_overwrite_never_touches_the_old_property(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'newer', 'older')
+        copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
+        for argv in world.argvs:
+            assert 'inherit' not in argv
+        assert f'{A}old' not in world.argvs[2]
+
+    def test_an_inherited_target_is_not_a_blocker_even_without_overwrite(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'snap', 'ancestors', 'inherited from pool')
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
+        assert len(world.verbs('set')) == 2
+
+    def test_a_received_target_does_not_count_as_existing(self, mock_subprocess):
+        """Only a LOCAL value is read now: a received one on the new name is not "there", so the local copy is
+        made ('copied', never 'overwritten' or 'exists'), with and without `overwrite`."""
+        world = self.props(mock_subprocess, 'newer', 'older', 'received')
+        assert copy_anchor_property(self.DS(), 'old', 'new') == 'copied'
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
+        assert world.verbs('set') == [['set', f'{A}new=newer', 'pool/data']] * 2
+
+    def test_overwrite_twice_is_overwritten_then_same(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'newer', 'older')
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
+        world.set_props('pool/data', [(A + 'old', 'newer', 'local'), (A + 'new', 'newer', 'local')])
+        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
+        assert [a[0] for a in world.argvs] == ['get', 'get', 'set', 'get', 'get']
+
+    def test_a_failing_overwrite_set_propagates(self, mock_subprocess):
+        world = self.props(mock_subprocess, 'newer', 'older')
+        world.fail(lambda argv: argv[0] == 'set', 'cannot set property: permission denied')
+        with pytest.raises(Exception, match='permission denied'):
+            copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
 
 
 class TestClearZfsbackupProperties:
@@ -2754,7 +2998,8 @@ class TestClearZfsbackupProperties:
         )
 
     def _inherited(self, mock_subprocess):
-        return [cmd[2] for cmd in _cmds(mock_subprocess) if cmd[1] == 'inherit']
+        # the property of every `inherit` (last operand but one: the options come first)
+        return [cmd[-2] for cmd in _cmds(mock_subprocess) if cmd[1] == 'inherit']
 
     def test_config_true_clears_the_config_property(self, mock_subprocess):
         self._arrange(mock_subprocess)
@@ -2768,6 +3013,96 @@ class TestClearZfsbackupProperties:
         inherit = _cmds(mock_subprocess)[1]
         assert inherit[1:] == ['inherit', PROP_CONFIG, 'pool/data']
         assert '-r' not in inherit
+
+    def test_an_anchor_is_inherited_with_dash_S(self, mock_subprocess):
+        """`zfs inherit -S <prop> <ds>`: reverts a LOCAL override to the received value (the pruner keeps
+        protecting it), a plain inherit would hide it. Every option comes before the property."""
+        self._arrange(mock_subprocess)
+        clear_zfsbackup_properties(self.DS(), config=False, anchors=['zeta'])
+        inherits = [c for c in _cmds(mock_subprocess) if c[1] == 'inherit']
+        assert [c[1:] for c in inherits] == [['inherit', '-S', A + 'zeta', 'pool/data']]
+
+    def test_an_inflight_pin_is_inherited_with_dash_S(self, mock_subprocess):
+        self._arrange(mock_subprocess, [(IF + 'off', 'a,b', 'local')])
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=True) == [IF + 'off']
+        inherits = [c for c in _cmds(mock_subprocess) if c[1] == 'inherit']
+        assert [c[1:] for c in inherits] == [['inherit', '-S', IF + 'off', 'pool/data']]
+
+    def test_only_the_config_is_a_plain_inherit_the_rest_is_dash_S(self, mock_subprocess):
+        """The config is never protection, so it keeps the plain form (and a received config is not reverted)."""
+        self._arrange(mock_subprocess, [
+            (PROP_CONFIG, 'cfg', 'local'), (A + 'a', 's', 'local'), (IF + 'a', 'x,y', 'local'),
+        ])
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
+        assert result == [PROP_CONFIG, A + 'a', IF + 'a']
+        assert [c[1:] for c in _cmds(mock_subprocess) if c[1] == 'inherit'] == [
+            ['inherit', PROP_CONFIG, 'pool/data'],
+            ['inherit', '-S', A + 'a', 'pool/data'],
+            ['inherit', '-S', IF + 'a', 'pool/data'],
+        ]
+
+    def test_a_received_only_anchor_is_neither_inherited_nor_returned(self, mock_subprocess):
+        """`-S` on a value that is only RECEIVED leaves it in place, and a plain inherit would hide it from the
+        pruner: so no command runs for it and it is not in the result (it is still set, not "cleared")."""
+        self._arrange(mock_subprocess, [(A + 'only', 'snap', 'received')])
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=True) == []
+        assert _subcommands(mock_subprocess) == ['get']
+
+    def test_a_received_only_inflight_pin_is_neither_inherited_nor_returned(self, mock_subprocess):
+        self._arrange(mock_subprocess, [(IF + 'only', 'a,b', 'received')])
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=True) == []
+        assert _subcommands(mock_subprocess) == ['get']
+
+    @pytest.mark.parametrize('config', [True, False])
+    def test_a_received_only_name_asked_for_by_name_is_left_alone(self, mock_subprocess, config):
+        self._arrange(mock_subprocess, [(A + 'only', 'snap', 'received'), (A + 'mine', 's', 'local')])
+        assert clear_zfsbackup_properties(self.DS(), config=config, anchors=['only', 'mine']) == [A + 'mine']
+        assert self._inherited(mock_subprocess) == [A + 'mine']
+
+    # The source matrix. One `zfs get` row per property: zfs prints the EFFECTIVE source, so a property that
+    # has both a local and a received value is the ONE row `local` (the received value stays under it, and
+    # `-S` reverts to it).
+    @pytest.mark.parametrize('prop, source, argv, returned', [
+        (A + 'x', 'local', ['inherit', '-S', A + 'x', 'pool/data'], True),
+        (A + 'x', 'received', None, False),
+        (IF + 'x', 'local', ['inherit', '-S', IF + 'x', 'pool/data'], True),
+        (IF + 'x', 'received', None, False),
+        (PROP_CONFIG, 'local', ['inherit', PROP_CONFIG, 'pool/data'], True),
+        (PROP_CONFIG, 'received', ['inherit', PROP_CONFIG, 'pool/data'], True),
+    ], ids=['anchor-local', 'anchor-received', 'inflight-local', 'inflight-received',
+            'config-local', 'config-received'])
+    def test_the_source_matrix(self, mock_subprocess, prop, source, argv, returned):
+        """anchor/inflight: cleared AND returned only when LOCAL (`-S`); the config keeps its plain inherit and is
+        returned whenever it is set, even when received (a received one is masked, which is fine: the config is
+        never protection)."""
+        self._arrange(mock_subprocess, [(prop, 'v', source)])
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
+        assert result == ([prop] if returned else [])
+        assert [c[1:] for c in _cmds(mock_subprocess) if c[1] == 'inherit'] == ([argv] if argv else [])
+
+    def test_a_local_anchor_that_also_has_a_received_value_is_cleared_with_dash_S(self, mock_subprocess):
+        """The one row says `local`: the local value is what is cleared, `-S` reverts to the received one under
+        it, which the pruner keeps protecting."""
+        self._arrange(mock_subprocess, [(A + 'both', 'local-snap', 'local')])
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=['both']) == [A + 'both']
+        assert [c[1:] for c in _cmds(mock_subprocess) if c[1] == 'inherit'] == [
+            ['inherit', '-S', A + 'both', 'pool/data']]
+
+    def test_a_mixed_dataset_returns_exactly_the_local_anchors_and_the_config(self, mock_subprocess):
+        self._arrange(mock_subprocess, [
+            (PROP_CONFIG, 'c', 'received'), (A + 'l', 's', 'local'), (A + 'r', 's', 'received'),
+            (IF + 'l', 'a,b', 'local'), (IF + 'r', 'a,b', 'received'),
+        ])
+        assert clear_zfsbackup_properties(self.DS(), config=True, anchors=True) == [
+            PROP_CONFIG, A + 'l', IF + 'l']
+        assert self._inherited(mock_subprocess) == [PROP_CONFIG, A + 'l', IF + 'l']
+
+    def test_the_dry_run_names_the_properties_and_inherits_nothing(self, mock_subprocess):
+        """A dry run reports what a real one would: the local pin, not the received one."""
+        self._arrange(mock_subprocess, [(A + 'x', 's', 'local'), (IF + 'x', 'a,b', 'received'),
+                                        (IF + 'y', 'a,b', 'local')])
+        assert clear_zfsbackup_properties(self.DS(), config=False, anchors=True, dry_run=True) == [A + 'x', IF + 'y']
+        assert [c for c in _cmds(mock_subprocess) if c[1] == 'inherit'] == []
 
     def test_config_false_leaves_the_config_property(self, mock_subprocess):
         self._arrange(mock_subprocess)
@@ -2783,7 +3118,7 @@ class TestClearZfsbackupProperties:
     def test_anchors_true_clears_every_anchor_sorted_and_only_anchors(self, mock_subprocess):
         self._arrange(mock_subprocess)
         result = clear_zfsbackup_properties(self.DS(), config=False, anchors=True)
-        assert result == [A + 'alpha', A + 'mid', A + 'zeta']
+        assert result == [A + 'alpha', A + 'zeta'], 'mid is received only: -S would leave it, so it is not touched'
         assert self._inherited(mock_subprocess) == result
         # not the config, not client_id, not another namespace's "anchor."
         assert PROP_CONFIG not in result
@@ -2852,13 +3187,13 @@ class TestClearZfsbackupProperties:
     def test_config_and_anchors_together_config_first(self, mock_subprocess):
         self._arrange(mock_subprocess)
         result = clear_zfsbackup_properties(self.DS(), config=True, anchors=True)
-        assert result == [PROP_CONFIG, A + 'alpha', A + 'mid', A + 'zeta']
+        assert result == [PROP_CONFIG, A + 'alpha', A + 'zeta']
         assert self._inherited(mock_subprocess) == result
 
     def test_config_and_listed_anchors(self, mock_subprocess):
         self._arrange(mock_subprocess)
-        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=['mid'])
-        assert result == [PROP_CONFIG, A + 'mid']
+        result = clear_zfsbackup_properties(self.DS(), config=True, anchors=['mid', 'zeta'])
+        assert result == [PROP_CONFIG, A + 'zeta'], 'mid is received only'
 
     def test_only_properties_actually_set_are_inherited(self, mock_subprocess):
         self._arrange(mock_subprocess, [(A + 'only', 'x', 'local')])
@@ -2883,9 +3218,9 @@ class TestClearZfsbackupProperties:
         with caplog.at_level(logging.INFO):
             result = clear_zfsbackup_properties(
                 self.DS(), config=True, anchors=True, dry_run=True)
-        assert result == [PROP_CONFIG, A + 'alpha', A + 'mid', A + 'zeta']
+        assert result == [PROP_CONFIG, A + 'alpha', A + 'zeta']
         assert _subcommands(mock_subprocess) == ['get']
-        assert caplog.text.count('DRY RUN') == 4
+        assert caplog.text.count('DRY RUN') == 3
 
     def test_dry_run_with_nothing_set_returns_empty(self, mock_subprocess):
         self._arrange(mock_subprocess, [])
@@ -3127,117 +3462,14 @@ class TestPruneHonoursEveryAnchor:
         assert calls == ['pool/a', 'pool/b']
 
 
-class TestCopyAnchorPropertyOverwrite:
-    DS = staticmethod(lambda: Filesystem('pool/data'))
-
-    def props(self, old=None, new=None, new_source='local'):
-        rows = []
-        if old is not None:
-            rows.append((A + 'old', old, 'local'))
-        if new is not None:
-            rows.append((A + 'new', new, new_source))
-        return _reads('pool/data', rows)
-
-    def test_overwrite_with_an_absent_target_is_copied(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('snap'), ('',))
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
-        assert _cmds(mock_subprocess)[1][1:] == ['set', f'{A}new=snap', 'pool/data']
-
-    def test_overwrite_replaces_a_different_value(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('newer', 'older'), ('',))
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
-        assert _subcommands(mock_subprocess) == ['get', 'set']
-        assert _cmds(mock_subprocess)[1][2] == f'{A}new=newer'
-
-    def test_overwrite_with_an_equal_value_is_same_and_sets_nothing(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('snap', 'snap'))
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
-        assert _subcommands(mock_subprocess) == ['get']
-
-    def test_without_overwrite_any_existing_value_is_exists(self, mock_subprocess):
-        for new in ('different', 'snap'):  # equal or not: left alone
-            for kwargs in ({}, {'overwrite': False}):
-                mock_subprocess.setup_multi(*self.props('snap', new))
-                assert copy_anchor_property(self.DS(), 'old', 'new', **kwargs) == 'exists'
-        assert 'set' not in _subcommands(mock_subprocess)
-
-    def test_no_source_is_decided_first_whatever_overwrite_says(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props(None, 'something'))
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'no-source'
-        assert _subcommands(mock_subprocess) == ['get']
-
-    def test_dry_run_with_an_absent_target_is_dry_run(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('snap'))
-        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'dry-run'
-        assert _subcommands(mock_subprocess) == ['get']
-
-    def test_dry_run_with_a_different_target_names_the_overwrite(self, mock_subprocess, caplog):
-        mock_subprocess.setup_multi(*self.props('newer', 'older'))
-        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
-            result = copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True)
-        assert result == 'dry-run'
-        assert _subcommands(mock_subprocess) == ['get']
-        assert 'Would overwrite' in caplog.text and 'older' in caplog.text and 'newer' in caplog.text
-
-    def test_dry_run_with_an_equal_target_is_still_same(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('snap', 'snap'))
-        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True, overwrite=True) == 'same'
-
-    def test_dry_run_without_overwrite_on_an_existing_target_is_exists(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('a', 'b'))
-        assert copy_anchor_property(self.DS(), 'old', 'new', dry_run=True) == 'exists'
-
-    def test_overwrite_is_keyword_only(self):
-        with pytest.raises(TypeError):
-            copy_anchor_property(self.DS(), 'old', 'new', False, True)
-        with pytest.raises(TypeError):
-            copy_anchor_property(self.DS(), 'old', 'new', True)
-
-    def test_overwrite_defaults_to_false(self):
-        import inspect
-
-        parameter = inspect.signature(copy_anchor_property).parameters['overwrite']
-        assert parameter.default is False and parameter.kind is inspect.Parameter.KEYWORD_ONLY
-
-    def test_overwrite_never_touches_the_old_property(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('newer', 'older'), ('',))
-        copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
-        for cmd in _cmds(mock_subprocess):
-            assert 'inherit' not in cmd and f'{A}old' not in cmd[2:]
-
-    def test_an_inherited_target_is_not_a_blocker_even_without_overwrite(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('snap', 'ancestors', 'inherited from pool'), ('',))
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'copied'
-
-    def test_a_received_target_counts_as_existing(self, mock_subprocess):
-        mock_subprocess.setup_multi(*self.props('newer', 'older', 'received'), ('',))
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
-
-    def test_overwrite_twice_is_overwritten_then_same(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *self.props('newer', 'older'),
-            ('',),
-            *self.props('newer', 'newer'),
-        )
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'overwritten'
-        assert copy_anchor_property(self.DS(), 'old', 'new', overwrite=True) == 'same'
-        assert _subcommands(mock_subprocess) == ['get', 'set', 'get']
-
-    def test_a_failing_overwrite_set_propagates(self, mock_subprocess):
-        mock_subprocess.setup_multi(
-            *self.props('newer', 'older'),
-            ([], 'cannot set property: permission denied', 1),
-        )
-        with pytest.raises(Exception, match='permission denied'):
-            copy_anchor_property(self.DS(), 'old', 'new', overwrite=True)
-
-
 # Mutation counts for the anchor decision (scratch copy, one revert at a time;
 # failing tests across the manager, rename and edit test files): raw anchor read
 # ignored 15; `-` value protected 3; orphan INFO on every call 4; read failure
 # prunes blind 3 / uncaught 4; configured destination's anchor dropped 4;
 # `copy_anchor_property`: equal value not 'same' 7 / overwrite ignored 14 /
 # overwrite positional 5 / 'overwritten' reported as 'copied' 7 / dry run sets 7.
+# Local-only `copy_anchor_property` (`zfs get -s local`, old then new): reads without `-s local` 108 / the target
+# read without `-s local` 34 / the target read before the old one 106 / a read error turned into 'no-source' 2.
 
 
 class TestSyncConfigPropertyDryRun:
@@ -3293,7 +3525,6 @@ class TestSyncConfigPropertyDryRun:
 
 from zfsbackup.backup_manager import PROP_INFLIGHT_PREFIX, _inflight_names  # noqa: E402
 
-IF = PROP_INFLIGHT_PREFIX
 
 
 class TestInflightNamesHelper:
@@ -3327,13 +3558,16 @@ class TestInflightProperty:
         def fake_set(ds, props):
             store.update(props)
 
-        def fake_inherit(ds, prop):
+        def fake_inherit(ds, prop, recursive=False, received=False):
+            inherits.append((prop, received))
             store.pop(prop, None)
 
+        inherits = []
         mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=fake_set)
         mocker.patch('zfsbackup.backup_manager.zfs.inherit', side_effect=fake_inherit)
         manager = DatasetManager(_make_config())
         mocker.patch.object(manager, '_get_own_prop', side_effect=lambda ds, prop: store.get(prop))
+        manager.inherits = inherits            # every `(property, received)` the fake saw
         return manager, manager.datasets[0], store
 
     def test_round_trip(self, mocker):
@@ -3378,6 +3612,8 @@ class TestInflightProperty:
         manager.set_inflight(dsi, 'offsite', 'f', 't')
         assert manager.clear_inflight(dsi, 'offsite') is True
         assert store == {} and manager.get_own_inflight(dsi, 'offsite') is None
+        # `-S`: a local pin reverts to a received one instead of hiding it from the pruner
+        assert manager.inherits == [(IF + 'offsite', True)]
 
     def test_a_failed_set_is_false_with_a_warning_and_never_raises(self, mocker, caplog):
         mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=Exception('read-only'))
@@ -3559,13 +3795,16 @@ class TestClearZfsbackupPropertiesWithInflight:
         mock_subprocess.setup_multi(*_reads('pool/data', self.PROPS), *[('',)] * 8)
 
     def _inherited(self, mock_subprocess):
-        return [cmd[2] for cmd in _cmds(mock_subprocess) if cmd[1] == 'inherit']
+        # the property of every `inherit` (last operand but one: the options come first)
+        return [cmd[-2] for cmd in _cmds(mock_subprocess) if cmd[1] == 'inherit']
 
     def test_anchors_true_clears_the_inflight_pins_with_the_anchors_sorted(self, mock_subprocess):
         self._arrange(mock_subprocess)
         result = clear_zfsbackup_properties(self.DS(), config=False, anchors=True)
-        assert result == sorted([A + 'alpha', A + 'zeta', IF + 'alpha', IF + 'mid'])
+        # (`inflight.mid` is received only: `-S` would leave it, so it is not touched and not returned)
+        assert result == sorted([A + 'alpha', A + 'zeta', IF + 'alpha'])
         assert self._inherited(mock_subprocess) == result
+        assert all(c[2] == '-S' for c in _cmds(mock_subprocess) if c[1] == 'inherit')
         assert 'org.other:inflight.alpha' not in result and PROP_CONFIG not in result
 
     def test_the_iterable_form_clears_only_the_named_anchors_not_the_inflight_pins(
@@ -3582,7 +3821,7 @@ class TestClearZfsbackupPropertiesWithInflight:
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             result = clear_zfsbackup_properties(
                 self.DS(), config=False, anchors=True, dry_run=True)
-        assert IF + 'alpha' in result and IF + 'mid' in result
+        assert IF + 'alpha' in result and IF + 'mid' not in result
         assert self._inherited(mock_subprocess) == []
         assert f'Would inherit {IF}alpha' in caplog.text
 

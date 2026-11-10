@@ -349,6 +349,22 @@ class FakeZfs:
         self._save(state)
         return self
 
+    def set_prop(
+        self, name: str, prop: str, value: str, source: str = "local", *, received: str = None
+    ) -> "FakeZfs":
+        """One property with a chosen source (`local`, `received` or `inherited from X`);
+        the dataset is created when it is not there yet. `received=R` on a LOCAL value gives
+        a property that also has a received value R underneath (what `inherit -S` reverts to)."""
+        state = self.state
+        if received is not None:
+            assert source == "local"
+            entry = {"value": value, "source": "local", "received": received}
+        else:
+            entry = value if source == "local" else {"value": value, "source": source}
+        state.setdefault(name, {})[prop] = entry
+        self._save(state)
+        return self
+
     def fail(self, command: str, name: str, prop: str = None) -> "FakeZfs":
         self._fail.append([command, name] + ([prop] if prop else []))
         self._monkeypatch.setenv("FAKEZFS_FAIL", json.dumps(self._fail))
@@ -363,6 +379,18 @@ class FakeZfs:
 
     def props(self, name: str):
         return self.state.get(name)
+
+    def value(self, name: str, prop: str):
+        """The effective value of one property (what `zfs get -o value` prints) or None."""
+        raw = (self.state.get(name) or {}).get(prop)
+        return raw["value"] if isinstance(raw, dict) else raw
+
+    def source(self, name: str, prop: str):
+        """`local`, `received`, `inherited from X`, or None when unset."""
+        raw = (self.state.get(name) or {}).get(prop)
+        if raw is None:
+            return None
+        return raw.get("source", "local") if isinstance(raw, dict) else "local"
 
     @property
     def calls(self) -> list:
@@ -386,7 +414,22 @@ def fake_zfs(tmp_path, monkeypatch) -> FakeZfs:
 
 
 ANCHOR = "org.zfsbackup:anchor."
+INFLIGHT = "org.zfsbackup:inflight."
 CONFIG_PROP = "org.zfsbackup:config"
+
+
+def inherit_command(prop: str, dataset: str, *, recursive: bool = False) -> str:
+    """The `zfs inherit` line the CLI prints for `prop` on `dataset`: `-S` for an
+    anchor or a pin (it clears only the LOCAL value and leaves a received one
+    alone), plain for `org.zfsbackup:config`; `-r` goes first."""
+    flag = "-S " if prop.startswith((ANCHOR, INFLIGHT)) else ""
+    return f"zfs inherit {'-r ' if recursive else ''}{flag}{prop} {dataset}"
+
+
+def inherit_property(call: list) -> str:
+    """The property of one logged `zfs inherit` call (`["inherit", "-r", "-S", PROP, DS]`): libzfseasy
+    writes the options BEFORE the property, so it is the first word after `inherit` that is no option."""
+    return next(word for word in call[1:-1] if not word.startswith("-"))
 
 
 # --------------------------------------------------------------------------

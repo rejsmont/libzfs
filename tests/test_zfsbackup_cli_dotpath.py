@@ -65,6 +65,7 @@ import yaml
 
 from _cli_support import (
     AMBIGUOUS_YAML,
+    ANCHOR,
     NEVER_PRUNE_TEXT,
     NO_AUTH_TEXT,
     PLAIN_YAML,
@@ -75,12 +76,15 @@ from _cli_support import (
     count_containing,
     db,
     db_state,
+    fake_zfs,
     generation,
     isolated,
     make_db,
     run,
+    scratch_tmp,
     stderr_lines,
     stored,
+    stub,
     warnings_in,
     write_yaml,
 )
@@ -1973,7 +1977,12 @@ class TestDotpathFingerprint:
         assert stored_dest.url == "https://other:1" and stored_dest.server_fingerprint == FP
 
     def test_changing_the_url_of_an_unenrolled_destination_does_not_warn(self, run, rich):
-        assert warnings_in(ok(run, rich, "set", "destinations.offsite.url", "https://other:1")) == []
+        result = ok(run, rich, "set", "destinations.offsite.url", "https://other:1")
+        # No fingerprint warning (nothing is pinned) ...
+        assert not any("pinned" in w or "is enrolled" in w for w in warnings_in(result))
+        # ... but `offsite` has senders, so the stale-anchor warning (A4) is the only one.
+        (warned,) = warnings_in(result)
+        assert "destinations[offsite] now points to a different place" in warned
 
 
 class TestDotpathTlsPaths:
@@ -2145,3 +2154,478 @@ class TestPinChangeWarnings:
         old, new = _config(tmp_path, {"d": FP}), _config(tmp_path, {"d": None})
         dotpath.pin_change_warnings(old, new)
         assert old.destinations["d"].server_fingerprint == FP
+
+
+# ---------------------------------------------------------------------------
+# A4: a destination that now points elsewhere keeps its anchors (keyed by NAME)
+# ---------------------------------------------------------------------------
+
+#: `tank/rec` (recursive) sends to `offsite` and to the local `loc`; `tank/flat` (not
+#: recursive) sends to `offsite` and to the local `loc2`; `spare` has no sender at all.
+ANCHOR_WARN_YAML = """\
+snapshot_prefix: "autosnap"
+check_interval: "5m"
+datasets:
+  - name: "tank/rec"
+    frequency: "1h"
+    recursive: true
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "offsite"
+      - destination: "loc"
+  - name: "tank/flat"
+    frequency: "1h"
+    retention:
+      "1d": "30d"
+    remote:
+      - destination: "offsite"
+      - destination: "loc2"
+destinations:
+  offsite:
+    url: "https://offsite:8080"
+  spare:
+    url: "https://spare:8080"
+  loc:
+    url: "zfs:backup/local"
+  loc2:
+    url: "zfs:backup/two"
+"""
+
+STALE_HEAD = "destinations[{name}] now points to a different place"
+
+
+def stale_warnings(result):
+    """The stale-anchor warnings printed: their first lines, in order."""
+    return [line for line in result.stderr.splitlines() if "now points to a different place" in line]
+
+
+class TestStaleAnchorWarning:
+    @pytest.fixture
+    def anchored(self, run, db):
+        return make_db(run, db, ANCHOR_WARN_YAML)
+
+    def test_a_server_url_change_warns_with_r_for_recursive_and_without_for_the_rest(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.offsite.url", "https://other:1")
+        (warned,) = stale_warnings(result)
+        assert warned.startswith("warning: " + STALE_HEAD.format(name="offsite"))
+        assert "org.zfsbackup:anchor.offsite" in warned
+        assert ", and on every descendant of a recursive one" in warned
+        assert ", with `-r` reaching the descendants of a recursive dataset" in result.stderr
+        commands = [l.strip() for l in result.stderr.splitlines() if l.strip().startswith("zfs inherit")]
+        assert commands == [
+            "zfs inherit -r -S org.zfsbackup:anchor.offsite tank/rec",
+            "zfs inherit -S org.zfsbackup:anchor.offsite tank/flat",
+        ]
+        assert "this tool changes no ZFS property itself" in result.stderr
+        assert stored(anchored).destinations["offsite"].url == "https://other:1"      # the change itself went through
+
+    def test_only_non_recursive_senders_means_no_r_and_no_descendants_wording(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.loc2.url", "zfs:backup/three")
+        warned = [l for l in stale_warnings(result)]
+        assert len(warned) == 1
+        assert "descendant" not in result.stderr.split("different place")[1]
+        commands = [l.strip() for l in result.stderr.splitlines() if l.strip().startswith("zfs inherit")]
+        assert commands == ["zfs inherit -S org.zfsbackup:anchor.loc2 tank/flat"]
+
+    def test_only_recursive_senders_say_so(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.loc.url", "zfs:backup/moved")
+        commands = [l.strip() for l in result.stderr.splitlines() if l.strip().startswith("zfs inherit")]
+        assert commands == ["zfs inherit -r -S org.zfsbackup:anchor.loc tank/rec"]
+        assert "and on every descendant of a recursive one" in result.stderr
+
+    def test_a_local_target_change_gets_the_anchor_warning_after_the_copy_path_one(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.loc.url", "zfs:backup/moved")
+        warned = warnings_in(result)
+        assert len(warned) == 2
+        assert "changes its local target from 'backup/local' to 'backup/moved'" in warned[0]
+        assert STALE_HEAD.format(name="loc") in warned[1]
+
+    def test_local_to_https_and_https_to_local_both_warn(self, run, anchored):
+        out = ok(run, anchored, "set", "destinations.loc.url", "https://elsewhere:9")
+        assert len(stale_warnings(out)) == 1
+        back = ok(run, anchored, "set", "destinations.loc.url", "zfs:backup/local")
+        assert len(stale_warnings(back)) == 1
+
+    def test_a_destination_nothing_sends_to_gets_no_anchor_warning(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.spare.url", "https://other:1")
+        assert stale_warnings(result) == []
+        assert warnings_in(result) == []
+
+    def test_the_same_url_is_a_noop_without_a_warning(self, run, anchored):
+        before, gen = db_state(anchored), generation(anchored)
+        result = ok(run, anchored, "set", "destinations.offsite.url", "https://offsite:8080")
+        assert stale_warnings(result) == [] and warnings_in(result) == []
+        assert db_state(anchored) == before and generation(anchored) == gen
+
+    def test_other_destination_settings_do_not_warn(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.offsite.server_fingerprint", FP)
+        assert stale_warnings(result) == []
+        assert stale_warnings(ok(run, anchored, "unset", "destinations.offsite.server_fingerprint")) == []
+
+    def test_a_refused_unset_of_the_url_warns_nothing(self, run, anchored):
+        before = db_state(anchored)
+        result = run("unset", "destinations.offsite.url", "-c", anchored)
+        assert result.exit_code == 1 and stale_warnings(result) == []
+        assert db_state(anchored) == before
+
+    def test_a_dotted_destination_name_is_quoted_into_the_property(self, run, db):
+        make_db(run, db, ANCHOR_WARN_YAML.replace('"loc2"', '"dc.two"').replace("  loc2:", "  dc.two:"))
+        result = ok(run, db, "set", "destinations[dc.two].url", "zfs:backup/three")
+        assert "zfs inherit -S org.zfsbackup:anchor.dc.two tank/flat" in result.stderr
+
+    def test_a_dataset_name_with_a_space_is_shell_quoted(self, run, db):
+        make_db(run, db, ANCHOR_WARN_YAML.replace('"tank/flat"', '"tank/my data"'))
+        result = ok(run, db, "set", "destinations.offsite.url", "https://other:1")
+        assert "zfs inherit -S org.zfsbackup:anchor.offsite 'tank/my data'" in result.stderr
+
+    # -- `edit` ------------------------------------------------------------
+
+    def test_edit_destination_warns_once_on_a_url_change(self, run, anchored, stub, scratch_tmp):
+        stub.plan([{"replace": ['url: "https://offsite:8080"', 'url: "https://other:1"']}])
+        result = run("edit", "destination", "offsite", "--no-prompt", "-c", anchored, env=stub.env(anchored))
+        assert result.exit_code == 0, result.stderr
+        assert len(stale_warnings(result)) == 1
+        assert "zfs inherit -r -S org.zfsbackup:anchor.offsite tank/rec" in result.stderr
+        assert stored(anchored).destinations["offsite"].url == "https://other:1"
+
+    def test_edit_of_the_whole_config_warns_per_changed_destination_and_skips_an_unsent_one(
+        self, run, anchored, stub, scratch_tmp
+    ):
+        stub.plan([
+            {"replace": ['url: "https://offsite:8080"', 'url: "https://other:1"']},
+            {"replace": ['url: "zfs:backup/two"', 'url: "zfs:backup/three"']},
+            {"replace": ['url: "https://spare:8080"', 'url: "https://spare2:8080"']},
+        ])
+        result = run("edit", "--no-prompt", "-c", anchored, env=stub.env(anchored))
+        assert result.exit_code == 0, result.stderr
+        assert sorted(l.split("]")[0] for l in stale_warnings(result)) == [
+            "warning: destinations[loc2", "warning: destinations[offsite"
+        ]
+        assert "spare" not in " ".join(stale_warnings(result))
+
+    def test_edit_that_changes_no_url_warns_nothing(self, run, anchored, stub, scratch_tmp):
+        stub.plan([{"replace": ['check_interval: "5m"', 'check_interval: "10m"']}])
+        result = run("edit", "--no-prompt", "-c", anchored, env=stub.env(anchored))
+        assert result.exit_code == 0, result.stderr
+        assert stale_warnings(result) == []
+
+    def test_edit_of_an_unsent_destinations_url_warns_nothing(self, run, anchored, stub, scratch_tmp):
+        stub.plan([{"replace": ['url: "https://spare:8080"', 'url: "https://spare2:8080"']}])
+        result = run("edit", "destination", "spare", "--no-prompt", "-c", anchored, env=stub.env(anchored))
+        assert result.exit_code == 0, result.stderr
+        assert stale_warnings(result) == []
+
+
+class TestStaleAnchorAdviceDashS:
+    """`-S` in the advice: it clears only LOCAL values, so a received anchor (which the pruner protects) survives."""
+
+    CAVEAT = "(`-S` clears only local values; it does not touch received values)"
+
+    @pytest.fixture
+    def anchored(self, run, db):
+        return make_db(run, db, ANCHOR_WARN_YAML)
+
+    @pytest.fixture
+    def config(self, tmp_path) -> BackupConfig:
+        return BackupConfig.from_file(write_yaml(tmp_path, ANCHOR_WARN_YAML, "anchors2.yaml"))
+
+    def dest(self, url):
+        from zfsbackup.config import Destination
+
+        return Destination(url=url)
+
+    def message(self, config, name, old, new):
+        (message,) = dotpath.stale_anchor_warnings(name, self.dest(old), self.dest(new), config)
+        return message
+
+    def test_the_caveat_is_in_every_warning(self, config):
+        for name, old, new in (
+            ("offsite", "https://offsite:8080", "https://other:1"),
+            ("loc", "zfs:backup/local", "zfs:backup/moved"),
+            ("loc2", "zfs:backup/two", "zfs:backup/three"),
+        ):
+            assert self.CAVEAT in self.message(config, name, old, new), name
+
+    def test_every_printed_command_is_an_inherit_with_dash_S(self, config):
+        message = self.message(config, "offsite", "https://offsite:8080", "https://other:1")
+        commands = [l.strip() for l in message.splitlines() if l.strip().startswith("zfs inherit")]
+        assert commands == [
+            "zfs inherit -r -S org.zfsbackup:anchor.offsite tank/rec",
+            "zfs inherit -S org.zfsbackup:anchor.offsite tank/flat",
+        ]
+        assert not any(l.strip().startswith("zfs inherit org.zfsbackup") or l.strip().startswith("zfs inherit -r org")
+                       for l in message.splitlines())
+
+    def test_a_recursive_sender_gets_the_check_the_copies_sentence_naming_its_root(self, config):
+        message = self.message(config, "offsite", "https://offsite:8080", "https://other:1")
+        assert message.endswith(
+            "\nBefore using `-r`, check that no backup copy below tank/rec carries a local "
+            "anchor.offsite you want to keep (the daemon reports the copies it skips)"
+        )
+
+    def test_the_sentence_names_only_the_recursive_roots_and_quotes_them(self, tmp_path):
+        yaml_text = ANCHOR_WARN_YAML.replace('"tank/flat"', '"tank/my data"').replace(
+            '  - name: "tank/my data"\n    frequency: "1h"\n', '  - name: "tank/my data"\n    frequency: "1h"\n    recursive: true\n')
+        config = BackupConfig.from_file(write_yaml(tmp_path, yaml_text, "two_rec.yaml"))
+        message = self.message(config, "offsite", "https://offsite:8080", "https://other:1")
+        assert "no backup copy below tank/rec, 'tank/my data' carries a local anchor.offsite" in message
+        assert "zfs inherit -r -S org.zfsbackup:anchor.offsite 'tank/my data'" in message
+
+    def test_without_a_recursive_sender_there_is_no_sentence_and_no_r(self, config):
+        message = self.message(config, "loc2", "zfs:backup/two", "zfs:backup/three")
+        assert "Before using" not in message and "backup copy" not in message and " -r " not in message
+        assert self.CAVEAT in message
+
+    def test_through_the_cli_the_sentence_is_the_last_line_of_the_warning(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.offsite.url", "https://other:1")
+        assert result.stderr.rstrip().splitlines()[-1].startswith("Before using `-r`, check that no backup copy below tank/rec")
+        assert self.CAVEAT in result.stderr
+
+    def test_the_printed_commands_clear_local_anchors_and_leave_received_ones(self, run, anchored, fake_zfs):
+        import shlex
+        import subprocess
+
+        fake_zfs.set_prop("tank/rec", ANCHOR + "offsite", "L0")
+        fake_zfs.set_prop("tank/rec/child", ANCHOR + "offsite", "L1")
+        fake_zfs.set_prop("tank/rec/overridden", ANCHOR + "offsite", "L2", received="R2")
+        fake_zfs.set_prop("tank/rec/copy", ANCHOR + "offsite", "R3", "received")
+        fake_zfs.set_prop("tank/flat", ANCHOR + "offsite", "L4")
+        result = ok(run, anchored, "set", "destinations.offsite.url", "https://other:1")
+        for line in result.stderr.splitlines():
+            if line.strip().startswith("zfs inherit"):
+                subprocess.run([str(fake_zfs.wrapper), *shlex.split(line.strip())[1:]], check=True, env=dict(os.environ))
+        value = lambda n: (fake_zfs.value(n, ANCHOR + "offsite"), fake_zfs.source(n, ANCHOR + "offsite"))
+        assert value("tank/rec") == (None, None) and value("tank/flat") == (None, None)
+        assert value("tank/rec/child") == (None, None)
+        assert value("tank/rec/overridden") == ("R2", "received")      # reverted to the received value
+        assert value("tank/rec/copy") == ("R3", "received")            # a received anchor is never cleared
+
+
+class TestStaleAnchorWarningsPure:
+    """`dotpath.stale_anchor_warnings(name, old, new, config)`, no database."""
+
+    @pytest.fixture
+    def config(self, tmp_path) -> BackupConfig:
+        return BackupConfig.from_file(write_yaml(tmp_path, ANCHOR_WARN_YAML, "anchors.yaml"))
+
+    def dest(self, url):
+        from zfsbackup.config import Destination
+
+        return Destination(url=url)
+
+    def test_a_changed_url_with_senders_warns_once_naming_the_property_and_the_commands(self, config):
+        (message,) = dotpath.stale_anchor_warnings(
+            "offsite", self.dest("https://offsite:8080"), self.dest("https://other:1"), config
+        )
+        assert message.startswith("destinations[offsite] now points to a different place, but the anchors for it")
+        assert "(org.zfsbackup:anchor.offsite, kept on the datasets that send to it" in message
+        assert (
+            "zfs inherit -r -S org.zfsbackup:anchor.offsite tank/rec\n"
+            "  zfs inherit -S org.zfsbackup:anchor.offsite tank/flat\n"
+            "Before using `-r`"
+        ) in message
+
+    def test_an_unchanged_url_gives_nothing(self, config):
+        same = self.dest("https://offsite:8080")
+        assert dotpath.stale_anchor_warnings("offsite", same, self.dest("https://offsite:8080"), config) == []
+
+    def test_no_sender_gives_nothing(self, config):
+        assert dotpath.stale_anchor_warnings(
+            "spare", self.dest("https://spare:8080"), self.dest("https://x:1"), config
+        ) == []
+
+    def test_a_destination_the_config_does_not_know_gives_nothing(self, config):
+        assert dotpath.stale_anchor_warnings(
+            "ghost", self.dest("https://a:1"), self.dest("https://b:1"), config
+        ) == []
+
+    def test_only_non_recursive_senders_have_no_r(self, config):
+        (message,) = dotpath.stale_anchor_warnings(
+            "loc2", self.dest("zfs:backup/two"), self.dest("zfs:backup/three"), config
+        )
+        assert "-r" not in message and "descendant" not in message
+        assert message.endswith("zfs inherit -S org.zfsbackup:anchor.loc2 tank/flat")
+
+    def test_url_change_warnings_adds_it_after_the_destination_one(self, config, tmp_path):
+        new = BackupConfig.from_file(write_yaml(
+            tmp_path, ANCHOR_WARN_YAML.replace("zfs:backup/local", "zfs:backup/moved"), "moved.yaml"))
+        messages = dotpath.url_change_warnings(config, new, "host-1")
+        assert len(messages) == 2
+        assert "changes its local target" in messages[0]
+        assert messages[1].startswith("destinations[loc] now points to a different place")
+
+    def test_url_change_warnings_is_silent_for_an_identical_configuration(self, config):
+        assert dotpath.url_change_warnings(config, config) == []
+
+
+class TestStaleAnchorAdviceIsConditional:
+    """The advice never says "clear" unconditionally: only when the destination now points to a DIFFERENT
+    copy; for the same server under a new name or address, clearing the anchor strands the incremental base."""
+
+    @pytest.fixture
+    def config(self, tmp_path) -> BackupConfig:
+        return BackupConfig.from_file(write_yaml(tmp_path, ANCHOR_WARN_YAML, "conditional.yaml"))
+
+    @pytest.fixture
+    def anchored(self, run, db):
+        return make_db(run, db, ANCHOR_WARN_YAML)
+
+    def message(self, config, old="https://offsite:8080", new="https://other:1", name="offsite"):
+        from zfsbackup.config import Destination
+
+        (message,) = dotpath.stale_anchor_warnings(name, Destination(url=old), Destination(url=new), config)
+        return message
+
+    def test_the_text_says_to_clear_only_for_a_different_copy(self, config):
+        message = self.message(config)
+        assert "Clear them ONLY if this destination now points to a DIFFERENT copy (another server or pool)" in message
+
+    def test_the_text_says_not_to_clear_for_the_same_server_and_why(self, config):
+        message = self.message(config)
+        assert (
+            "if it is the same server under a new name or address, do NOT clear anything: the old anchor is "
+            "the incremental base, and once it is gone the pruner may remove that snapshot, the next send "
+            "finds no common snapshot, and sends stop until you intervene"
+        ) in message
+
+    def test_the_conditions_come_before_the_commands(self, config):
+        message = self.message(config)
+        commands = message.index("zfs inherit")
+        assert message.index("ONLY if") < message.index("do NOT clear") < commands
+
+    def test_it_is_still_one_warning_through_the_cli(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.offsite.url", "https://other:1")
+        (warned,) = stale_warnings(result)
+        assert "Clear them ONLY if" in result.stderr and "do NOT clear anything" in result.stderr
+        assert warned.startswith("warning: destinations[offsite] now points to a different place")
+
+    def test_a_local_target_change_carries_the_same_conditional_wording(self, config):
+        message = self.message(config, "zfs:backup/two", "zfs:backup/three", name="loc2")
+        assert "ONLY if this destination now points to a DIFFERENT copy" in message
+        assert "do NOT clear anything" in message
+
+
+class TestStaleAnchorSameCertificateLead:
+    """With the same non-empty `server_fingerprint` on both sides the warning LEADS with the same-server hint."""
+
+    LEAD = ("the server certificate is the same, so this is likely the same server under a new address: "
+            "if so, do NOT clear anything. destinations[offsite] now points to a different place")
+
+    @pytest.fixture
+    def config(self, tmp_path) -> BackupConfig:
+        return BackupConfig.from_file(write_yaml(tmp_path, ANCHOR_WARN_YAML, "lead.yaml"))
+
+    def warn(self, config, old_fp, new_fp, old="https://offsite:8080", new="https://other:1"):
+        from zfsbackup.config import Destination
+
+        return dotpath.stale_anchor_warnings(
+            "offsite", Destination(url=old, server_fingerprint=old_fp),
+            Destination(url=new, server_fingerprint=new_fp), config,
+        )
+
+    def test_an_equal_fingerprint_leads_with_the_same_server_sentence(self, config):
+        (message,) = self.warn(config, FP, FP)
+        assert message.startswith(self.LEAD)
+
+    def test_the_lead_is_followed_by_the_usual_text_and_commands(self, config):
+        (message,) = self.warn(config, FP, FP)
+        assert "(org.zfsbackup:anchor.offsite, kept on the datasets that send to it" in message
+        assert "zfs inherit -r -S org.zfsbackup:anchor.offsite tank/rec" in message
+
+    def test_the_fingerprint_is_compared_after_normalisation(self, config):
+        (message,) = self.warn(config, FP, FP.upper())
+        assert message.startswith(self.LEAD)
+
+    def test_a_different_fingerprint_has_no_lead(self, config):
+        (message,) = self.warn(config, FP, FP2)
+        assert message.startswith("destinations[offsite] now points to a different place")
+        assert "the server certificate is the same" not in message
+
+    @pytest.mark.parametrize("old_fp, new_fp", [(FP, None), (None, FP), (None, None)])
+    def test_an_absent_fingerprint_on_either_side_has_no_lead(self, config, old_fp, new_fp):
+        (message,) = self.warn(config, old_fp, new_fp)
+        assert message.startswith("destinations[offsite] now points to a different place")
+        assert "the server certificate is the same" not in message
+
+    def test_the_lead_still_leaves_the_do_not_clear_paragraph(self, config):
+        (message,) = self.warn(config, FP, FP)
+        assert message.count("do NOT clear anything") == 2     # the lead, and the conditional advice
+
+    def test_an_unchanged_url_is_silent_whatever_the_fingerprint(self, config):
+        assert self.warn(config, FP, FP, new="https://offsite:8080") == []
+        assert self.warn(config, FP, FP2, new="https://offsite:8080") == []
+
+    def test_through_the_cli_a_pinned_destination_whose_url_moves_gets_the_lead(self, run, db):
+        pinned = make_db(run, db, ANCHOR_WARN_YAML.replace(
+            'url: "https://offsite:8080"', f'url: "https://offsite:8080"\n    server_fingerprint: "{FP}"'))
+        result = ok(run, pinned, "set", "destinations.offsite.url", "https://other:1")
+        (warned,) = stale_warnings(result)
+        assert warned.startswith("warning: the server certificate is the same, so this is likely the same server")
+        assert stored(pinned).destinations["offsite"].server_fingerprint == FP
+
+    def test_through_the_cli_an_unenrolled_destination_gets_no_lead(self, run, db):
+        unpinned = make_db(run, db, ANCHOR_WARN_YAML)
+        result = ok(run, unpinned, "set", "destinations.offsite.url", "https://other:1")
+        assert "the server certificate is the same" not in result.stderr
+        assert len(stale_warnings(result)) == 1
+
+
+class TestStaleAnchorUrlNormalisation:
+    """`_anchor_url`: a `zfs:` target without surrounding blanks or a trailing `/` is the same dataset."""
+
+    @pytest.fixture
+    def config(self, tmp_path) -> BackupConfig:
+        return BackupConfig.from_file(write_yaml(tmp_path, ANCHOR_WARN_YAML, "norm.yaml"))
+
+    def warn(self, config, old, new, name="loc2"):
+        from zfsbackup.config import Destination
+
+        return dotpath.stale_anchor_warnings(name, Destination(url=old), Destination(url=new), config)
+
+    @pytest.mark.parametrize("old, new", [
+        ("zfs:backup/two", "zfs:backup/two/"),
+        ("zfs:backup/two/", "zfs:backup/two"),
+        ("zfs:backup/two/", "zfs:backup/two/"),
+        ("zfs:backup/two", " zfs:backup/two "),
+        (" zfs:backup/two/ ", "zfs:backup/two"),
+    ])
+    def test_a_blank_or_trailing_slash_difference_gives_no_warning(self, config, old, new):
+        assert self.warn(config, old, new) == []
+
+    def test_a_real_target_change_still_warns_whatever_the_decoration(self, config):
+        for old, new in [
+            ("zfs:backup/two", "zfs:backup/three"),
+            ("zfs:backup/two/", "zfs:backup/three/"),
+            ("zfs:backup/two", " zfs:backup/three/ "),
+            ("zfs:backup/two/", "zfs:backup/twos"),
+        ]:
+            (message,) = self.warn(config, old, new)
+            assert message.startswith("destinations[loc2] now points to a different place"), (old, new)
+
+    def test_a_server_url_is_compared_verbatim(self, config):
+        (message,) = self.warn(config, "https://offsite:8080", "https://offsite:8080/", name="offsite")
+        assert message.startswith("destinations[offsite] now points to a different place")
+
+    def test_a_zfs_url_with_a_trailing_slash_against_a_server_url_warns(self, config):
+        assert len(self.warn(config, "zfs:backup/two/", "https://x:1")) == 1
+
+    def test_the_prefix_is_matched_exactly(self):
+        assert dotpath._anchor_url("ZFS:tank/x/") == "ZFS:tank/x/"
+        assert dotpath._anchor_url("zfs:tank/x/ ") == "zfs:tank/x"
+        assert dotpath._anchor_url("https://h:1/") == "https://h:1/"
+
+    def test_url_change_warnings_gives_no_stale_warning_for_a_decoration_only_change(self, config, tmp_path):
+        from zfsbackup.config import Destination
+
+        new = BackupConfig.from_file(write_yaml(tmp_path, ANCHOR_WARN_YAML, "norm2.yaml"))
+        new.destinations["loc2"] = Destination(url="zfs:backup/two/")
+        messages = dotpath.url_change_warnings(config, new, "host-1")
+        assert not [m for m in messages if "now points to a different place" in m]
+
+
+def test_dotpath_all_is_sorted_and_every_name_exists():
+    assert list(dotpath.__all__) == sorted(dotpath.__all__)
+    assert len(set(dotpath.__all__)) == len(dotpath.__all__)
+    assert [n for n in dotpath.__all__ if not hasattr(dotpath, n)] == []
+    assert "stale_anchor_warnings" in dotpath.__all__
