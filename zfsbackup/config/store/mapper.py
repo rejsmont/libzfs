@@ -1042,7 +1042,8 @@ def _require_outside_target(ds: DatasetConfig, key: str, remote_backup: object) 
 def _require_disjoint_receive_targets(
     remote_backup: object, destinations: object
 ) -> None:
-    """Refuse receive targets that overlap one another.
+    """Refuse receive targets that overlap one another, with ONE exception: a
+    local target EXACTLY EQUAL to the enabled remote target.
 
     What bug this prevents: two targets that are equal, or one inside the
     other, share received datasets. Each destination stamps its own
@@ -1050,36 +1051,67 @@ def _require_disjoint_receive_targets(
     own anchors, so the pruner of one would act on the other's copies and a
     receive could hit a dataset another destination claims. The same holds
     between a local target and an ENABLED remote target (the API worker
-    receives into the latter). Component-wise, like the dataset check; local
-    targets are every declared `zfs:` destination (`_local_targets`), the
-    remote one only while remote_backup is enabled.
+    receives into the latter) when one is inside or above the other, and
+    between any two local targets, equal or nested. Component-wise, like
+    the dataset check; local targets are every declared `zfs:` destination
+    (`_local_targets`), the remote one only while remote_backup is enabled.
+
+    The exception (docs/local_destination_plan.md, "a local target shared
+    with the server"): a local destination whose target equals the enabled
+    remote target is accepted. That is safe because a local copy carries the
+    same properties as a client's (local `client_id`, `source_dataset`,
+    stamped `config`, the forced `-o` set) and lives under this host's OWN
+    id, `<T>/<own id>/<pool>/<path>`, which the server lists and prunes like
+    any client's tree: one owner per tree, no second retention stamp. The
+    server reserves that id while the target is shared (so no enrolled
+    client can write into the host's own tree); that guard is the API's, not
+    this check's. Only equality is safe: a local target below the remote
+    one would put copies under another client's namespace, and one above it
+    would make the server's tree part of the local copies' parent. Disabled
+    remote_backup: nothing is received there, nothing to share.
     """
-    parties: List[Tuple[str, str]] = [
-        (f"local destination {name!r}", target)
+    # (who, target, is_remote): the remote party is appended last
+    parties: List[Tuple[str, str, bool]] = [
+        (f"local destination {name!r}", target, False)
         for name, target in _local_targets(destinations)
     ]
     if remote_backup is not None and getattr(remote_backup, "enabled", False):
         target = getattr(remote_backup, "target_dataset", None)
         if isinstance(target, str) and target:
-            parties.append(("remote_backup", target))
-    for i, (who_a, a) in enumerate(parties):
+            parties.append(("remote_backup", target, True))
+    for i, (who_a, a, remote_a) in enumerate(parties):
         ca = _dataset_components(a)
-        for who_b, b in parties[i + 1:]:
+        for who_b, b, remote_b in parties[i + 1:]:
             cb = _dataset_components(b)
             if not (_is_prefix(ca, cb) or _is_prefix(cb, ca)):
                 continue
             if ca == cb:
+                if remote_a != remote_b:
+                    # local == the enabled remote target: the shared target
+                    continue
                 how = "is the same dataset as"
             elif _is_prefix(ca, cb):
                 how = "is an ancestor of"
             else:
                 how = "is below"
+            if remote_a != remote_b:
+                advice = (
+                    "Only the server's target itself may be shared with a "
+                    "local destination (use exactly "
+                    "remote_backup.target_dataset); a local target inside or "
+                    "above it is refused. Give the local destination its own "
+                    "dataset, or the same one as remote_backup."
+                )
+            else:
+                advice = (
+                    "Receive targets must be dedicated and disjoint: copies "
+                    "under one would be pruned and overwritten as the "
+                    "other's. Give each destination its own dataset that is "
+                    "neither inside nor above another target."
+                )
             raise ValueError(
                 f"the target {a!r} of {who_a} {how} the target {b!r} of "
-                f"{who_b}. Receive targets must be dedicated and disjoint: "
-                "copies under one would be pruned and overwritten as the "
-                "other's. Give each destination its own dataset that is "
-                "neither inside nor above another target."
+                f"{who_b}. {advice}"
             )
 
 
@@ -1143,8 +1175,11 @@ def validate_config(config: BackupConfig) -> List[str]:
       strict ancestor of it; likewise for the target of EVERY declared
       `zfs:` (local) destination, used or not
       (`_require_outside_receive_targets`);
-    - receive targets that overlap one another: two local targets, or a local
-      target and the ENABLED remote target, equal or one inside the other
+    - receive targets that overlap one another: two local targets, equal or
+      one inside the other, or a local target inside or above the ENABLED
+      remote target. A local target EXACTLY EQUAL to the enabled remote
+      target is accepted (a shared target: the copies live under the host's
+      own client id, which the server reserves)
       (`_require_disjoint_receive_targets`);
     - a `zfs:` destination that carries a `server_fingerprint`
       (`destination_problem`).

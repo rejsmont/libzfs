@@ -10,7 +10,7 @@ subcommand like every other command)::
     trust list         [--json]
     trust revoke FINGERPRINT | --client ID
     identity show      [--json]
-    identity set-client-id ID [--force]
+    identity set-client-id ID [--force]   # --force never overrides a shared-target collision
     identity rotate [--cert NEW --key NEW]   # enroll.py (plan M14c)
 
 The server side (`trust ...`)
@@ -100,6 +100,7 @@ from zfsbackup.cli.write import (
     notify_daemon,
     read_snapshot,
     release_database,
+    shared_local_destinations,
     where_flag,
 )
 from zfsbackup.config import Duration, client_id_problem
@@ -280,6 +281,18 @@ def token_create(
     # configuration that cannot be loaded stop here, before anything is
     # generated next to the database.
     snapshot = read_snapshot(resolved)
+    shared, sharing = shared_local_destinations(snapshot.config)
+    if shared is not None and client_id is not None and client_id == snapshot.client_id:
+        # Before anything is generated: the server reserves its own id, so a
+        # token for it would enroll a client the server then refuses.
+        names = ", ".join(repr(n) for n in sharing)
+        raise CliError(
+            f"refusing to create a token for client id {client_id!r}: it is this host's own "
+            f"client id, and the server reserves its own id while local destination(s) {names} "
+            f"share its target {shared!r}. Nothing was written. To enroll this host with its "
+            "own server, remove the shared local destination first (or give it another "
+            "target)."
+        )
     remote = snapshot.config.remote_backup
     if remote is None or not remote.enabled:
         state.warn(
@@ -794,6 +807,37 @@ def identity_set_client_id(state: Any, new_id: str, force: bool) -> None:
         click.echo(f"client id is already {new_id}; nothing changed")
         return
 
+    shared, sharing = shared_local_destinations(snapshot.config)
+    if shared is not None:
+        # Mirrors the server's `client_id_taken` (any `clients` row, revoked or
+        # not; the `target/<id>` dataset part is invisible to the CLI). Fail
+        # closed, and never overridable by --force. The server's reservation of
+        # its own id is the real guarantee: this check and the write below are
+        # not one transaction against the API worker's /enroll.
+        try:
+            known = {c.client_id for c in list_clients(resolved)}
+        except Exception as exc:  # noqa: BLE001 - fail closed: refuse, whatever it was
+            raise CliError(
+                f"refusing to change the client id to {new_id!r}: local destination(s) "
+                f"{', '.join(repr(n) for n in sharing)} share this server's target {shared!r} "
+                f"and the trust tables could not be read to check that no client already uses "
+                f"that id ({type(exc).__name__}: {exc}). --force does not override this; fix "
+                "the database and retry."
+            ) from None
+        finally:
+            release_database()
+        if new_id in known:
+            names = ", ".join(repr(n) for n in sharing)
+            raise CliError(
+                f"refusing to change the client id to {new_id!r}: a client with that id is "
+                f"already known to this server (see `zfsbackup-config{where_flag(resolved)} "
+                f"trust list`; a revoked id counts), and local destination(s) {names} share "
+                f"this server's target {shared!r}. The server would reserve {new_id!r} as this "
+                f"host's own id and refuse that client's receives, and its copies under "
+                f"{shared}/{new_id}/ would mix with this host's. --force does not override "
+                "this: choose another id."
+            )
+
     # With no id stored yet nothing can be bound to an old one (a fingerprint
     # imported from YAML pins a SERVER; no server has been told an id by this
     # host), so there is nothing to refuse.
@@ -839,6 +883,21 @@ def identity_set_client_id(state: Any, new_id: str, force: bool) -> None:
         (name, dest.target_dataset)
         for name, dest in snapshot.config.destinations.items() if dest.is_local
     ) if previous else []
+    if shared is not None and locals_:
+        # The server's own target: its received-dataset listing keeps pruning
+        # the copies under the old id, and the old id stops being reserved.
+        on_shared = [n for n in sharing]
+        locals_ = [(n, t) for n, t in locals_ if n not in on_shared]
+        state.warn(
+            f"local destination(s) {', '.join(repr(n) for n in on_shared)} share the server's "
+            f"target {shared!r}: the copies under {shared}/{previous}/ stay where they are and "
+            "the server keeps pruning them to their stamped rules, but this host no longer "
+            f"sends to them (with the new client id {new_id!r} the next backup is a FULL send "
+            f"into {shared}/{new_id}/). After the reload {previous!r} is no longer reserved "
+            "for this host: do not create a token scoped to it (`trust token create "
+            f"--client-id {previous}`), or another client could take that tree over. Destroy "
+            "the old tree by hand only if you no longer need those copies."
+        )
     if locals_:
         # A local destination keeps its copies at <target>/<client id>/...
         # (the server's layout), so a new id is a new, empty place.
@@ -1022,7 +1081,8 @@ def register(
             "64; starting with a letter or digit). Every server then sees a NEW client and the "
             "next remote backup is a full send. Refused while any destination is "
             "enrolled (its server has this host's certificate bound to the old id) "
-            "unless --force."
+            "unless --force. Refused, with no override, while a local destination shares "
+            "the server's target and any client (revoked included) already uses that id."
         ),
     )
     @click.argument("client_id", metavar="ID")

@@ -190,7 +190,7 @@ writer lock; any change to the stored id bumps `GlobalSettings.generation` in
 the same transaction, so the daemon reloads). **The trust tables have exactly
 two writers, both going through `store.trust`:** the CLI (`create_token`,
 `revoke_token`, `revoke_pin`, `revoke_client`, under the writer lock) and the
-API worker (`enroll_client`, `rotate_client`, `retire_predecessor`, no flock:
+API worker (`enroll_client`, `confirm_token_live`, `rotate_client`, `retire_predecessor`, no flock:
 they serialise against the CLI on SQLite's write lock alone, and against each
 other on an in-process lock in `trust.py`; each first decides read-only, so a
 refused or no-op call -- every unauthenticated wrong `/enroll` -- never takes
@@ -226,6 +226,8 @@ Tool-level surface -- what the daemon and `zfsbackup-config` are meant to call:
   `/enroll`, before any `zfs` call; `enroll_client` re-checks everything);
   `create_token`, `revoke_token`, `revoke_pin` / `PinRevocation` /
   `SupersededRevocation`, `revoke_client`;
+  `confirm_token_live` (is the token redeemable right now, never consuming it:
+  the API's reserved-client-id refusal in `/enroll`; latches an expired one),
   `enroll_client` / `EnrollOutcome` / `NewPin`, `rotate_client` /
   `RotateOutcome`, `retire_predecessor`; `TOKEN_MAX_TTL_SECONDS`;
 
@@ -377,6 +379,7 @@ from zfsbackup.config.store.trust import (
     TrustKey,
     TrustSnapshot,
     TrustedPin,
+    confirm_token_live,
     create_token,
     enroll_client,
     ensure_client_id,
@@ -429,6 +432,7 @@ __all__ = [
     "ConfigPathEnvError",
     "ConfigPathError",
     "ConfigSnapshot",
+    "confirm_token_live",
     "create_config_db_file",
     "create_token",
     "Dataset",
