@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.0.0rc4 (2026-11-09)
+
+Local destinations: back a dataset up to another dataset or pool on the same host, with no server.
+
+### Compatibility
+
+- **Wire protocol 1** and the **config schema head** are unchanged: no migration. A `zfs:` URL is stored in the
+  existing `destinations.url` column. An rc3 daemon or CLI refuses a database that holds one (its destinations
+  must be `https://`), so remove local destinations before going back to rc3.
+- **Send flags, `raw` semantics and the server's dataset layout** unchanged.
+
+### Changes
+
+- **Local destinations: `url: zfs:<dataset>`.** A destination whose URL is `zfs:backup/zfsbackup` is sent to with a
+  direct `zfs send | zfs receive` on this host: no HTTP, no TLS, no enrollment, no fingerprint. It is the same
+  chain as a remote backup (incremental `-i` steps, resumable receive, raw or plain per dataset and destination,
+  anchors and pins, the same rollback and ownership refusals), laid out the server's way,
+  `<target>/<client_id>/<pool>/<path>`, with the server's forced properties on every copy (`readonly=on`,
+  `canmount=noauto`, `mountpoint=none`, `volmode=none`, share/setuid/exec/devices off, `-u`, `-h`). The remote
+  worker sends to local and remote destinations one after another. The copies are pruned by the retention stamped
+  on each (this host's own client id only, never recursively, newest always kept). An exported or hung target pool
+  skips the destination with one message per episode instead of stalling the worker (non-streaming `zfs` calls
+  have a 60 s budget, a stream that moves no byte for 600 s is stopped and resumed later). The target dataset is
+  created by the operator; see `zfsbackup/README.md`, "Local destinations", for the setup, restore, removable
+  pools and the move from a loopback setup (one `zfs rename` of `<target>/<client_id>`).
+- **New validation rules.** A local target must be disjoint from every configured dataset (at or below it, or a
+  `recursive` one above it), from every other local target and from an enabled `remote_backup.target_dataset`;
+  `url` is `zfs:` plus a valid dataset name (exact lowercase prefix; no `//`, `/`, `@` or `#`) and a `zfs:`
+  destination never has a `server_fingerprint`; a copy's snapshot name must fit ZFS's 255 characters (an error
+  for an enabled dataset, a warning when only a long client id would not fit).
+- **`zfsbackup-config`.** `list destinations` shows the kind (`--json`: `kind`, `target_dataset`); `enroll` refuses
+  a local destination; `identity rotate` skips it; `set`/`edit` warn when a destination's target or kind changes
+  and refuse a kind switch while a `server_fingerprint` is set; `rename dataset` prints the copy's path and, when
+  its parent is unchanged, the commands that move it; `identity set-client-id` warns that local copies are orphaned; `check` grades the
+  client certificate only when an `https://` destination exists. An `import`, `set` or `edit` that adds the first
+  local destination to a host without a client id generates one (`generated this host's client id: …`).
+- **Fix: raw copies on OpenZFS 2.1 could inherit `sharesmb`.** On 2.1 a raw `zfs receive` skips the forced
+  `-o sharesmb=off` (it prints "cannot receive sharesmb property … must be upgraded" and still succeeds), so a raw
+  server copy inherited the target's `sharesmb`. After every successful raw receive the server (and a local
+  destination) now sets any forced property that did not land locally. Plain receives and 2.2+ were not affected.
+- **A failure at one destination no longer abandons the dataset's other destinations.** An exception from one
+  `remote:` entry is logged, recorded against that destination in the status file and `check`, and the rest of
+  the dataset's destinations still get their turn in that cycle (remote destinations too).
+- **libzfseasy: `StreamHandle.terminate()`, `.poll()` and `.pid`.** `terminate()` stops a stream's child (SIGTERM,
+  SIGKILL after 5 s, bounded) without closing the stream, abandons a child that survives SIGKILL in
+  `stuck_children()` so that a later `close()` does not block on it; `poll()` is a non-blocking status check
+  for a bounded close. `close()` still collects stderr and the exit status.
+- **libzfseasy: `zfs.send.snapshot/dataset/redact/resume/partial(..., peek=False)`** (keyword-only, default
+  `True` = unchanged) returns the handle right after spawning, without the blocking read of the first byte, for
+  callers that bound the first read themselves; an immediate failure then shows as EOF and is reported by
+  `close()`.
+- Internal: the send chain moved out of `remote.py` into `zfsbackup/chain.py` (`ChainSender`) and the receive-side
+  helpers out of `api.py` into `zfsbackup/receiver.py`; the remote client and the API behave as before.
+
+### Known limitations
+
+New in `zfsbackup/README.md` ("Known limitations", "Local destinations"): local and remote sends share one
+worker; a `zfs receive` stuck on a hung pool is not remembered across worker restarts (ZFS refuses the overlap,
+nothing is corrupted); an exported target pool makes `check` WARN then CRIT until it is imported again.
+
 ## 1.0.0rc3 (2026-11-08)
 
 Third release candidate: one change to the server's dataset layout and one fix.

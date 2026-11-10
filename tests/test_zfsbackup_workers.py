@@ -8,14 +8,16 @@ import pickle
 import signal
 import pytest
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import zfsbackup.workers as workers_module
 from _config_handoff import config_signature, literals_in
-from zfsbackup.config import BackupConfig, DatasetConfig, Duration, RemoteDatasetConfig
+from zfsbackup.config import BackupConfig, DatasetConfig, Destination, Duration, RemoteDatasetConfig
 from zfsbackup.config.store import dispose_all
 from zfsbackup.runtime_config import load_runtime_config
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager
+from zfsbackup.health import StatusWriter, ensure_status_dir, read_worker_status
 from zfsbackup.stopflag import ReloadEpoch, StopFlag
 from zfsbackup.workers import (
     WORKER_EXIT_RELOAD, BaseWorker, SnapshotWorker, PruningWorker, RemoteBackupWorker, ApiWorker,
@@ -600,6 +602,239 @@ class TestRemoteWorkerPassesShouldStop:
         assert kwargs['should_stop']() is True
 
 
+class TestPerDestinationIsolation:
+    """Plan 3.2: one destination's failure is its own. `_send_to_destinations` catches an `Exception` from
+    one destination (the anchor read, the send, the record), logs ONE ERROR with the traceback, records a
+    failed `send` against THAT destination and flushes it, and the dataset's remaining destinations still get
+    their turn -- unless an exit reason is pending, which stops the chain at that safe point.
+
+    Mutation-checked (scratch copy; failing tests of this class): narrowing the `except Exception` in
+    `_send_to_destinations` so nothing is caught 13; dropping the failed `send` record 8; dropping the forced
+    flush after a failure 1; dropping the `index and self._exit_reason()` check between destinations 2;
+    `_record_send` ignoring the sender that ran (always asking the remote manager for `last_problem`) 1;
+    dropping `exc_info=True` 1."""
+
+    @pytest.fixture
+    def sdir(self, tmp_path):
+        (tmp_path / 'config.db').write_bytes(b'')
+        directory = tmp_path / 'config.db.status'
+        ensure_status_dir(directory)
+        return directory
+
+    def rig(self, sdir, destinations=('d1', 'd2'), local=(), stop=None):
+        urls = {d: Destination(url='zfs:bk' if d in local else 'https://h.example:8443') for d in destinations}
+        config = BackupConfig(
+            datasets=[DatasetConfig(
+                name='pool/data', remote=[RemoteDatasetConfig(destination=d) for d in destinations])],
+            destinations=urls,
+        )
+        worker = RemoteBackupWorker(config, stop or StopFlag(), status_dir=sdir)
+        worker._status = StatusWriter(sdir, 'remote-backup-worker')
+        worker._remote_manager = MagicMock(name='RemoteBackupManager')
+        worker._local_manager = MagicMock(name='LocalBackupManager')
+        for sender in (worker._remote_manager, worker._local_manager):
+            sender.backup_dataset.return_value = True
+            sender.last_problem.return_value = None
+        manager = MagicMock(name='manager')
+        manager.config = config
+        manager.get_anchor.return_value = None
+        dsi = SimpleNamespace(name='pool/data', config=config.datasets[0])
+        return worker, manager, dsi
+
+    @staticmethod
+    def records(sdir):
+        status = read_worker_status(sdir, 'remote-backup-worker')
+        return {} if status is None else {r.key: r for r in status.records}
+
+    @staticmethod
+    def sent_to(sender):
+        return [call.args[1].destination for call in sender.backup_dataset.call_args_list]
+
+    @staticmethod
+    def failing(destination, error=RuntimeError('boom')):
+        def backup(dsi, remote_cfg, should_stop=None):
+            if remote_cfg.destination == destination:
+                raise error
+            return True
+        return backup
+
+    def test_the_destination_after_a_failed_one_is_still_sent(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
+        worker._process_dataset(manager, dsi)
+        assert self.sent_to(worker._remote_manager) == ['d1', 'd2']
+
+    def test_the_failure_is_recorded_against_its_own_destination_and_the_other_succeeds(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        recs = self.records(sdir)
+        assert recs[('send', 'pool/data', 'd1')].result == 'error'
+        assert recs[('send', 'pool/data', 'd1')].last_error == 'RuntimeError: boom'
+        assert recs[('send', 'pool/data', 'd2')].result == 'ok'
+
+    def test_nothing_propagates_to_the_loop(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
+        assert worker._process_dataset(manager, dsi) is None
+
+    def test_consecutive_failures_accumulate_across_cycles(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
+        for _ in range(3):
+            worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        recs = self.records(sdir)
+        assert recs[('send', 'pool/data', 'd1')].consecutive_failures == 3
+        assert recs[('send', 'pool/data', 'd2')].consecutive_failures == 0
+
+    def test_a_later_success_resets_the_count(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
+        worker._process_dataset(manager, dsi)
+        worker._remote_manager.backup_dataset.side_effect = None
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        assert self.records(sdir)[('send', 'pool/data', 'd1')].consecutive_failures == 0
+
+    def test_one_error_with_a_traceback_names_the_dataset_and_the_destination(self, sdir, caplog):
+        worker, manager, dsi = self.rig(sdir)
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
+            worker._process_dataset(manager, dsi)
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert 'error on pool/data -> d1: boom' in errors[0].getMessage()
+        assert errors[0].exc_info is not None and errors[0].exc_info[0] is RuntimeError
+
+    def test_each_outcome_is_written_before_the_next_destination_begins(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+        seen = []
+
+        def backup(dsi_, remote_cfg, should_stop=None):
+            if remote_cfg.destination == 'd1':
+                raise RuntimeError('boom')
+            seen.append({k: r.result for k, r in self.records(sdir).items()})
+            return True
+
+        worker._remote_manager.backup_dataset.side_effect = backup
+        worker._process_dataset(manager, dsi)
+        assert seen == [{('send', 'pool/data', 'd1'): 'error'}], 'the failure was on disk while d2 ran'
+
+    def test_a_pending_stop_after_the_failure_leaves_the_next_destination_unsent(self, sdir):
+        stop = StopFlag()
+        worker, manager, dsi = self.rig(sdir, stop=stop)
+
+        def backup(dsi_, remote_cfg, should_stop=None):
+            stop.set()
+            raise RuntimeError('boom')
+
+        worker._remote_manager.backup_dataset.side_effect = backup
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        assert self.sent_to(worker._remote_manager) == ['d1']
+        assert self.records(sdir) == {}      # ...and the stop that cut d1 short is no failure of d1 either
+
+    def test_an_exception_with_a_stop_pending_is_neither_a_success_nor_a_failure_but_is_still_logged(
+        self, sdir, caplog
+    ):
+        """As `_record_send` does for a `False`: a stop or reload cutting the work short (a killed child, a
+        closed stream) raises, and that says nothing about the destination."""
+        stop = StopFlag()
+        worker, manager, dsi = self.rig(sdir, stop=stop)
+
+        def backup(dsi_, remote_cfg, should_stop=None):
+            stop.set()
+            raise ConnectionError('stream closed')
+
+        worker._remote_manager.backup_dataset.side_effect = backup
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
+            worker._process_dataset(manager, dsi)
+        assert [r for r in caplog.records if r.levelno == logging.ERROR and 'stream closed' in r.getMessage()]
+        worker._flush_status(force=True)
+        assert self.records(sdir) == {}
+
+    def test_a_pending_reload_after_the_failure_stops_the_chain_too(self, sdir):
+        epoch = ReloadEpoch()
+        worker, manager, dsi = self.rig(sdir)
+        worker.reload_epoch, worker.born_epoch = epoch, 0
+
+        def backup(dsi_, remote_cfg, should_stop=None):
+            epoch.set(1)
+            raise RuntimeError('boom')
+
+        worker._remote_manager.backup_dataset.side_effect = backup
+        worker._process_dataset(manager, dsi)
+        assert self.sent_to(worker._remote_manager) == ['d1']
+
+    def test_three_destinations_the_middle_one_fails(self, sdir):
+        worker, manager, dsi = self.rig(sdir, destinations=('d1', 'd2', 'd3'))
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d2')
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        assert self.sent_to(worker._remote_manager) == ['d1', 'd2', 'd3']
+        recs = self.records(sdir)
+        assert [recs[('send', 'pool/data', d)].result for d in ('d1', 'd2', 'd3')] == ['ok', 'error', 'ok']
+
+    def test_the_anchor_read_failing_for_one_destination_is_isolated_too(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+
+        def get_anchor(dsi_, destination):
+            if destination == 'd1':
+                raise OSError('cannot read the anchor')
+            return None
+
+        manager.get_anchor.side_effect = get_anchor
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        assert self.sent_to(worker._remote_manager) == ['d2']
+        assert self.records(sdir)[('send', 'pool/data', 'd1')].last_error == 'OSError: cannot read the anchor'
+
+    def test_a_failing_local_destination_does_not_stop_the_remote_one(self, sdir):
+        worker, manager, dsi = self.rig(sdir, destinations=('usb', 'off'), local=('usb',))
+        worker._local_manager.backup_dataset.side_effect = RuntimeError('target is gone')
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        assert self.sent_to(worker._local_manager) == ['usb'] and self.sent_to(worker._remote_manager) == ['off']
+        recs = self.records(sdir)
+        assert recs[('send', 'pool/data', 'usb')].last_error == 'RuntimeError: target is gone'
+        assert recs[('send', 'pool/data', 'off')].result == 'ok'
+
+    def test_a_failing_remote_destination_does_not_stop_the_local_one(self, sdir):
+        worker, manager, dsi = self.rig(sdir, destinations=('off', 'usb'), local=('usb',))
+        worker._remote_manager.backup_dataset.side_effect = ConnectionError('reset by peer')
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        assert self.sent_to(worker._local_manager) == ['usb']
+        recs = self.records(sdir)
+        assert recs[('send', 'pool/data', 'off')].last_error == 'ConnectionError: reset by peer'
+        assert recs[('send', 'pool/data', 'usb')].result == 'ok'
+
+    def test_a_local_destination_goes_to_the_local_manager_only_and_a_remote_one_to_the_remote_only(self, sdir):
+        worker, manager, dsi = self.rig(sdir, destinations=('usb', 'off'), local=('usb',))
+        worker._process_dataset(manager, dsi)
+        assert self.sent_to(worker._local_manager) == ['usb']
+        assert self.sent_to(worker._remote_manager) == ['off']
+
+    def test_an_incomplete_local_send_is_charged_with_the_local_managers_account(self, sdir):
+        worker, manager, dsi = self.rig(sdir, destinations=('usb',), local=('usb',))
+        worker._local_manager.backup_dataset.return_value = False
+        worker._local_manager.last_problem.return_value = 'the target pool is full'
+        worker._process_dataset(manager, dsi)
+        worker._flush_status(force=True)
+        worker._local_manager.last_problem.assert_called_once_with('pool/data', 'usb')
+        worker._remote_manager.last_problem.assert_not_called()
+        assert self.records(sdir)[('send', 'pool/data', 'usb')].last_error == 'the target pool is full'
+
+    def test_an_interrupt_is_not_swallowed(self, sdir):
+        worker, manager, dsi = self.rig(sdir)
+        worker._remote_manager.backup_dataset.side_effect = self.failing('d1', KeyboardInterrupt())
+        with pytest.raises(KeyboardInterrupt):
+            worker._process_dataset(manager, dsi)
+        assert self.sent_to(worker._remote_manager) == ['d1']
+
+
 class TestApiWorker:
     def test_name_and_daemon(self, worker_config):
         stop_event = multiprocessing.Event()
@@ -796,6 +1031,12 @@ EXTRA_KEYWORDS = {
     RemoteBackupWorker: ['tls_dir', 'client_id'],
 }
 
+#: The pruning worker's `client_id` (the local copies' home, 3.2) is declared
+#: after `code_signature`.
+TRAILING_KEYWORDS = {
+    PruningWorker: ['client_id'],
+}
+
 
 class TestWorkerConstructors:
     """`(config, stop_event, log_level=logging.INFO)` for every concrete
@@ -827,12 +1068,14 @@ class TestWorkerConstructors:
     def test_the_signature_is_exactly_config_stop_event_log_level(self, cls, name):
         sig = inspect.signature(cls.__init__)
         extra = EXTRA_KEYWORDS.get(cls, [])
+        trailing = TRAILING_KEYWORDS.get(cls, [])
         # `status_dir` (S-7a) comes after the reload trio, before the class extras
         # of the remote worker; the API worker has none (it records no outcomes).
         status = [] if cls is ApiWorker else ['status_dir']
         assert list(sig.parameters) == [
             'self', 'config', 'stop_event', 'log_level',
             'reload_epoch', 'born_epoch', 'workers_lock', *extra, *status, 'code_signature',
+            *trailing,
         ]
         # The reload trio is keyword-only with inert defaults, so every old
         # positional call keeps working; so are the class-specific extras (M9:
@@ -843,7 +1086,7 @@ class TestWorkerConstructors:
             assert sig.parameters[trio].default == default
         # `code_signature` (S-8) is the last: the supervisor's `version.code_signature()`,
         # `None` = no version-skew check.
-        for name_ in [*extra, *status, 'code_signature']:
+        for name_ in [*extra, *status, 'code_signature', *trailing]:
             assert sig.parameters[name_].kind is inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters[name_].default is None
 
@@ -912,11 +1155,19 @@ class TestM9WorkerArguments:
         worker = ApiWorker(worker_config, multiprocessing.Event(), config_db=sqlite_config_db)
         assert worker.config_db is sqlite_config_db
 
-    @pytest.mark.parametrize('cls', [SnapshotWorker, PruningWorker])
-    @pytest.mark.parametrize('kwarg', ['config_db', 'tls_dir', 'client_id'])
+    @pytest.mark.parametrize('cls, kwarg', [
+        (SnapshotWorker, 'config_db'), (SnapshotWorker, 'tls_dir'), (SnapshotWorker, 'client_id'),
+        (PruningWorker, 'config_db'), (PruningWorker, 'tls_dir'),
+    ])
     def test_the_local_workers_take_none_of_them(self, cls, kwarg, worker_config):
         with pytest.raises(TypeError):
             cls(worker_config, multiprocessing.Event(), **{kwarg: 'x'})
+
+    def test_the_pruning_worker_keeps_the_client_id(self, worker_config):
+        """3.2: the local copies live under `<target>/<client_id>`."""
+        worker = PruningWorker(worker_config, multiprocessing.Event(), client_id='host-1')
+        assert worker.client_id == 'host-1'
+        assert PruningWorker(worker_config, multiprocessing.Event()).client_id is None
 
     def test_the_other_classes_do_not_take_each_others(self, worker_config):
         with pytest.raises(TypeError):

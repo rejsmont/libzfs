@@ -60,8 +60,14 @@ Two settings are *paired* or *pinned*, and deliberately awkward to change:
   value is the same as `unset`. Removing or changing a pin warns, because the
   destination stops being trusted until it is enrolled again.
 
-``set destinations.N.url`` refuses ``http://`` (and any non-https URL) with the
-model's own wording (`destination_url_problem`).
+``set destinations.N.url`` takes ``https://HOST[:PORT]`` (a remote server) or
+``zfs:<dataset>`` (a dataset on this host: a local destination, no server) and
+refuses anything else, ``http://`` included, with the model's own wording
+(`destination_problem`). It may switch a destination between the two kinds,
+but not while a ``server_fingerprint`` is set (a local destination has no
+server: `unset` the fingerprint first). Changing a local target, or the kind,
+warns that the next send is a full send and that the copies under the old
+target are orphaned.
 
 ``datasets.N.remote.D.raw`` is ``true``, ``false`` or ``auto``; ``auto`` (and
 `unset`) stores nothing, meaning "raw if and only if the dataset is encrypted".
@@ -90,8 +96,8 @@ from zfsbackup.cli.errors import CliError
 from zfsbackup.cli.render import duration_literal, render_yaml
 from zfsbackup.config.store import destination_name_problem  # noqa: F401 - re-exported
 from zfsbackup.config import (
-    BackupConfig, DatasetConfig, Duration, RemoteDatasetConfig, RetentionRule,
-    destination_url_problem,
+    BackupConfig, DatasetConfig, Destination, Duration, RemoteDatasetConfig, RetentionRule,
+    destination_problem,
 )
 
 __all__ = [
@@ -99,11 +105,13 @@ __all__ = [
     "NOT_SET",
     "PathError",
     "compact",
+    "destination_change_warnings",
     "destination_name_problem",
     "format_path",
     "prefix_change_warnings",
     "get_lines",
     "pin_change_warnings",
+    "url_change_warnings",
     "raw_change_warnings",
     "kind_of",
     "parse_dict",
@@ -602,7 +610,8 @@ def get_lines(config: BackupConfig, segs: Segs) -> List[str]:
     if kind == "destination_url":
         return [config.destinations[segs[1]].url]
     if kind == "destination_fingerprint":
-        return [config.destinations[segs[1]].server_fingerprint or NOT_ENROLLED]
+        dest = config.destinations[segs[1]]
+        return [dest.server_fingerprint or (NOT_APPLICABLE if dest.is_local else NOT_ENROLLED)]
     if kind in ("server", "server_field"):
         server = config.remote_backup
         if server is None:
@@ -624,6 +633,7 @@ def _dataset_entry(config: BackupConfig, name: str) -> Dict[str, Any]:
 
 NOT_SET = "(not set)"
 NOT_ENROLLED = "not enrolled"
+NOT_APPLICABLE = "not applicable (local destination)"
 
 
 def compact(config: BackupConfig, segs: Segs) -> str:
@@ -832,6 +842,68 @@ def pin_change_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
     return messages
 
 
+def _copies_path(target: str, client_id: Optional[str]) -> str:
+    """Where this host's copies live under a local `target`:
+    `<target>/<client id>/` (the id is not known to every caller)."""
+    return f"{target}/{client_id or '<client id>'}/"
+
+
+def destination_change_warnings(
+    name: str, old: Destination, new: Destination, client_id: Optional[str] = None
+) -> List[str]:
+    """Warnings for a destination whose URL changed, when a local (`zfs:`)
+    destination is on either side. A copy's place is the target plus this
+    host's client id, so a different target holds no copy: the next send to it
+    is a FULL send, and the copies under the old target are orphaned (nothing
+    sends to, prunes-to-rules or tracks them any more; they stay until
+    destroyed or renamed by hand). https-to-https changes are the enrollment
+    warning's business."""
+    if old.url == new.url or not (old.is_local or new.is_local):
+        return []
+    where = f"destinations[{name}]"
+    messages: List[str] = []
+    if old.is_local:
+        old_path = _copies_path(old.target_dataset, client_id)
+        tail = (
+            f"existing copies under {old_path} are orphaned: they are no longer sent to, "
+            "and stay until you destroy or `zfs rename` them"
+        )
+        if new.is_local:
+            messages.append(
+                f"{where} changes its local target from {old.target_dataset!r} to "
+                f"{new.target_dataset!r}: the next send to it is a full send (the new target "
+                f"holds no copy), and {tail}"
+            )
+        else:
+            messages.append(
+                f"{where} changes from the local target {old.target_dataset!r} to the "
+                f"server {new.url}: the next send to it is a full send, and {tail}"
+            )
+    else:
+        messages.append(
+            f"{where} changes from the server {old.url} to the local target "
+            f"{new.target_dataset!r}: the next send to it is a full send into "
+            f"{_copies_path(new.target_dataset, client_id)}, and the copies already on the "
+            "server are no longer updated (they stay there until its operator removes them)"
+        )
+    return messages
+
+
+def url_change_warnings(
+    old: BackupConfig, new: BackupConfig, client_id: Optional[str] = None
+) -> List[str]:
+    """`destination_change_warnings` for every destination present in both."""
+    messages: List[str] = []
+    for name in sorted(old.destinations):
+        if name in new.destinations:
+            messages.extend(
+                destination_change_warnings(
+                    name, old.destinations[name], new.destinations[name], client_id
+                )
+            )
+    return messages
+
+
 def _raw_text(raw: Optional[bool]) -> str:
     return "auto" if raw is None else ("true" if raw else "false")
 
@@ -882,7 +954,9 @@ _RECEIVE_WARNING = (
 
 def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
     """Set the setting at `segs` to `text` (read as YAML). `PathError` /
-    `ValueError` leave nothing changed -- this returns a new object."""
+    `ValueError` leave nothing changed -- this returns a new object. (A
+    destination changing kind or local target is warned about by the caller
+    with `url_change_warnings`, which needs this host's client id.)"""
     kind = kind_of(segs)
     path = format_path(segs)
     if kind in _MEMBERSHIP_KINDS:
@@ -961,8 +1035,17 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
         scope = segs[:5]
     elif kind == "destination_url":
         _require_text(value, path, text)
+        old_dest = config.destinations[segs[1]]
         if isinstance(value, str):
-            problem = destination_url_problem(value.strip())
+            candidate = Destination(url=value.strip(), server_fingerprint=old_dest.server_fingerprint)
+            if candidate.is_local and not old_dest.is_local and old_dest.server_fingerprint:
+                raise PathError(
+                    f"destinations[{segs[1]}] is enrolled with a server (it has a "
+                    f"server_fingerprint), and {candidate.url!r} is a local destination, which "
+                    "has no server. Nothing was changed. Unset the fingerprint first: "
+                    f"`zfsbackup-config unset {format_path(('destinations', segs[1], 'server_fingerprint'))}`"
+                )
+            problem = destination_problem(candidate)
             if problem:
                 raise PathError(f"destinations[{segs[1]}]: {problem}")
         data["destinations"][segs[1]]["url"] = value
@@ -979,6 +1062,11 @@ def set_value(config: BackupConfig, segs: Segs, text: str) -> Change:
         fingerprint = text.strip()
         if len(fingerprint) >= 2 and fingerprint[0] == fingerprint[-1] and fingerprint[0] in "'\"":
             fingerprint = fingerprint[1:-1].strip()
+        if fingerprint and config.destinations[segs[1]].is_local:
+            raise PathError(
+                f"destination {segs[1]!r} is local ({config.destinations[segs[1]].url}): "
+                "it has no server, so it has no server_fingerprint. Nothing was changed."
+            )
         if fingerprint:
             data["destinations"][segs[1]]["server_fingerprint"] = fingerprint
         else:

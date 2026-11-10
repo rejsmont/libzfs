@@ -65,7 +65,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import click
 import yaml
@@ -82,6 +82,7 @@ from zfsbackup.cli.write import (
     commit_config,
     notify_daemon,
     read_snapshot,
+    release_database,
     where_flag,
 )
 from zfsbackup.config import BackupConfig
@@ -96,6 +97,7 @@ from zfsbackup.config.store import (
     check_config_schema,
     check_migration_packaging,
     dispose_all,
+    ensure_client_id,
     import_yaml,
     read_config,
     resolve_config_path,
@@ -590,9 +592,16 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
             exc.add_note(_REPLACE_NOTE)
         raise
 
+    try:
+        new_id, generation, store_id = _client_id_after_import(state, resolved, yaml_file, result)
+    except BaseException as exc:
+        # The import is committed whatever happened here: one reload request
+        # for it, then the error.
+        begin_reload(resolved, result.generation, result.store_id)
+        raise
     # The import is committed: ask the daemon to reload BEFORE printing
     # anything, so a closed stdout cannot cost the signal.
-    request = begin_reload(resolved, result.generation, result.store_id)
+    request = begin_reload(resolved, generation, store_id)
     where = resolved.resolved_path
     if result.created:
         click.echo(f"Imported {yaml_file} into new database {where}.")
@@ -612,7 +621,76 @@ def import_cmd(yaml_file: Path, no_backup: bool, config_path: Optional[str], ver
         )
         click.echo(f"Imported {yaml_file} into {where}.")
     click.echo(f"Schema revision: {result.head_revision}")
-    notify_daemon(resolved, result.generation, result.store_id, request=request)
+    if new_id is not None:
+        click.echo(f"generated this host's client id: {new_id}")
+    notify_daemon(resolved, generation, store_id, request=request)
+
+
+def _client_id_after_import(
+    state: "State", resolved: ResolvedConfigPath, yaml_file: Path, result: Any
+) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    """A local (`zfs:`) destination keeps its copies under `<target>/<client
+    id>/`, so an import that brings one to a store with no client id generates
+    the id (`ensure_client_id`: its own writer-lock hold and transaction, one
+    generation bump, nothing written when an id exists; `import` otherwise
+    keeps whatever id there is). The import itself is a full replace with no
+    compare-and-swap basis, so nothing here can conflict with an edit. What
+    decides is the COMMITTED configuration (`read_snapshot` after the import):
+    the file is never read a second time (it may be a FIFO or `/dev/stdin`,
+    and a file that changed since is not what was stored). An import without a
+    local destination, or into a store that has an id, does no further write.
+    -> `(generated id or None, generation, store_id)`: the reload key of the
+    LAST committed write. A failure carries a note that says what is true: the
+    import is committed, and the client id is mentioned only when the stored
+    configuration has a local destination (or could not be read to tell)."""
+    muted = state.handler is not None
+    if muted:
+        state.handler.muted = True  # the import already showed the file's warnings
+    try:
+        try:
+            committed = read_snapshot(resolved)
+        finally:
+            if muted:
+                state.handler.muted = False
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            exc.add_note(
+                "the import itself was committed, but it could not be read back to check "
+                "whether this host needs a client id; if the imported configuration has a "
+                "local (`zfs:`) destination the daemon will warn until this host has one "
+                "(`zfsbackup-config identity set-client-id ID`, or re-run `import`)"
+            )
+        raise
+    needs_id = committed.client_id is None and any(
+        d.is_local for d in committed.config.destinations.values()
+    )
+    if not needs_id:
+        return None, result.generation, result.store_id
+    try:
+        try:
+            client_id, created = ensure_client_id(resolved, lock=None)
+        finally:
+            release_database()
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            exc.add_note(
+                "the import itself was committed; the imported configuration has a local "
+                "destination, so the daemon will warn until this host has a client id "
+                "(`zfsbackup-config identity set-client-id ID`, or re-run `import`)"
+            )
+        raise
+    if not created:
+        return None, result.generation, result.store_id
+    if muted:
+        state.handler.muted = True
+    try:
+        after = read_snapshot(resolved)  # the exact key of what is stored now
+    except Exception:  # noqa: BLE001 - the id IS stored; reload without a key
+        return client_id, None, None
+    finally:
+        if muted:
+            state.handler.muted = False
+    return client_id, after.generation, after.store_id
 
 
 def _exists(path: Path) -> bool:
@@ -1048,7 +1126,11 @@ def list_datasets_cmd(
 
 @list_group.command(
     "destinations",
-    help="One row per destination, by name: its URL and the datasets that send to it.",
+    help=(
+        "One row per destination, by name: its kind (remote = an https:// server, "
+        "local = a zfs:<dataset> on this host), its URL, whether a server is "
+        "enrolled and the datasets that send to it."
+    ),
 )
 @_JSON_OPTION
 @click.option(
@@ -1153,6 +1235,10 @@ def _edit(
     segs = dotpath.resolve(path, config)
     change = apply(config, segs)
     for message in change.warnings:
+        state.warn(message)
+    # A destination that changed kind or local target: worded with this host's
+    # client id (the copies' real path), which only the snapshot knows.
+    for message in dotpath.url_change_warnings(config, change.config, snapshot.client_id):
         state.warn(message)
 
     shown = change.scope or segs

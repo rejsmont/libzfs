@@ -399,11 +399,49 @@ def _not_regular(*paths) -> Optional[str]:
 ADVISORY_IDENTITY_LOCK_TIMEOUT = 0.5
 
 
-def _remote_destinations(config: BackupConfig) -> List[str]:
-    """The destination names the enabled datasets send to, sorted."""
+def _used_destination_names(config: BackupConfig) -> List[str]:
+    """Every destination name the enabled datasets send to, sorted."""
     return sorted({
         r.destination for ds in config.enabled_datasets for r in (ds.remote or [])
     })
+
+
+def _is_local_destination(config: BackupConfig, name: str) -> bool:
+    """Whether destination `name` is a `zfs:<dataset>` one (an undeclared
+    name is not: it is neither, and `from_file` refuses it)."""
+    dest = config.destinations.get(name)
+    return dest is not None and dest.is_local is True
+
+
+def _remote_destinations(config: BackupConfig) -> List[str]:
+    """The https destination names the enabled datasets send to, sorted:
+    the ones that need a client certificate and an enrollment. A local
+    (`zfs:`) destination is not among them."""
+    return [
+        n for n in _used_destination_names(config)
+        if not _is_local_destination(config, n)
+    ]
+
+
+def _local_destinations(config: BackupConfig) -> List[str]:
+    """The local (`zfs:<dataset>`) destination names the enabled datasets
+    send to, sorted."""
+    return [
+        n for n in _used_destination_names(config)
+        if _is_local_destination(config, n)
+    ]
+
+
+#: Starts every `_client_tls_problem` message about local destinations; the
+#: reporters (`_problem_label`) then do not call it a "remote backup" problem.
+_LOCAL_PROBLEM_PREFIX = 'local destination(s) '
+
+
+def _problem_label(problem: str) -> str:
+    """The prefix a `_client_tls_problem` message is logged under: `remote
+    backup: ` for the https ones (unchanged), nothing for a local-destination
+    one, whose own wording already says what it is about."""
+    return '' if problem.startswith(_LOCAL_PROBLEM_PREFIX) else 'remote backup: '
 
 
 def _client_tls_problem(
@@ -418,9 +456,12 @@ def _client_tls_problem(
     Never a refusal, never creates anything: remote backup is the only thing
     affected -- the remote worker skips a destination it cannot use (M11) --
     so callers WARN and accept the configuration. `([], None)` when no
-    enabled dataset has a remote destination.
+    enabled dataset has a remote destination. A local (`zfs:<dataset>`)
+    destination needs only a client id: with only local destinations nothing
+    about the client certificate or enrollment is checked or returned.
 
-    Checked: a client id exists (`enroll` generates it); the client
+    Checked: a client id exists (`enroll` generates it, and so does the CLI
+    on the write that adds the first local destination); the client
     certificate and key (`_client_identity_paths`) load as a `clientAuth`
     identity -- readable, matching, unexpired, usable EKU -- and do not
     expire within `CLIENT_CERT_EXPIRY_WARN_DAYS`; every destination in use
@@ -430,6 +471,20 @@ def _client_tls_problem(
     if not _remote_worker_needed(config):
         return [], None
     problems: List[str] = []
+    local = _local_destinations(config)
+    if local and client_id is None:
+        # The copies live under `<target>/<client id>/`, so a local
+        # destination cannot be used without one.
+        problems.append(
+            f"{_LOCAL_PROBLEM_PREFIX}{', '.join(local)} need a client id (the "
+            "copies are stored under <target>/<client id>/) and this host has "
+            "none yet, so backups to them are skipped; the next "
+            "`zfsbackup-config` write that changes the configuration creates "
+            "one, or run `zfsbackup-config identity set-client-id ID`"
+        )
+    if not _remote_destinations(config):
+        # Only local destinations: no certificate, no enrollment.
+        return problems, None
     if client_id is None:
         problems.append(
             "this host has no client id yet; run `zfsbackup-config enroll "
@@ -487,6 +542,7 @@ def _tls_inputs(config: BackupConfig, client_id: Optional[str]) -> tuple:
             (name, getattr(config.destinations.get(name), 'server_fingerprint', None))
             for name in _remote_destinations(config)
         ),
+        tuple(_local_destinations(config)),
     )
 
 
@@ -577,7 +633,7 @@ def _candidate_warnings(
         return []
     problems, _ = _client_tls_problem(config, client_id, tls)
     return [
-        f"remote backup: {problem}; local snapshots and pruning are unaffected"
+        f"{_problem_label(problem)}{problem}; local snapshots and pruning are unaffected"
         for problem in problems
     ]
 
@@ -1061,13 +1117,17 @@ class BackupDaemon:
         # The client id rides the same `Handoff` (a changed id is a reload,
         # never a separate value read here). The API worker gets the database
         # path for its TLS identity and trust view only; the remote worker
-        # gets the TLS directory (its default client identity) and the id.
+        # gets the TLS directory (its default client identity) and the id;
+        # the pruning worker gets the id alone (its local copies' home).
         h = self._handoff
         extra = {}
         if name == 'api':
             extra['config_db'] = self.resolved_config
         elif name == 'remote':
             extra['tls_dir'] = _tls_dir(self.resolved_config)
+            extra['client_id'] = h.client_id
+        elif name == 'pruning':
+            # Only for the local copies' home (`<target>/<client_id>`).
             extra['client_id'] = h.client_id
         if name != 'api':
             # The outcome files (S-7): the API worker has no per-dataset
@@ -3269,7 +3329,7 @@ def _report_client_tls(
         )
     for problem in problems:
         logger.warning(
-            f"configuration generation {generation}: remote backup: {problem}; "
+            f"configuration generation {generation}: {_problem_label(problem)}{problem}; "
             "local snapshots and pruning are unaffected"
         )
 

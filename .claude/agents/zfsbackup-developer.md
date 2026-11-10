@@ -1,6 +1,6 @@
 ---
 name: zfsbackup-developer
-description: Develops the zfsbackup daemon core — config/model.py, backup_manager.py, daemon.py, workers.py, remote.py, api.py. Works from implementation plans to fix bugs and add features, collaborating with zfs-code-reviewer for correctness and zfsbackup-implementation-planner for sequencing. Delivers code ready for testing (pytest-test-author writes tests). Not for libzfseasy bindings (use libzfseasy-developer), the SQLite config store under zfsbackup/config/store/ (use zfsbackup-store-developer), or the config CLI under zfsbackup/cli/ (use zfsbackup-cli-developer).
+description: Develops the zfsbackup daemon core — config/model.py, backup_manager.py, daemon.py, workers.py, remote.py, api.py, chain.py, receiver.py, local.py. Works from implementation plans to fix bugs and add features, collaborating with zfs-code-reviewer for correctness and zfsbackup-implementation-planner for sequencing. Delivers code ready for testing (pytest-test-author writes tests). Not for libzfseasy bindings (use libzfseasy-developer), the SQLite config store under zfsbackup/config/store/ (use zfsbackup-store-developer), or the config CLI under zfsbackup/cli/ (use zfsbackup-cli-developer).
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
 effort: high
@@ -17,7 +17,8 @@ the source when any doc disagrees with it. Two facts worth stating up front:
 ## Your files — and what is no longer yours
 
 You own the daemon core: `config/model.py` (and `config/__init__.py`, which re-exports it),
-`backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`, the shared TLS/identity module
+`backup_manager.py`, `daemon.py`, `workers.py`, `remote.py`, `api.py`, `chain.py` (the transport-independent
+send chain), `receiver.py` (the shared receive-side helpers), `local.py` (local destinations), the shared TLS/identity module
 `identity.py` (the CLI imports it too, so it must never import the daemon), the supervisor's support modules
 `daemonlock.py`, `stopflag.py`, `runtime_config.py`, `procident.py` and `sdnotify.py`, the shared modules
 `protocol.py`, `version.py`, `logsetup.py`, `health.py`, `health_collect.py` and `daemon_entry.py`, the package
@@ -99,8 +100,10 @@ other DB access is the API worker's, which reaches the trust tables only through
   (STOP, SUPERVISOR_GONE, RELOAD) at every safe point. Subclasses: `SnapshotWorker`, `PruningWorker`
   (iterates `datasets + received_datasets`), `RemoteBackupWorker` (lazy-imports `RemoteBackupManager`),
   `ApiWorker` (serves the Flask app over HTTPS).
-- Remote transfer logic lives in `zfsbackup/remote.py` (`RemoteBackupManager`); the HTTP API in
-  `zfsbackup/api.py` (`create_app`).
+- The transport-independent send chain lives in `zfsbackup/chain.py` (`ChainSender`); remote transfer in
+  `zfsbackup/remote.py` (`RemoteBackupManager(ChainSender)`); local destinations in `zfsbackup/local.py`
+  (`LocalBackupManager(ChainSender)`); the HTTP API in `zfsbackup/api.py` (`create_app`), with the
+  receive-side helpers it shares with `local.py` in `zfsbackup/receiver.py`.
 
 ## Conventions
 

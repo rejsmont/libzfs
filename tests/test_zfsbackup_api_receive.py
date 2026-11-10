@@ -42,10 +42,14 @@ from test_zfsbackup_api import (  # noqa: F401  (Stream: a harness, not a test; 
     source_props, stored_config,
 )
 from _stream_support import (
-    FILESYSTEM_FORCED, HEADER, expected_receive_argv, get_value_answers, incremental_header, stream_script,
+    FILESYSTEM_FORCED, HEADER, VOLUME_FORCED, VOLUME_HEADER, capture_header, expected_receive_argv,
+    get_value_answers, incremental_header, make_header, stream_script,
 )
 from _api_support import Authed, pending_api, pending_configs
+import zfsbackup.api as api
+from libzfseasy import ZFSTimeoutError
 from libzfseasy.types import Dataset
+from libzfseasy.zfs import PropertySource, _timeout_var
 from zfsbackup.api import SERVER_OWNED_PROPERTIES, canonical_dataset_config
 from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG, PROP_SOURCE_DATASET
 
@@ -466,6 +470,354 @@ class TestNoStampAfterAFailedReceive:
         stream.run("resume")
         stream.set.assert_not_called()
         stream.receive.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A RAW stream: the forced properties are made local after the receive
+# ---------------------------------------------------------------------------
+
+#: What the real senders write (OpenZFS 2.1.5 captures): a raw filesystem / raw volume.
+RAW_HEADER = make_header("filesystem", versioninfo=0x5080011)
+RAW_VOLUME_HEADER = make_header("volume", versioninfo=0x5080001)
+
+
+def local(props, ds=SERVER_DS):
+    return [PropertySource(ds, p, "local") for p in props]
+
+
+class FakeBudgetClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class TestRawStreamEnforcesForcedProperties:
+    """OpenZFS 2.1 skips `-o sharesmb=off` on a RAW receive and exits 0: after `writer.close()` the
+    server reads which forced properties are local (`zfs get -s local`, no values) and `zfs set`s the
+    others, under the claim, with a fresh request budget, before the claim is released and `ok` sent.
+    Plain streams run no `zfs` call there (the tests above)."""
+
+    def record(self, stream):
+        stream.writer.write.side_effect = lambda d: stream.order.append("write")
+        stream.writer.close.side_effect = lambda: stream.order.append("close")
+        stream.ws.send.side_effect = lambda m: stream.order.append(("send", json.loads(m)))
+
+    def raw(self, stream, header=RAW_HEADER, mode="resume", **kw):
+        stream.ws.receive.side_effect = stream_script(b"chunk", header=header)
+        stream.run(mode, **kw)
+
+    # -- the three outcomes ------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("mode", ["fresh", "resume"])
+    def test_every_forced_property_local_reads_once_and_sets_nothing(self, stream, mode, caplog):
+        self.record(stream)
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.api"):
+            self.raw(stream, mode=mode)
+        assert stream.order == ["get", "receive", "write", "write", "close", "sources",
+                                ("send", {"status": "ok"})]
+        (call,) = stream.sources.call_args_list
+        assert str(call.args[0]) == SERVER_DS
+        assert call.kwargs == {"sources": "local"}
+        stream.set.assert_not_called()
+        assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+
+    @pytest.mark.parametrize("mode", ["fresh", "resume"])
+    def test_sharesmb_missing_is_set_to_off_and_nothing_else(self, stream, mode, caplog):
+        self.record(stream)
+        stream.sources.side_effect = lambda ds, **kw: local(p for p in FILESYSTEM_FORCED if p != "sharesmb")
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            self.raw(stream, mode=mode)
+        assert stream.order == ["get", "receive", "write", "write", "close", "set",
+                                ("send", {"status": "ok"})]
+        (call,) = stream.set.call_args_list
+        assert str(call.args[0]) == SERVER_DS
+        assert call.args[1] == {"sharesmb": "off"}
+        infos = [r for r in caplog.records if r.levelno == logging.INFO and "sharesmb" in r.getMessage()]
+        assert len(infos) == 1
+        assert "sharesmb=off" in infos[0].getMessage() and SERVER_DS in infos[0].getMessage()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_order_is_close_then_read_then_set_then_ok(self, stream):
+        self.record(stream)
+        stream.sources.side_effect = lambda ds, **kw: (stream.order.append("sources"), [])[1]
+        self.raw(stream)
+        assert stream.order[stream.order.index("close"):] == [
+            "close", "sources", "set", ("send", {"status": "ok"})]
+
+    @pytest.mark.parametrize("exc", [RuntimeError("cannot read"), ZFSTimeoutError("zfs did not answer"),
+                                     OSError("zfs is gone")])
+    def test_a_failing_read_is_a_warning_and_the_stream_still_succeeds(self, stream, exc, caplog):
+        stream.sources.side_effect = exc
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            self.raw(stream)
+        assert stream.sent == [{"status": "ok"}]
+        stream.set.assert_not_called()
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        text = warnings[0].getMessage()
+        assert SERVER_DS in text and str(exc) in text and "forced properties" in text
+        assert stream.claimed == set()
+
+    def test_the_warning_is_given_once_per_episode_then_recovery_is_announced(self, stream, caplog):
+        stream.sources.side_effect = RuntimeError("zfs said no")
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.api"):
+            for _ in range(3):
+                stream.ws.receive.side_effect = stream_script(b"chunk", header=RAW_HEADER)
+                stream.run("resume")
+        assert stream.sent == [{"status": "ok"}] * 3
+        mine = [r for r in caplog.records if "forced properties" in r.getMessage()]
+        assert [r.levelno for r in mine] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+        caplog.clear()
+        stream.sources.side_effect = lambda ds, **kw: []
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            stream.ws.receive.side_effect = stream_script(b"chunk", header=RAW_HEADER)
+            stream.run("resume")
+        texts = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any("are local again" in t and SERVER_DS in t for t in texts)
+        # a new episode warns again
+        caplog.clear()
+        stream.sources.side_effect = RuntimeError("again")
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            stream.ws.receive.side_effect = stream_script(b"chunk", header=RAW_HEADER)
+            stream.run("resume")
+        assert [r.levelno for r in caplog.records if "forced properties" in r.getMessage()] == [logging.WARNING]
+
+    def test_an_episode_is_per_dataset(self, stream, caplog):
+        stream.sources.side_effect = RuntimeError("x")
+        with caplog.at_level(logging.DEBUG, logger="zfsbackup.api"):
+            for dataset in ("pool/data", "pool/other", "pool/data"):
+                stream.ws.receive.side_effect = stream_script(b"chunk", header=RAW_HEADER)
+                stream.run("resume", dataset=dataset)
+        mine = [r for r in caplog.records if "forced properties" in r.getMessage()]
+        assert [r.levelno for r in mine] == [logging.WARNING, logging.WARNING, logging.DEBUG]
+        assert "pool/data" in mine[0].getMessage() and "pool/other" in mine[1].getMessage()
+
+    @pytest.mark.parametrize("exc", [RuntimeError("permission denied"), ZFSTimeoutError("slow")])
+    def test_a_failing_set_is_a_warning_and_the_stream_still_succeeds(self, stream, exc, caplog):
+        stream.sources.side_effect = lambda ds, **kw: []
+        stream.set.side_effect = exc
+        with caplog.at_level(logging.INFO, logger="zfsbackup.api"):
+            self.raw(stream)
+        assert stream.sent == [{"status": "ok"}]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and str(exc) in warnings[0].getMessage()
+        assert not [r for r in caplog.records if r.levelno == logging.INFO and "did not apply" in r.getMessage()]
+        assert stream.claimed == set()
+
+    def test_after_a_failed_enforcement_the_next_stream_is_not_busy(self, stream):
+        stream.sources.side_effect = RuntimeError("x")
+        self.raw(stream)
+        stream.sources.side_effect = lambda ds, **kw: []
+        stream.ws.receive.side_effect = stream_script(b"chunk", header=RAW_HEADER)
+        stream.run("resume")
+        assert stream.sent == [{"status": "ok"}, {"status": "ok"}]
+        assert stream.set.call_count == 1
+
+    # -- where it runs -----------------------------------------------------------------------------
+
+    def test_it_runs_inside_the_claim_and_the_claim_is_released_before_ok(self, stream):
+        seen = {}
+        stream.sources.side_effect = lambda ds, **kw: (seen.setdefault("read", set(stream.claimed)), [])[1]
+        stream.set.side_effect = lambda ds, props: seen.setdefault("set", set(stream.claimed))
+        stream.ws.send.side_effect = lambda m: seen.setdefault("ok", set(stream.claimed))
+        self.raw(stream)
+        assert seen == {"read": {SERVER_DS}, "set": {SERVER_DS}, "ok": set()}
+
+    def test_it_runs_after_the_receive_exited_zero_not_before(self, stream):
+        stream.writer.close.side_effect = RuntimeError("cannot receive: bad stream")
+        self.raw(stream)
+        stream.sources.assert_not_called()
+        stream.set.assert_not_called()
+        assert stream.sent == [{"error": "cannot receive: bad stream"}]
+
+    def test_a_write_error_runs_nothing(self, stream):
+        stream.writer.write.side_effect = BrokenPipeError(32, "Broken pipe")
+        self.raw(stream)
+        stream.sources.assert_not_called()
+
+    def test_a_disconnect_whose_receive_failed_runs_nothing(self, stream):
+        stream.ws.receive.side_effect = [RAW_HEADER, ConnectionClosed(None, None)]
+        stream.writer.close.side_effect = RuntimeError("cannot receive: premature end of stream")
+        stream.run("resume")
+        stream.sources.assert_not_called()
+        stream.set.assert_not_called()
+        assert stream.claimed == set()
+
+    def test_a_disconnect_after_the_receive_exited_zero_still_enforces_under_the_claim(self, stream):
+        """The reaped receive exited 0 (the snapshot is committed): the properties are made local
+        whatever happened to the socket, before the claim is let go."""
+        seen = []
+        stream.ws.receive.side_effect = [RAW_HEADER, ConnectionClosed(None, None)]
+        stream.sources.side_effect = lambda ds, **kw: (seen.append(set(stream.claimed)), [])[1]
+        stream.run("resume")
+        assert seen == [{SERVER_DS}]
+        stream.set.assert_called_once()
+        assert stream.claimed == set()
+
+    def test_a_cut_session_after_the_commit_still_enforces(self, stream):
+        stream.ws.receive.side_effect = [RAW_HEADER, b"chunk", json.dumps({"done": True})]
+        stream.ws.send.side_effect = ConnectionClosed(None, None)          # gone before the ack
+        stream.run("resume")
+        stream.sources.assert_called_once()          # once: not again by the disconnect handler
+        assert stream.claimed == set()
+
+    def test_an_error_after_the_receive_exited_zero_enforces_once_before_the_error_reply(self, stream):
+        stream.ws.receive.side_effect = [RAW_HEADER, None]                  # idle timeout
+        order = []
+        stream.sources.side_effect = lambda ds, **kw: (order.append(("sources", set(stream.claimed))), [])[1]
+        stream.ws.send.side_effect = lambda m: order.append(("send", json.loads(m), set(stream.claimed)))
+        stream.run("resume")
+        assert [o[0] for o in order] == ["sources", "send"]
+        assert order[0][1] == {SERVER_DS} and order[1][2] == set()
+        assert "error" in order[1][1]
+        stream.sources.assert_called_once()
+
+    def test_a_refused_stream_runs_nothing(self, stream, source_props):
+        source_props.return_value = {PROP_SOURCE_DATASET: "tank/other"}
+        self.raw(stream)
+        stream.receive.assert_not_called()
+        stream.sources.assert_not_called()
+
+    def test_a_dry_run_runs_nothing(self, mocker):
+        s = Stream(mocker, dry_run=True)
+        self.raw(s)
+        s.sources.assert_not_called()
+        s.set.assert_not_called()
+
+    def test_a_new_dataset_is_checked_too_and_its_pending_entry_dropped_even_if_the_check_fails(self, stream):
+        stream.exists.return_value = False
+        negotiate(stream)
+        stream.sources.side_effect = RuntimeError("x")
+        self.raw(stream, mode="fresh")
+        assert stream.sent == [{"status": "ok"}]
+        stream.sources.assert_called_once()
+        assert dict(pending_configs(stream.app)) == {}
+
+    # -- the budget --------------------------------------------------------------------------------
+
+    def test_the_calls_run_under_a_libzfseasy_timeout(self, stream):
+        limits = []
+        stream.sources.side_effect = lambda ds, **kw: (limits.append(_timeout_var.get()), [])[1]
+        stream.set.side_effect = lambda ds, props: limits.append(_timeout_var.get())
+        self.raw(stream)
+        assert len(limits) == 2 and all(l is not None for l in limits)
+
+    def test_the_budget_is_fresh_whatever_the_receive_took(self, stream, mocker):
+        """The receive may run for hours: a budget made before it would be spent."""
+        clock = FakeBudgetClock()
+        real = api.ZFSBudget
+        mocker.patch("zfsbackup.api.ZFSBudget", lambda *a, **k: real(*a, clock=clock, **k))
+        stream.writer.write.side_effect = lambda d: setattr(clock, "now", clock.now + 100_000)
+        stream.sources.side_effect = lambda ds, **kw: []
+        self.raw(stream)
+        stream.sources.assert_called_once()
+        stream.set.assert_called_once()
+        assert stream.sent == [{"status": "ok"}]
+
+    def test_the_two_calls_share_one_budget(self, stream, mocker):
+        clock = FakeBudgetClock()
+        real = api.ZFSBudget
+        mocker.patch("zfsbackup.api.ZFSBudget", lambda *a, **k: real(*a, clock=clock, **k))
+        mocker.patch("zfsbackup.api.ZFS_REQUEST_BUDGET", 30.0)
+
+        def read(ds, **kw):
+            clock.now += 31
+            return []
+
+        stream.sources.side_effect = read
+        self.raw(stream)
+        stream.set.assert_not_called()                       # the budget was spent by the read
+        assert stream.sent == [{"status": "ok"}]
+
+    def test_a_timeout_is_a_warning_not_a_zfs_timeout_reply(self, stream, caplog):
+        stream.sources.side_effect = ZFSTimeoutError("zfs did not answer in 15 s")
+        with caplog.at_level(logging.WARNING, logger="zfsbackup.api"):
+            self.raw(stream)
+        assert stream.sent == [{"status": "ok"}]
+        assert "zfs_timeout" not in json.dumps(stream.sent)
+
+    # -- raw volume --------------------------------------------------------------------------------
+
+    def test_a_raw_volume_with_its_set_local_sets_nothing(self, stream):
+        stream.type = "volume"
+        stream.sources.side_effect = lambda ds, **kw: local(VOLUME_FORCED)
+        self.raw(stream, RAW_VOLUME_HEADER)
+        stream.sources.assert_called_once()
+        stream.set.assert_not_called()
+        assert stream.sent == [{"status": "ok"}]
+
+    def test_a_raw_volume_missing_readonly_sets_only_readonly(self, stream):
+        stream.type = "volume"
+        stream.sources.side_effect = lambda ds, **kw: local(["volmode"])
+        self.raw(stream, RAW_VOLUME_HEADER)
+        (call,) = stream.set.call_args_list
+        assert call.args[1] == {"readonly": "on"}
+
+    def test_a_raw_volume_never_gets_a_filesystem_property(self, stream):
+        stream.type = "volume"
+        stream.sources.side_effect = lambda ds, **kw: []
+        self.raw(stream, RAW_VOLUME_HEADER)
+        (call,) = stream.set.call_args_list
+        assert call.args[1] == VOLUME_FORCED
+        assert "sharesmb" not in call.args[1]
+
+    # -- real captures -----------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("version", ["2.1.5", "2.2.2", "2.3.9", "2.4.1"])
+    @pytest.mark.parametrize("name, raw", [("raw_full", True), ("plain_full", False),
+                                           ("volume_raw_full", True), ("volume_full", False),
+                                           ("resume_raw_full", True), ("resume_plain_full", False)])
+    def test_the_real_captures_decide_whether_anything_is_read(self, stream, version, name, raw):
+        stream.type = "volume" if name.startswith("volume") else "filesystem"
+        self.raw(stream, capture_header(version, name))
+        assert stream.sent == [{"status": "ok"}]
+        assert stream.sources.called is raw
+
+    # -- plain streams -----------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("header", [HEADER, VOLUME_HEADER], ids=["filesystem", "volume"])
+    @pytest.mark.parametrize("mode", ["fresh", "resume"])
+    def test_a_plain_stream_reads_and_sets_nothing_after_the_receive(self, stream, header, mode):
+        stream.type = "volume" if header is VOLUME_HEADER else "filesystem"
+        self.raw(stream, header, mode)
+        assert stream.sent == [{"status": "ok"}]
+        stream.sources.assert_not_called()
+        stream.set.assert_not_called()
+        stream.create.assert_not_called()
+
+    def test_a_plain_stream_succeeds_even_if_the_check_would_fail(self, stream):
+        stream.sources.side_effect = RuntimeError("never called")
+        stream.set.side_effect = RuntimeError("never called")
+        self.raw(stream, HEADER)
+        assert stream.sent == [{"status": "ok"}]
+
+    # -- nothing else is stamped -------------------------------------------------------------------
+
+    def test_a_raw_stream_still_creates_nothing(self, stream):
+        stream.sources.side_effect = lambda ds, **kw: []
+        self.raw(stream)
+        stream.create.assert_not_called()
+
+    def test_no_zfs_create_exists_on_a_raw_stream_path_and_a_set_only_when_needed(self, stream):
+        """The raw variant of `test_no_zfs_create_or_set_exists_on_any_stream_path`: the read always
+        happens, the set only for a property that is not local, and a failing set or create is not
+        the stream's."""
+        stream.create.side_effect = RuntimeError("pool is full")
+        stream.set.side_effect = RuntimeError("permission denied")
+        for mode, answer in (("fresh", FILESYSTEM_FORCED), ("resume", ["canmount"])):
+            stream.sources.side_effect = lambda ds, a=answer, **kw: local(a)
+            stream.ws.receive.side_effect = stream_script(header=RAW_HEADER)
+            stream.run(mode)
+        assert stream.sent == [{"status": "ok"}, {"status": "ok"}]
+        assert stream.sources.call_count == 2
+        assert stream.set.call_count == 1                    # only the second stream lacked properties
+        stream.create.assert_not_called()
+
+    def test_the_receive_call_is_the_same_for_a_raw_stream(self, stream):
+        self.raw(stream)
+        assert stream.receive.call_args.kwargs["props"] == RECEIVE_PROPS
 
 
 # ---------------------------------------------------------------------------

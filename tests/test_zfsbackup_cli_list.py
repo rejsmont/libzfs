@@ -5,7 +5,7 @@ Both views are read-only functions of the stored configuration. Covered:
 - ``TestListDatasets``       columns, stored order, `never` / rule count, the
                              `inherit (X)` remote frequency, durations as typed,
                              `--enabled-only`, `--json` shape and types.
-- ``TestListDestinations``   name order, URL, ENROLLED (the first 16 hex of the
+- ``TestListDestinations``   name order, KIND, URL, ENROLLED (the first 16 hex of the
                              pinned server fingerprint, or `not enrolled`),
                              referencing datasets, `--enabled-only` (counts only
                              enabled senders and hides unused destinations),
@@ -210,11 +210,11 @@ class TestListDestinations:
     def test_rows_sorted_by_name(self, run, rich):
         result = run("list", "destinations", "-c", rich)
         assert result.exit_code == 0, result.stderr
-        assert result.stdout.splitlines()[0].split() == ["NAME", "URL", "ENROLLED", "DATASETS"]
+        assert result.stdout.splitlines()[0].split() == ["NAME", "KIND", "URL", "ENROLLED", "DATASETS"]
         assert table(result)[1:] == [
-            ["dc.two", "https://dc2:8080", "not enrolled", "tank/data"],
-            ["offsite", "https://offsite:8080", "not enrolled", "tank/data"],
-            ["spare", "https://spare:8080", "not enrolled", "-"],
+            ["dc.two", "remote", "https://dc2:8080", "not enrolled", "tank/data"],
+            ["offsite", "remote", "https://offsite:8080", "not enrolled", "tank/data"],
+            ["spare", "remote", "https://spare:8080", "not enrolled", "-"],
         ]
 
     def test_sorted_by_name_not_by_file_order(self, run, db):
@@ -233,7 +233,7 @@ class TestListDestinations:
             '  - name: "tank/a"\n    remote:\n      - destination: "d"\n'
         )
         make_db(run, db, text)
-        assert table(run("list", "destinations", "-c", db))[1] == ["d", "https://d", "not enrolled", "tank/z, tank/a"]
+        assert table(run("list", "destinations", "-c", db))[1] == ["d", "remote", "https://d", "not enrolled", "tank/z, tank/a"]
 
     def test_enabled_only_counts_only_enabled_senders_and_hides_unused(self, run, db):
         text = (
@@ -247,12 +247,12 @@ class TestListDestinations:
         make_db(run, db, text)
         everything = table(run("list", "destinations", "-c", db))[1:]
         assert [r[0] for r in everything] == ["both", "only_off", "unused"]
-        assert everything[0][3] == "tank/on, tank/off"
+        assert everything[0][4] == "tank/on, tank/off"
 
         enabled = table(run("list", "destinations", "--enabled-only", "-c", db))[1:]
         # `both` now lists the enabled sender only; the destinations nothing
         # enabled sends to are hidden.
-        assert enabled == [["both", "https://both", "not enrolled", "tank/on"]]
+        assert enabled == [["both", "remote", "https://both", "not enrolled", "tank/on"]]
 
     def test_enabled_only_json(self, run, rich):
         data = json.loads(run("list", "destinations", "--enabled-only", "--json", "-c", rich).stdout)
@@ -262,10 +262,12 @@ class TestListDestinations:
         result = run("list", "destinations", "--json", "-c", rich)
         data = json.loads(result.stdout)
         assert data == [
-            {"name": "dc.two", "url": "https://dc2:8080", "server_fingerprint": None, "datasets": ["tank/data"]},
-            {"name": "offsite", "url": "https://offsite:8080", "server_fingerprint": None,
-             "datasets": ["tank/data"]},
-            {"name": "spare", "url": "https://spare:8080", "server_fingerprint": None, "datasets": []},
+            {"name": "dc.two", "kind": "remote", "url": "https://dc2:8080", "target_dataset": None,
+             "server_fingerprint": None, "datasets": ["tank/data"]},
+            {"name": "offsite", "kind": "remote", "url": "https://offsite:8080",
+             "target_dataset": None, "server_fingerprint": None, "datasets": ["tank/data"]},
+            {"name": "spare", "kind": "remote", "url": "https://spare:8080", "target_dataset": None,
+             "server_fingerprint": None, "datasets": []},
         ]
         assert result.stderr == ""
 
@@ -281,11 +283,11 @@ class TestListDestinations:
         make_db(run, db, self.PINNED_YAML)
         rows = table(run("list", "destinations", "-c", db))
         assert rows[1:] == [
-            ["dc.two", "https://dc2:8080", DIGITS_FP[:16], "tank/data"],
-            ["offsite", "https://offsite:8080", FP[:16], "tank/data"],
-            ["spare", "https://spare:8080", "not enrolled", "-"],
+            ["dc.two", "remote", "https://dc2:8080", DIGITS_FP[:16], "tank/data"],
+            ["offsite", "remote", "https://offsite:8080", FP[:16], "tank/data"],
+            ["spare", "remote", "https://spare:8080", "not enrolled", "-"],
         ]
-        assert len(rows[1][2]) == 16 and len(rows[2][2]) == 16
+        assert len(rows[1][3]) == 16 and len(rows[2][3]) == 16
 
     def test_the_text_view_never_shows_the_whole_pin(self, run, db):
         make_db(run, db, self.PINNED_YAML)
@@ -299,15 +301,17 @@ class TestListDestinations:
             ("dc.two", DIGITS_FP), ("offsite", FP), ("spare", None),
         ]
         assert isinstance(data[0]["server_fingerprint"], str)
-        assert list(data[0]) == ["name", "url", "server_fingerprint", "datasets"]
+        assert list(data[0]) == [
+            "name", "kind", "url", "target_dataset", "server_fingerprint", "datasets",
+        ]
 
     def test_enabled_only_keeps_the_enrolled_column(self, run, db):
         make_db(run, db, self.PINNED_YAML)
         rows = table(run("list", "destinations", "--enabled-only", "-c", db))
-        assert rows[0] == ["NAME", "URL", "ENROLLED", "DATASETS"]
-        assert [r[:3] for r in rows[1:]] == [
-            ["dc.two", "https://dc2:8080", DIGITS_FP[:16]],
-            ["offsite", "https://offsite:8080", FP[:16]],
+        assert rows[0] == ["NAME", "KIND", "URL", "ENROLLED", "DATASETS"]
+        assert [r[:4] for r in rows[1:]] == [
+            ["dc.two", "remote", "https://dc2:8080", DIGITS_FP[:16]],
+            ["offsite", "remote", "https://offsite:8080", FP[:16]],
         ]
 
     def test_a_colon_upper_case_pin_is_listed_normalised(self, run, db):
