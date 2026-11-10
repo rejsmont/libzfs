@@ -44,6 +44,7 @@ from zfsbackup.config.model import (
     generate_client_id,
     normalize_fingerprint,
     parse_time_duration,
+    shared_receive_target,
     validate_retention_uniqueness,
     wire_config_problem,
     # Not public, but imported across module boundaries by backup_manager
@@ -68,6 +69,7 @@ __all__ = [
     "generate_client_id",
     "normalize_fingerprint",
     "parse_time_duration",
+    "shared_receive_target",
     "validate_retention_uniqueness",
     "wire_config_problem",
 ]

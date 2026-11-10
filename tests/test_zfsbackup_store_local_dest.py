@@ -546,7 +546,6 @@ class TestTargetsDisjoint:
     @pytest.mark.parametrize(
         "local_target, remote_target, how",
         [
-            ("tank/x", "tank/x", "is the same dataset as"),
             ("tank/x/y", "tank/x", "is below"),
             ("tank", "tank/x", "is an ancestor of"),
         ],
@@ -572,7 +571,15 @@ class TestTargetsDisjoint:
         validate_config(cfg(locals_={"local": "tank/xy"}, remote_target="tank/x"))
 
     def test_an_unused_local_target_still_collides(self):
-        refused(cfg(locals_={"local": "tank/x"}, remote_target="tank/x", use=()))
+        # A nested target is refused even when no dataset sends to it: declared is enough.
+        refused(cfg(locals_={"local": "tank/x/y"}, remote_target="tank/x", use=()))
+        refused(cfg(locals_={"local": "tank"}, remote_target="tank/x", use=()))
+
+    @pytest.mark.parametrize("use", [(), ("local",)])
+    def test_a_target_equal_to_the_enabled_remote_target_is_accepted(self, use):
+        """The shared target (docs/local_destination_plan.md addendum): equality only,
+        whether or not any dataset sends to the destination."""
+        validate_config(cfg(locals_={"local": "tank/x"}, remote_target="tank/x", use=use))
 
     def test_an_https_destination_has_no_target(self):
         config = cfg(
@@ -580,6 +587,132 @@ class TestTargetsDisjoint:
             extra_destinations={"offsite": Destination(url="https://tank/x")},
         )
         validate_config(config)
+
+
+# --------------------------------------------------------------------------
+# A local target shared with the server (docs/local_destination_plan.md addendum)
+# --------------------------------------------------------------------------
+
+ONLY_THE_SERVERS_TARGET = "Only the server's target itself may be shared"
+
+
+@pytest.mark.unit
+class TestSharedTarget:
+    """A local target EQUAL to the enabled remote target is accepted; everything else stays refused.
+
+    Mutation-checked (scratch copy): removing the equal-pair `continue` in `_require_disjoint_receive_targets`
+    fails 11 tests in this file; treating nested pairs as disjoint fails 12.
+    """
+
+    def test_equal_to_the_enabled_remote_target_validates(self):
+        validate_config(cfg(locals_={"local": "tank/x"}, remote_target="tank/x", use=("local",)))
+
+    def test_a_disabled_remote_with_an_equal_target_validates(self):
+        validate_config(cfg(locals_={"local": "tank/x"}, remote_target="tank/x", remote_enabled=False))
+
+    def test_a_second_local_destination_on_the_shared_target_is_refused_as_local_local(self):
+        message = refused(
+            cfg(locals_={"one": "tank/x", "two": "tank/x"}, remote_target="tank/x")
+        )
+        assert "is the same dataset as" in message
+        assert "local destination 'one'" in message and "local destination 'two'" in message
+        assert "remote_backup" not in message
+        assert "disjoint" in message and ONLY_THE_SERVERS_TARGET not in message
+
+    def test_the_second_local_is_refused_whatever_the_declaration_order(self):
+        message = refused(
+            cfg(locals_={"zzz": "tank/x", "aaa": "tank/x"}, remote_target="tank/x")
+        )
+        assert "local destination 'zzz'" in message and "local destination 'aaa'" in message
+
+    def test_a_third_target_nested_in_the_shared_one_is_refused(self):
+        message = refused(
+            cfg(locals_={"shared": "tank/x", "inner": "tank/x/y"}, remote_target="tank/x")
+        )
+        assert "tank/x/y" in message
+
+    @pytest.mark.parametrize(
+        "local_target, how",
+        [("tank/x/y", "is below"), ("tank", "is an ancestor of")],
+    )
+    def test_nested_local_remote_refusals_carry_the_only_the_servers_target_wording(
+        self, local_target, how
+    ):
+        message = refused(cfg(locals_={"local": local_target}, remote_target="tank/x"))
+        assert how in message
+        assert ONLY_THE_SERVERS_TARGET in message
+        assert "local destination 'local'" in message and "remote_backup" in message
+
+    def test_local_local_refusals_keep_the_dedicated_and_disjoint_wording(self):
+        message = refused(cfg(locals_={"outer": "bk/a", "inner": "bk/a/b"}))
+        assert "dedicated and disjoint" in message and ONLY_THE_SERVERS_TARGET not in message
+
+    @pytest.mark.parametrize(
+        "name, recursive, ds_enabled, how",
+        [
+            pytest.param("tank/x", False, True, "is remote_backup.target_dataset", id="at"),
+            pytest.param("tank/x", False, False, "is remote_backup.target_dataset", id="at-disabled"),
+            pytest.param("tank/x/a", False, True, "is below remote_backup.target_dataset", id="below"),
+            pytest.param("tank/x/a", True, False, "is below remote_backup.target_dataset",
+                         id="below-disabled-recursive"),
+            pytest.param("tank", True, True, "remote_backup.target_dataset", id="recursively-above"),
+        ],
+    )
+    def test_a_configured_dataset_at_below_or_above_the_shared_target_is_refused(
+        self, name, recursive, ds_enabled, how
+    ):
+        message = refused(
+            cfg(name, recursive=recursive, enabled=ds_enabled,
+                locals_={"local": "tank/x"}, remote_target="tank/x")
+        )
+        assert message.startswith(f"datasets[{name}]: ") and how in message
+
+    def test_a_non_recursive_dataset_above_the_shared_target_is_allowed(self):
+        validate_config(cfg("tank", locals_={"local": "tank/x"}, remote_target="tank/x"))
+
+    def test_save_then_load_round_trips_a_shared_config(self, session):
+        config = cfg(locals_={"local": "tank/x"}, remote_target="tank/x", use=("local",))
+        save_config(session, config)
+        session.commit()
+        loaded = load_config(session)
+        assert loaded == config
+        validate_config(loaded)
+        from zfsbackup.config import shared_receive_target
+
+        assert shared_receive_target(loaded) == "tank/x"
+
+    def test_import_accepts_a_shared_target_and_export_round_trips(self, tmp_path, db):
+        source = tmp_path / "shared.yaml"
+        source.write_text(
+            overlap_yaml([("tank/data", False)], [("local", "bk/store")]).replace(
+                "destinations:", "remote_backup:\n  target_dataset: \"bk/store\"\n  enabled: true\ndestinations:", 1
+            )
+        )
+        run = Cli()
+        result = run("import", source, "-c", db)
+        assert result.exit_code == 0, result.stderr
+        dispose_all()
+        stored_config = stored(db)
+        assert stored_config.remote_backup.target_dataset == "bk/store"
+        assert stored_config.destinations["local"] == Destination(url="zfs:bk/store")
+        exported = run("export", "-c", db)
+        again = tmp_path / "again.yaml"
+        again.write_text(exported.stdout)
+        other = tmp_path / "other" / "config.db"
+        assert run("import", again, "-c", other).exit_code == 0
+        dispose_all()
+        assert stored(other) == stored_config
+
+    def test_import_refuses_a_nested_local_target_with_the_new_wording(self, tmp_path, db):
+        source = tmp_path / "nested.yaml"
+        source.write_text(
+            overlap_yaml([("tank/data", False)], [("local", "bk/store/inner")]).replace(
+                "destinations:", "remote_backup:\n  target_dataset: \"bk/store\"\n  enabled: true\ndestinations:", 1
+            )
+        )
+        result = Cli()("import", source, "-c", db)
+        assert result.exit_code == 1 and ONLY_THE_SERVERS_TARGET in result.stderr
+        assert not db.exists()
 
 
 # --------------------------------------------------------------------------

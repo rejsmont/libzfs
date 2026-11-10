@@ -263,11 +263,12 @@ class TestListDestinations:
         data = json.loads(result.stdout)
         assert data == [
             {"name": "dc.two", "kind": "remote", "url": "https://dc2:8080", "target_dataset": None,
-             "server_fingerprint": None, "datasets": ["tank/data"]},
+             "server_fingerprint": None, "datasets": ["tank/data"], "shared": False},
             {"name": "offsite", "kind": "remote", "url": "https://offsite:8080",
-             "target_dataset": None, "server_fingerprint": None, "datasets": ["tank/data"]},
+             "target_dataset": None, "server_fingerprint": None, "datasets": ["tank/data"],
+             "shared": False},
             {"name": "spare", "kind": "remote", "url": "https://spare:8080", "target_dataset": None,
-             "server_fingerprint": None, "datasets": []},
+             "server_fingerprint": None, "datasets": [], "shared": False},
         ]
         assert result.stderr == ""
 
@@ -302,8 +303,9 @@ class TestListDestinations:
         ]
         assert isinstance(data[0]["server_fingerprint"], str)
         assert list(data[0]) == [
-            "name", "kind", "url", "target_dataset", "server_fingerprint", "datasets",
+            "name", "kind", "url", "target_dataset", "server_fingerprint", "datasets", "shared",
         ]
+        assert all(isinstance(d["shared"], bool) for d in data)
 
     def test_enabled_only_keeps_the_enrolled_column(self, run, db):
         make_db(run, db, self.PINNED_YAML)
