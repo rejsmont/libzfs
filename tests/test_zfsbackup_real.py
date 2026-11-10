@@ -1165,7 +1165,7 @@ class TestRealSendReceive:
         assert e2e.cycle() is True
 
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         assert _zfs_get(e2e.source.name, f'{PROP_INFLIGHT_PREFIX}{DEST}') == '-'
 
     def test_server_dataset_is_stamped_with_its_owner(self, e2e):
@@ -1431,7 +1431,7 @@ class TestRealSendReceive:
         self._assert_replicated(e2e, s1, s2)
         assert any(f'incremental from {s1}' in m for m in e2e.log_lines())
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         assert (_zfs_get(f'{e2e.server_ds}@{s2}', 'logicalreferenced')
                 == _zfs_get(f'{e2e.source.name}@{s2}', 'logicalreferenced'))
 
@@ -1461,7 +1461,7 @@ class TestRealSendReceive:
 
         assert e2e.server_snaps() == before
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
 
     # -- resume after a killed stream ----------------------------------------
     def _kill_a_first_send(self, e2e, snapshot_hours_ago=3, data_mib=24, after=4 * MIB):
@@ -1482,7 +1482,7 @@ class TestRealSendReceive:
         assert e2e.server_snaps() == {}
         assert e2e.manager.get_anchor(e2e.dsi, DEST) is None
         # The pin survives a failed send: both ends stay protected from the pruner.
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) == ('', s1)
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) == ('', s1)
         assert any('Transfer failed' in m for m in e2e.log_lines())
 
     def test_resume_after_a_killed_stream_completes_the_snapshot(self, e2e):
@@ -1497,7 +1497,7 @@ class TestRealSendReceive:
         self._assert_replicated(e2e, s1)
         assert e2e.server_prop('receive_resume_token') == '-'
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         assert (_zfs_get(f'{e2e.server_ds}@{s1}', 'logicalreferenced')
                 == _zfs_get(f'{e2e.source.name}@{s1}', 'logicalreferenced'))
 
@@ -1514,7 +1514,7 @@ class TestRealSendReceive:
         assert set(e2e.server_snaps()) == {s1, s2}
         self._assert_replicated(e2e, s1, s2)
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
 
     def test_a_token_for_a_destroyed_snapshot_is_discarded_for_a_fresh_send(self, e2e):
         s1 = self._kill_a_first_send(e2e, snapshot_hours_ago=3)
@@ -2241,7 +2241,7 @@ class TestRealChain(_ChainTests):
 
         self.assert_on_the_server(e2e, [first] + more)
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == more[-1]
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         lines = e2e.log_lines()
         assert any(f'Sending 4 snapshots of {e2e.source.name} to {DEST}' in m for m in lines)
         for prev, name in zip([first] + more, more):

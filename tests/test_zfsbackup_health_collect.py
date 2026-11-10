@@ -902,9 +902,12 @@ class TestReadOnly:
         value_reads = batch_reads = 0
         for argv in world.calls:
             if argv[0] == 'get':
-                assert '-H' in argv and '-s' not in argv
+                assert '-H' in argv
                 columns = argv[argv.index('-o') + 1]
                 assert columns in ('value', 'name,property,value,source'), argv   # never `received`
+                if '-s' in argv:
+                    # only the dataset's OWN anchor / pin read (`get_own_*`): `-s local`, one value
+                    assert columns == 'value' and argv[argv.index('-s') + 1] == 'local', argv
                 value_reads += columns == 'value' and argv[-1].startswith(TARGET + '/')
                 batch_reads += columns != 'value'
         assert batch_reads == 1                      # the ONE batch read of the received datasets

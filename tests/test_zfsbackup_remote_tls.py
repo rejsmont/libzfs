@@ -100,8 +100,9 @@ def _no_local_zfs_property_writes(mocker):
     harmless defaults, so no test here reaches even the stub `zfs`. Tests that assert on them patch
     the instance (which wins over these class patches)."""
     mocker.patch.object(DatasetManager, "get_anchor", return_value=None)
+    mocker.patch.object(DatasetManager, "get_own_anchor", return_value=None)
     mocker.patch.object(DatasetManager, "set_anchor", return_value=True)
-    mocker.patch.object(DatasetManager, "get_inflight", return_value=None)
+    mocker.patch.object(DatasetManager, "get_own_inflight", return_value=None)
     mocker.patch.object(DatasetManager, "set_inflight", return_value=True)
     mocker.patch.object(DatasetManager, "clear_inflight", return_value=True)
 
@@ -2753,6 +2754,9 @@ class _LocalManager:
     def get_anchor(self, dsi, dest):
         return self.anchors.get(dest)
 
+    def get_own_anchor(self, dsi, dest):
+        return self.anchors.get(dest)
+
     def get_local_anchor(self, dsi, dest):
         return self.anchors.get(dest)
 
@@ -2770,7 +2774,7 @@ class _LocalManager:
     def clear_inflight(self, *a):
         return True
 
-    def get_inflight(self, *a):
+    def get_own_inflight(self, *a):
         return None
 
 

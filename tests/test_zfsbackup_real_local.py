@@ -493,7 +493,7 @@ class _SharedTests(_RigTests):
         assert list(rig.copy_snaps()) == [old[-1]]                  # no backfill of the older ones
         assert rig.copy_snaps()[old[-1]] == rig.local_snaps()[old[-1]]
         assert rig.manager.get_anchor(rig.dsi, DEST) == old[-1]
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         assert any(f'Sending full snapshot {rig.src}@{old[-1]}' in m for m in rig.log_lines())
         self.assert_copy_state(rig)
 
@@ -503,7 +503,7 @@ class _SharedTests(_RigTests):
         assert set(rig.copy_snaps()) == {old[-1]} | set(more)
         self.assert_on_the_copy(rig, [old[-1]] + more)
         assert rig.manager.get_anchor(rig.dsi, DEST) == more[-1]
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         lines = rig.log_lines()
         assert any(f'Sending 3 snapshots of {rig.src} to {DEST}' in m for m in lines)
         for prev, name in zip([old[-1]] + more, more):
@@ -541,7 +541,7 @@ class _SharedTests(_RigTests):
         assert rig.copy_snaps() == {}
         self.assert_owned_locally(rig)
         assert rig.manager.get_anchor(rig.dsi, DEST) is None
-        assert rig.manager.get_inflight(rig.dsi, DEST) == ('', s1)   # the pin of the cut step stays
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) == ('', s1)   # the pin of the cut step stays
         assert rig.errors()                                          # and the failure was reported
 
     def test_the_next_cycle_resumes_the_cut_stream_into_the_same_copy(self, rig):
@@ -555,7 +555,7 @@ class _SharedTests(_RigTests):
         assert list(rig.copy_snaps()) == [s1]
         assert rig.copy_snaps()[s1] == rig.local_snaps()[s1]
         assert rig.manager.get_anchor(rig.dsi, DEST) == s1
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         self.assert_copy_state(rig)
         assert rig.errors()[mark:] == []
 
@@ -587,7 +587,7 @@ class _SharedTests(_RigTests):
         assert cut.done
         assert set(rig.copy_snaps()) == {first, more[0]}
         assert rig.manager.get_anchor(rig.dsi, DEST) == more[0]       # the last good step
-        assert rig.manager.get_inflight(rig.dsi, DEST) == (more[0], more[1])
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) == (more[0], more[1])
         assert rig.wait_for_resume_token() not in ('-', '')
 
         assert rig.cycle() is True                                    # resumes step 2, then step 3
@@ -596,7 +596,7 @@ class _SharedTests(_RigTests):
         assert set(rig.copy_snaps()) == {first} | set(more)
         self.assert_on_the_copy(rig, [first] + more)
         assert rig.manager.get_anchor(rig.dsi, DEST) == more[2]
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         self.assert_copy_state(rig)
 
 

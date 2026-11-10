@@ -397,6 +397,16 @@ def _inflight_names(value: Optional[str]) -> List[str]:
     return [n for n in (part.strip() for part in value.split(',')) if n and n != '-']
 
 
+def _parse_inflight(value: Optional[str]) -> Optional[Tuple[str, str]]:
+    """The `(from, to)` pair of an `inflight.*` value (`<from>,<to>`; `from`
+    is `''` for a full send), or `None` when unset, `-` or malformed. Unlike
+    `_inflight_names` it keeps which end is which."""
+    if not value or value == '-' or ',' not in value:
+        return None
+    src, _, dst = value.partition(',')
+    return (src, dst) if dst else None
+
+
 def clear_zfsbackup_properties(
     ds: Dataset,
     *,
@@ -664,9 +674,17 @@ class DatasetManager:
         """Read a single ZFS user property from a dataset. Returns None if unset.
 
         The effective value, whatever its source (local, received or
-        inherited -- `get_anchor` relies on seeing an inherited anchor), read
-        with `zfs get -H -o value` (`zfs.get.value`): exact even when the
-        value holds a tab or newline, which a `zfs list -H` row cannot frame.
+        inherited), read with `zfs get -H -o value` (`zfs.get.value`): exact
+        even when the value holds a tab or newline, which a `zfs list -H` row
+        cannot frame. Inherited values are right for PROTECTION only: the
+        pruner (`get_anchors`, through `get_anchor`) wants a parent's anchor
+        to widen the protect-set (it never reads an inherited pin: its pin
+        readers take local/received values), and `sync_config_property`
+        compares the value as it stands. Evidence about THIS dataset's own
+        send history (the due check, health, the anchor-never-backwards rule,
+        settling) must read only a LOCAL value -- `get_own_anchor` /
+        `get_own_inflight` / `get_local_anchor` -- or a child without one is
+        credited with its parent's progress.
 
         While a local copy is being pruned (`_prune_timed`) a `ZFSTimeoutError`
         propagates instead of reading as "unset": "could not read" must never
@@ -714,9 +732,45 @@ class DatasetManager:
         prop = f"{PROP_ANCHOR_PREFIX}{destination}"
         return self._get_prop(dsi.dataset, prop)
 
-    def get_local_anchor(self, dsi: DatasetInfo, destination: str) -> Optional[str]:
+    def _get_own_prop(self, ds: Dataset, prop: str) -> Optional[str]:
+        """`prop` as a LOCAL value of `ds` only (`zfs get -s local`); `None`
+        when unset, inherited or received. Any failure is ALSO `None` (with a
+        DEBUG line, as for `_get_prop`), so this read must only feed
+        decisions where "unknown" is safe as "no history": the due check
+        (due, and negotiate decides), health reporting, and a pin read that
+        merely over-protects. NEVER use it where the result leads to writing
+        or clearing an anchor or pin: those use `get_local_anchor`, which
+        raises. While a
+        local copy is being pruned a `ZFSTimeoutError` propagates instead (as
+        in `_get_prop`; no current caller runs there, but "could not read"
+        must never shrink a protect-set)."""
+        try:
+            return zfs.get.value(ds, prop, sources='local')
+        except Exception as e:
+            if self._prune_timed and isinstance(e, ZFSTimeoutError):
+                raise
+            logger.debug(f"Failed to read local property {prop} from {ds.name}: {e!r}")
+        return None
+
+    def get_own_anchor(self, dsi: DatasetInfo, destination: str) -> Optional[str]:
         """The anchor snapshot name for a destination as a LOCAL value of
-        this very dataset, or `None` (unset, inherited or received).
+        this dataset, or `None` (unset, inherited, received OR UNREADABLE --
+        the failure is swallowed). Use it only for the "due" check and for
+        health, where an unreadable anchor safely reads as "no history".
+        Anything that writes or clears an anchor, or decides from the anchor
+        whether something may be sent or destroyed (`_record_step`,
+        `_settle_up_to_date`, `_rollback_permit`), must use
+        `get_local_anchor`, which raises `LocalAnchorUnreadable`. A parent's
+        inherited anchor never counts here; `get_anchor` stays the pruner's
+        (inherited values only widen protection)."""
+        return self._get_own_prop(dsi.dataset, f"{PROP_ANCHOR_PREFIX}{destination}")
+
+    def get_local_anchor(self, dsi: DatasetInfo, destination: str) -> Optional[str]:
+        """The RAISING local read, for every caller that writes or clears an
+        anchor or decides from it: the anchor snapshot name for a destination
+        as a LOCAL value of this very dataset, or `None` (unset, inherited or
+        received). `get_own_anchor` is the swallowing variant, for the "due"
+        check and health only.
         `get_anchor` also reports an inherited value, which must not
         count where the anchor is evidence about this dataset's own history
         (`RemoteBackupManager._rollback_permit`): a dataset restored under a
@@ -752,14 +806,17 @@ class DatasetManager:
         except Exception as e:
             logger.warning(f"Failed to clear anchor property for {dsi.name}: {e}")
 
-    def get_inflight(self, dsi: DatasetInfo, destination: str) -> Optional[Tuple[str, str]]:
-        """The `(from, to)` pair recorded in `inflight.<destination>`
-        (`from` is `''` for a full send), or `None` when unset or malformed."""
-        value = self._get_prop(dsi.dataset, f"{PROP_INFLIGHT_PREFIX}{destination}")
-        if not value or value == '-' or ',' not in value:
-            return None
-        src, _, dst = value.partition(',')
-        return (src, dst) if dst else None
+    def get_own_inflight(self, dsi: DatasetInfo, destination: str) -> Optional[Tuple[str, str]]:
+        """The `(from, to)` pair recorded in a LOCAL `inflight.<destination>`
+        (`from` is `''` for a full send): the pin of this dataset's own send,
+        never a parent's inherited one. `None` when unset, inherited,
+        received, malformed or unreadable. A failed read means "not pinned",
+        which is safe only where that merely over-protects (settling then does not
+        clear a pin it could not read; health just reports none); the pruner reads pins
+        through `read_zfsbackup_properties`, not here."""
+        return _parse_inflight(
+            self._get_own_prop(dsi.dataset, f"{PROP_INFLIGHT_PREFIX}{destination}")
+        )
 
     def set_inflight(
         self, dsi: DatasetInfo, destination: str, from_name: Optional[str], to_name: str

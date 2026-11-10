@@ -142,12 +142,12 @@ def _observe_local(
 
     for remote in dsi.config.remote:
         destination = remote.destination
-        anchor_name = manager.get_anchor(dsi, destination)
+        anchor_name = manager.get_own_anchor(dsi, destination)
         anchor = next((s for s in snapshots if s.name == anchor_name), None) if anchor_name else None
         notes = []
         if anchor_name and anchor is None:
             notes.append(f'anchor {anchor_name} is not among the local managed snapshots')
-        pin = manager.get_inflight(dsi, destination)
+        pin = manager.get_own_inflight(dsi, destination)
         if pin is not None:
             src, dst = pin
             notes.append(f'send in flight: {src or "(full)"} -> {dst}')

@@ -1350,7 +1350,7 @@ class RemoteBackupWorker(BaseWorker):
         else:
             sender = self._remote_manager
         freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
-        anchor_name = manager.get_anchor(dsi, remote_cfg.destination)
+        anchor_name = manager.get_own_anchor(dsi, remote_cfg.destination)
         if anchor_name:
             snapshots = manager.list_snapshots(dsi)
             anchor = next((s for s in snapshots if s.name == anchor_name), None)

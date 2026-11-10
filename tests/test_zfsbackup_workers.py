@@ -501,7 +501,7 @@ class TestRemoteBackupWorker:
         anchor_snap = MagicMock()
         anchor_snap.name = 'autosnap_20240101120000'
         anchor_snap.age = timedelta(minutes=30)
-        manager.get_anchor.return_value = 'autosnap_20240101120000'
+        manager.get_own_anchor.return_value = 'autosnap_20240101120000'
         manager.list_snapshots.return_value = [anchor_snap]
         manager.clock_behind.return_value = False       # the anchor is not future-dated
 
@@ -519,7 +519,7 @@ class TestRemoteBackupWorker:
         dsi = MagicMock()
         dsi.config.remote = [remote_cfg]
         dsi.config.frequency = timedelta(hours=1)
-        manager.get_anchor.return_value = None
+        manager.get_own_anchor.return_value = None
 
         worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
         worker.name = 'remote-backup-worker'
@@ -553,7 +553,7 @@ class TestRemoteWorkerPassesShouldStop:
         dsi.config.remote = [remote_cfg]
         dsi.config.frequency = timedelta(hours=1)
         manager = MagicMock()
-        manager.get_anchor.return_value = None
+        manager.get_own_anchor.return_value = None
         worker._process_dataset(manager, dsi)
         (args, kwargs), = worker._remote_manager.backup_dataset.call_args_list
         return args, kwargs['should_stop']
@@ -596,7 +596,7 @@ class TestRemoteWorkerPassesShouldStop:
         dsi = MagicMock()
         dsi.config.remote = [remote_cfg]
         manager = MagicMock()
-        manager.get_anchor.return_value = None
+        manager.get_own_anchor.return_value = None
         worker._process_dataset(manager, dsi)
         _, kwargs = worker._remote_manager.backup_dataset.call_args
         assert kwargs['should_stop']() is True
@@ -637,7 +637,7 @@ class TestPerDestinationIsolation:
             sender.last_problem.return_value = None
         manager = MagicMock(name='manager')
         manager.config = config
-        manager.get_anchor.return_value = None
+        manager.get_own_anchor.return_value = None
         dsi = SimpleNamespace(name='pool/data', config=config.datasets[0])
         return worker, manager, dsi
 
@@ -780,12 +780,12 @@ class TestPerDestinationIsolation:
     def test_the_anchor_read_failing_for_one_destination_is_isolated_too(self, sdir):
         worker, manager, dsi = self.rig(sdir)
 
-        def get_anchor(dsi_, destination):
+        def get_own_anchor(dsi_, destination):
             if destination == 'd1':
                 raise OSError('cannot read the anchor')
             return None
 
-        manager.get_anchor.side_effect = get_anchor
+        manager.get_own_anchor.side_effect = get_own_anchor
         worker._process_dataset(manager, dsi)
         worker._flush_status(force=True)
         assert self.sent_to(worker._remote_manager) == ['d2']
@@ -1415,7 +1415,7 @@ class TestFutureDatedAnchor:
                  for i, m in enumerate(sorted(set(anchors.values())))}
         anchor_name = {dest: snaps[m].name for dest, m in anchors.items()}
         mocker.patch.object(manager, 'list_snapshots', side_effect=lambda d: list(snaps.values()))
-        mocker.patch.object(manager, 'get_anchor', side_effect=lambda d, dest: anchor_name.get(dest))
+        mocker.patch.object(manager, 'get_own_anchor', side_effect=lambda d, dest: anchor_name.get(dest))
         worker = RemoteBackupWorker.__new__(RemoteBackupWorker)
         worker.name = 'remote-backup-worker'
         worker._exit_reason = lambda: None
@@ -1483,7 +1483,7 @@ class TestFutureDatedAnchor:
 
     def test_no_anchor_is_due_and_not_an_error(self, mocker, frozen_clock, caplog):
         worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 0, 'b': 0})
-        manager.get_anchor.side_effect = lambda d, dest: None
+        manager.get_own_anchor.side_effect = lambda d, dest: None
         with caplog.at_level(logging.ERROR):
             assert self.cycle(worker, manager, dsi) == ['a', 'b']
         assert not caplog.records

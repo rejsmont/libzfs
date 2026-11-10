@@ -104,6 +104,7 @@ def manager_for(*dsis, **attrs):
     manager.last_snapshot_error = None
     manager.last_received_error = None
     manager.get_anchor.return_value = None
+    manager.get_own_anchor.return_value = None
     for key, value in attrs.items():
         setattr(manager, key, value)
     return manager
@@ -608,6 +609,36 @@ class TestRemoteWorkerRecords:
         rrig.go()
         assert rrig.records()[('send', 'pool/a', 'off')].last_error == 'not completed (see the journal)'
 
+    def test_a_settle_that_could_not_read_the_anchor_is_a_failed_send_with_the_warning_as_its_account(
+            self, rrig):
+        """`_settle_up_to_date` returns False when the local anchor is unreadable (it writes nothing);
+        the worker records the pair as an error, `last_problem` being the sender's own WARNING."""
+        from types import SimpleNamespace
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        from zfsbackup.chain import ChainSender
+
+        class Settler(ChainSender):
+            def _ready_transport(self, *a, **k):
+                raise NotImplementedError
+
+            _negotiate = _fetch_resume_token = _stream_step = _ready_transport
+
+        local = MagicMock(name='local_manager')
+        local.get_local_anchor.side_effect = LocalAnchorUnreadable('pool I/O is currently suspended')
+        sender = Settler(rrig.config, local, client_id='client1')
+        latest = SimpleNamespace(name='autosnap_20240101000000')
+        rrig.rbm.backup_dataset.side_effect = (
+            lambda dsi, cfg, should_stop=None: sender._settle_up_to_date(dsi, latest, cfg.destination, []))
+        rrig.rbm.last_problem.side_effect = sender.last_problem
+        rrig.go()
+        rec = rrig.records()[('send', 'pool/a', 'off')]
+        assert rec.result == 'error' and rec.consecutive_failures == 1
+        assert 'cannot read the local anchor property org.zfsbackup:anchor.off' in rec.last_error
+        assert 'pool I/O is currently suspended' in rec.last_error
+        local.set_anchor.assert_not_called()
+        local.clear_anchor.assert_not_called()
+        local.clear_inflight.assert_not_called()
+
     def test_a_pending_stop_makes_a_false_neither_success_nor_failure(self, rrig):
         worker = remote_worker(rrig.sdir, rrig.config)
 
@@ -681,7 +712,7 @@ class TestRemoteWorkerRecords:
     def test_a_send_that_is_not_due_records_nothing(self, run, sdir, mocker):
         rig = RemoteRig(run, sdir, mocker)
         anchor = SimpleNamespace(name='autosnap_1', age=timedelta(minutes=5))
-        rig.manager.get_anchor.return_value = 'autosnap_1'
+        rig.manager.get_own_anchor.return_value = 'autosnap_1'
         rig.manager.list_snapshots.return_value = [anchor]
         rig.manager.clock_behind.return_value = False
         rig.go()

@@ -3333,38 +3333,38 @@ class TestInflightProperty:
         mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=fake_set)
         mocker.patch('zfsbackup.backup_manager.zfs.inherit', side_effect=fake_inherit)
         manager = DatasetManager(_make_config())
-        mocker.patch.object(manager, '_get_prop', side_effect=lambda ds, prop: store.get(prop))
+        mocker.patch.object(manager, '_get_own_prop', side_effect=lambda ds, prop: store.get(prop))
         return manager, manager.datasets[0], store
 
     def test_round_trip(self, mocker):
         manager, dsi, store = self._store(mocker)
         assert manager.set_inflight(dsi, 'offsite', 'autosnap_1', 'autosnap_2') is True
         assert store == {IF + 'offsite': 'autosnap_1,autosnap_2'}
-        assert manager.get_inflight(dsi, 'offsite') == ('autosnap_1', 'autosnap_2')
+        assert manager.get_own_inflight(dsi, 'offsite') == ('autosnap_1', 'autosnap_2')
 
     @pytest.mark.parametrize('empty', [None, ''])
     def test_a_full_send_has_an_empty_from(self, mocker, empty):
         manager, dsi, store = self._store(mocker)
         assert manager.set_inflight(dsi, 'offsite', empty, 'autosnap_2') is True
         assert store == {IF + 'offsite': ',autosnap_2'}
-        assert manager.get_inflight(dsi, 'offsite') == ('', 'autosnap_2')
+        assert manager.get_own_inflight(dsi, 'offsite') == ('', 'autosnap_2')
 
     def test_an_unset_property_is_none(self, mocker):
         manager, dsi, _ = self._store(mocker)
-        assert manager.get_inflight(dsi, 'offsite') is None
+        assert manager.get_own_inflight(dsi, 'offsite') is None
 
     @pytest.mark.parametrize('value', ['-', '', 'nocomma', 'a,', ','])
     def test_a_malformed_value_is_none(self, mocker, value):
         manager, dsi, store = self._store(mocker)
         store[IF + 'offsite'] = value
-        assert manager.get_inflight(dsi, 'offsite') is None
+        assert manager.get_own_inflight(dsi, 'offsite') is None
 
     def test_destinations_are_independent(self, mocker):
         manager, dsi, store = self._store(mocker)
         manager.set_inflight(dsi, 'one', 'a', 'b')
         manager.set_inflight(dsi, 'two.dotted', None, 'c')
-        assert manager.get_inflight(dsi, 'one') == ('a', 'b')
-        assert manager.get_inflight(dsi, 'two.dotted') == ('', 'c')
+        assert manager.get_own_inflight(dsi, 'one') == ('a', 'b')
+        assert manager.get_own_inflight(dsi, 'two.dotted') == ('', 'c')
 
     def test_set_writes_exactly_one_property_with_the_documented_name(self, mocker):
         manager = DatasetManager(_make_config())
@@ -3377,7 +3377,7 @@ class TestInflightProperty:
         manager, dsi, store = self._store(mocker)
         manager.set_inflight(dsi, 'offsite', 'f', 't')
         assert manager.clear_inflight(dsi, 'offsite') is True
-        assert store == {} and manager.get_inflight(dsi, 'offsite') is None
+        assert store == {} and manager.get_own_inflight(dsi, 'offsite') is None
 
     def test_a_failed_set_is_false_with_a_warning_and_never_raises(self, mocker, caplog):
         mocker.patch('zfsbackup.backup_manager.zfs.set', side_effect=Exception('read-only'))
@@ -3396,8 +3396,27 @@ class TestInflightProperty:
     def test_a_failed_read_is_none(self, mocker):
         manager = DatasetManager(_make_config())
         value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=Exception('err'))
-        assert manager.get_inflight(manager.datasets[0], 'offsite') is None
+        assert manager.get_own_inflight(manager.datasets[0], 'offsite') is None
         value.assert_called_once()                      # the failure came from the read, not elsewhere
+
+
+class TestParseInflight:
+    """`_parse_inflight`, behind `get_own_inflight`: `(from, to)`, `''` for a full send."""
+
+    @pytest.mark.parametrize('value, expected', [
+        ('a,b', ('a', 'b')),
+        (',b', ('', 'b')),                                    # a full send has an empty from
+        ('autosnap_1,autosnap_2', ('autosnap_1', 'autosnap_2')),
+        ('a,b,c', ('a', 'b,c')),                              # partition at the first comma
+    ])
+    def test_valid(self, value, expected):
+        from zfsbackup.backup_manager import _parse_inflight
+        assert _parse_inflight(value) == expected
+
+    @pytest.mark.parametrize('value', [None, '', '-', 'nocomma', 'a,', ','])
+    def test_malformed_or_unset_is_none(self, value):
+        from zfsbackup.backup_manager import _parse_inflight
+        assert _parse_inflight(value) is None
 
 
 class TestSetAnchorReturnsBool:

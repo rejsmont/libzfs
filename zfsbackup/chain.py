@@ -695,8 +695,7 @@ class ChainSender:
         # newer (nothing newer exists locally), and a stale older token is
         # discarded by the next fresh send (`mode=fresh` aborts it).
         if common_snap is not None and common_snap.name == latest.name:
-            self._settle_up_to_date(dsi, latest, destination, snapshots)
-            return True
+            return self._settle_up_to_date(dsi, latest, destination, snapshots)
 
         # Check dry-run *before* starting a real `zfs send` subprocess: a
         # StreamHandle spawned here would otherwise be left unclosed (no
@@ -773,8 +772,7 @@ class ChainSender:
             if discard is None:
                 return False
             if common_snap is not None and common_snap.name == latest.name:
-                self._settle_up_to_date(dsi, latest, destination, snapshots)
-                return True
+                return self._settle_up_to_date(dsi, latest, destination, snapshots)
 
         # The chain of fresh steps.
         sent_any = resumed is not None
@@ -1000,7 +998,24 @@ class ChainSender:
         stream, mode, inflight_set, sent, base = started
 
         self._refusal_logged.pop((f"{dsi.name} [{self._refusal_label}]", destination), None)
-        old_anchor = self.local_manager.get_anchor(dsi, destination)
+        # The RAISING read: "unset" and "could not read" differ here. An
+        # unreadable anchor must neither skip the never-backwards rule below
+        # nor, with no `base`, let the sent-snapshot backstop `clear_anchor` a
+        # real anchor. Treated as a failed anchor write: nothing is written
+        # or cleared, the pin stays (nothing here has cleared it) and the
+        # chain stops; the next cycle negotiates again.
+        read_key = (f"{dsi.name} [local anchor after a send]", destination)
+        try:
+            old_anchor = self.local_manager.get_local_anchor(dsi, destination)
+        except LocalAnchorUnreadable as e:
+            self._log_warning_once(read_key, (
+                f"{dsi.name} -> {destination}: cannot read the local anchor property "
+                f"org.zfsbackup:anchor.{destination} ({e}) after sending {sent.name}; no anchor "
+                f"is written or cleared and the in-flight pin is kept, so the next cycle "
+                f"negotiates again"
+            ))
+            return _ANCHOR_FAILED
+        self._refusal_logged.pop(read_key, None)
         keep_anchor = False
         if old_anchor and old_anchor != sent.name:
             # Never move an anchor backwards (by createtxg): a snapshot older
@@ -1088,20 +1103,37 @@ class ChainSender:
         except ValueError:
             return None
 
-    def _settle_up_to_date(self, dsi, latest, destination, snapshots) -> None:
+    def _settle_up_to_date(self, dsi, latest, destination, snapshots) -> bool:
         """`latest` is already on the server: make the bookkeeping say so.
         The anchor is written if it is missing or points elsewhere (never
         backwards: an anchor on a newer managed snapshot is left), and a stale
         `inflight.<dest>` pin is cleared once the anchor is right. Writes
-        nothing in a dry run."""
+        nothing in a dry run.
+
+        -> `True` (settled, or deliberately left as it is), or `False` when
+        the local anchor could not be read: it may name a snapshot this host
+        lacks (rollback evidence), so nothing is written or cleared, one
+        WARNING per episode, and the caller reports the cycle as not
+        completed, as `_rollback_permit` does for the same read."""
         self._logger.debug(
             f"Nothing to send for {dsi.name} -> {destination}: "
             f"{latest.name} is already {self._at_receiver}"
         )
         self._token_ok(dsi, destination)
         if self.config.dry_run:
-            return
-        anchor = self.local_manager.get_anchor(dsi, destination)
+            return True
+        read_key = (f"{dsi.name} [local anchor to settle]", destination)
+        try:
+            anchor = self.local_manager.get_local_anchor(dsi, destination)
+        except LocalAnchorUnreadable as e:
+            self._log_warning_once(read_key, (
+                f"{dsi.name} -> {destination}: cannot read the local anchor property "
+                f"org.zfsbackup:anchor.{destination} ({e}), so the anchor and the in-flight "
+                f"pin are left as they are although {latest.name} is {self._at_receiver}; "
+                "the next cycle retries"
+            ))
+            return False
+        self._refusal_logged.pop(read_key, None)
         anchored = anchor == latest.name
         wrote = False
         if not anchored:
@@ -1124,10 +1156,10 @@ class ChainSender:
                     f"{dsi.name} -> {destination}: the anchor {anchor!r} names a snapshot this "
                     f"host does not have; left unchanged although {latest.name} is {self._at_receiver}"
                 )
-                return
+                return True
             wrote = not newer
             anchored = newer or self.local_manager.set_anchor(dsi, destination, latest.name)
-        if anchored and self.local_manager.get_inflight(dsi, destination) is not None:
+        if anchored and self.local_manager.get_own_inflight(dsi, destination) is not None:
             # As after a step: release the pin only if the snapshot is really
             # still here (the pruner may have taken it meanwhile). If it is
             # gone, put the anchor back where it was and keep the pin; if that
@@ -1149,8 +1181,9 @@ class ChainSender:
                         f"cannot confirm that {dsi.name}@{latest.name} still exists; "
                         "keeping its in-flight pin"
                     )
-                return
+                return True
             self.local_manager.clear_inflight(dsi, destination)
+        return True
 
     def _resume_target(self, token: str, dsi: DatasetInfo, snapshots, mode: str = 'plain') -> object:
         """Decide whether `token` can be resumed: -> `(to_snap, from_snap)`

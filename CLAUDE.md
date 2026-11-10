@@ -444,6 +444,7 @@ workers, or once a *signalled* (verified, so never on macOS) daemon has applied 
 | `tests/test_commands_part2.py` | Command classes `AllowCommand` through `MountCommand` |
 | `tests/test_zfsbackup_basic.py` | Package smoke tests |
 | `tests/test_zfsbackup_manager.py` | `DatasetManager`, retention/pruning; the one six-column listing and txg order; B-4 prune fallback, held/cloned pre-skip, stuck names, protection re-read before every destroy |
+| `tests/test_zfsbackup_recursive_sends.py` | Sender rework Track A (`docs/sender_rework_plan.md`): an inheriting fake `zfs` at Popen level (local/inherited/received/unset/unreadable); the A1 matrix (the due check, `_record_step`, `_settle_up_to_date` and `check` read only the dataset's OWN anchor/pin; the pruner's `get_anchors` still widens with inherited values); the A2 strict xfail (descendants of a recursive dataset sent) and its tripwire control |
 | `tests/test_zfsbackup_prune_descendants.py` | Recursive prune honours descendants' anchors and configured retention; received datasets pruned non-recursively |
 | `tests/test_openzfs_formats.py` | Captured OpenZFS 2.1.5/2.2.2/2.3.9/2.4.1 output (`tests/fixtures/openzfs/`, loader `tests/_openzfs_fixtures.py`) replayed through `resume_info`, destroy, list/get and zfsbackup's stale-token and `receive -A` classifiers; the M7 `-F` history through `decide_receive` |
 | `tests/test_zfsbackup_store_raw.py` | `dataset_remotes.raw` migration up/down, mapper round trip, column-aware stamp advice and `SchemaColumnsMissing`, the column-registry guard |

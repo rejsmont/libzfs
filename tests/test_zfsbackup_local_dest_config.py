@@ -674,7 +674,7 @@ class Rig:
         self.manager.received_datasets.return_value = []
         self.manager.last_snapshot_error = None
         self.manager.last_received_error = None
-        self.manager.get_anchor.return_value = None
+        self.manager.get_own_anchor.return_value = None
         self.manager.clock_behind.return_value = False
 
     def worker(self, **kwargs):
@@ -788,15 +788,15 @@ class TestRemoteWorkerSendsToLocalDestinations:
         assert ("send", "pool/a", "here") not in rig.records()
 
     def test_the_interval_check_applies_to_a_local_destination(self, rig):
-        rig.manager.get_anchor.return_value = "autosnap_20260101000000"
+        rig.manager.get_own_anchor.return_value = "autosnap_20260101000000"
         young = SimpleNamespace(name="autosnap_20260101000000", age=timedelta(minutes=10))
         rig.manager.list_snapshots.return_value = [young]
         rig.run()
         rig.lbm.backup_dataset.assert_not_called()
-        assert [c.args[1] for c in rig.manager.get_anchor.call_args_list] == ["here"]
+        assert [c.args[1] for c in rig.manager.get_own_anchor.call_args_list] == ["here"]
 
     def test_an_anchor_older_than_the_frequency_makes_it_due(self, rig):
-        rig.manager.get_anchor.return_value = "autosnap_20260101000000"
+        rig.manager.get_own_anchor.return_value = "autosnap_20260101000000"
         old = SimpleNamespace(name="autosnap_20260101000000", age=timedelta(hours=2))
         rig.manager.list_snapshots.return_value = [old]
         rig.run()
@@ -872,7 +872,7 @@ class TestRemoteWorkerMixedDestinations:
 
     def test_the_anchor_is_read_for_both_destinations(self, rig):
         rig.run()
-        assert [c.args[1] for c in rig.manager.get_anchor.call_args_list] == ["here", "off"]
+        assert [c.args[1] for c in rig.manager.get_own_anchor.call_args_list] == ["here", "off"]
 
     def test_a_missing_destination_object_goes_to_the_remote_manager(self, mocker, sdir):
         # An undeclared name is `from_file`'s to refuse; the worker must not

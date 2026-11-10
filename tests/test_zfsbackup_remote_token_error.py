@@ -67,7 +67,9 @@ class Rig:
         self.send_resume = mocker.patch('zfsbackup.remote.zfs.send.resume')
         self.set_inflight = mocker.patch.object(self.manager, 'set_inflight', return_value=True)
         mocker.patch.object(self.manager, 'get_anchor', return_value=None)
-        mocker.patch.object(self.manager, 'get_inflight', return_value=None)
+        mocker.patch.object(self.manager, 'get_own_anchor', return_value=None)
+        mocker.patch.object(self.manager, 'get_local_anchor', return_value=None)
+        mocker.patch.object(self.manager, 'get_own_inflight', return_value=None)
         mocker.patch.object(self.manager, 'set_anchor', return_value=True)
         self.rbm._server_info[(DS, DEST)] = ('plain', 'pool/b/client1/data')
 

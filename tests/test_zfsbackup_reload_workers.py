@@ -605,7 +605,7 @@ class TestRemoteWorkerBetweenDestinations:
         rbm = MagicMock()
         worker._remote_manager = rbm
         manager = DatasetManager(config)
-        mocker.patch.object(DatasetManager, "get_anchor", return_value=None)
+        mocker.patch.object(DatasetManager, "get_own_anchor", return_value=None)
         return worker, rbm, manager, manager.datasets[0], stop, rel
 
     @staticmethod

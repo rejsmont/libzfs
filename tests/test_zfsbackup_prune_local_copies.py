@@ -1298,17 +1298,17 @@ class TestEveryTimeoutSiteOfACopysPass:
         assert world.snaps['bk/A/tank/data'] == OLD or world.destroyed == []
 
     def test_the_single_property_read_raises_a_timeout_only_inside_a_copys_pass(self, world):
-        """`_get_prop` (behind `get_anchor`/`get_inflight`): "could not read" is "unset" for the senders and
+        """`_get_prop` / `_get_own_prop` (behind `get_anchor` / `get_own_inflight`): "could not read" is "unset" for the senders and
         the source datasets, but inside a copy's pass a timeout must propagate, never read as unset."""
         mgr, dsi = self.setup_pass(world)
         Hang(world, is_value)
         assert mgr.get_anchor(dsi, 'usb') is None                     # outside a pass: as before
-        assert mgr.get_inflight(dsi, 'usb') is None
+        assert mgr.get_own_inflight(dsi, 'usb') is None
         mgr._prune_timed = True
         with pytest.raises(ZFSTimeoutError):
             mgr.get_anchor(dsi, 'usb')
         with pytest.raises(ZFSTimeoutError):
-            mgr.get_inflight(dsi, 'usb')
+            mgr.get_own_inflight(dsi, 'usb')
 
     def test_the_snapshot_listing_is_debug_not_the_failed_to_list_error(self, world, caplog):
         mgr, dsi = self.setup_pass(world)

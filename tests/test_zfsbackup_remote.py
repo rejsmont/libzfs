@@ -84,9 +84,10 @@ def _no_local_zfs_property_writes(mocker):
     harmless defaults here, so a test that does not care never reaches even the stub `zfs`.
     Tests that assert on them patch the instance (which wins over these class patches)."""
     mocker.patch.object(DatasetManager, 'get_anchor', return_value=None)
+    mocker.patch.object(DatasetManager, 'get_own_anchor', return_value=None)
     mocker.patch.object(DatasetManager, 'get_local_anchor', return_value=None)
     mocker.patch.object(DatasetManager, 'set_anchor', return_value=True)
-    mocker.patch.object(DatasetManager, 'get_inflight', return_value=None)
+    mocker.patch.object(DatasetManager, 'get_own_inflight', return_value=None)
     mocker.patch.object(DatasetManager, 'set_inflight', return_value=True)
     mocker.patch.object(DatasetManager, 'clear_inflight', return_value=True)
 
@@ -339,11 +340,17 @@ class Harness:
         self.clear_inflight = mocker.patch.object(lm, 'clear_inflight', side_effect=cleared, return_value=True)
         self.set_anchor = mocker.patch.object(lm, 'set_anchor', side_effect=anchored, return_value=True)
         self.clear_anchor = mocker.patch.object(lm, 'clear_anchor', return_value=None)
-        self.get_anchor = mocker.patch.object(lm, 'get_anchor', return_value=None)
-        #: the dataset's OWN anchor (`get_anchor` may also report an inherited one): what the
-        #: rollback permit reads
+        #: the sender must read neither of these: `get_anchor` (effective, so a parent's inherited
+        #: anchor too) is the pruner's, `get_own_anchor` is the swallowing read of the due check and
+        #: health. A test that drove them would pass for the wrong reason.
+        wrong = AssertionError('the sender read an anchor through the wrong reader')
+        self.get_anchor = mocker.patch.object(lm, 'get_anchor', side_effect=wrong)
+        self.get_own_anchor = mocker.patch.object(lm, 'get_own_anchor', side_effect=wrong)
+        #: the dataset's OWN (local-only) anchor, the RAISING read: what `_record_step`,
+        #: `_settle_up_to_date` and the rollback permit all use. The harness's anchor knob.
         self.get_local_anchor = mocker.patch.object(lm, 'get_local_anchor', return_value=None)
-        self.get_inflight = mocker.patch.object(lm, 'get_inflight', return_value=None)
+        #: the own pin, as `_settle_up_to_date` reads it. The harness's pin knob.
+        self.get_own_inflight = mocker.patch.object(lm, 'get_own_inflight', return_value=None)
 
     def stopper(self, *script, default=False):
         """A `should_stop` that answers `script` in order, then `default`, and records every
@@ -1352,14 +1359,14 @@ class TestAnchorNeverMovesBackwardsInAChain:
     def test_a_newer_anchor_is_kept_through_the_earlier_steps(self, h5, mocker):
         """The anchor is already on S5 (say a resume or a concurrent cycle got there): S2..S4
         leave it and their pins stay; S5 itself is written (anchor == sent) and clears the pin."""
-        h5.get_anchor.return_value = S5
+        h5.get_local_anchor.return_value = S5
         chain = Chain(h5, mocker, sessions=5)
         assert chain.run(common=S1) is True
         assert [c.args[1:] for c in h5.set_anchor.call_args_list] == [('offsite', S5)]
         assert h5.clear_inflight.call_count == 1
 
     def test_an_older_anchor_moves_forward_at_every_step(self, h5, mocker):
-        h5.get_anchor.return_value = S1
+        h5.get_local_anchor.return_value = S1
         chain = Chain(h5, mocker, sessions=5)
         chain.run(common=S1)
         assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S2, S3, S4, S5]
@@ -1368,7 +1375,7 @@ class TestAnchorNeverMovesBackwardsInAChain:
         """S1 carries the NEWEST txg although its name is the oldest: an anchor on it is newer
         than every other step."""
         five(h5, txgs={S1: 900, S2: 20, S3: 30, S4: 40, S5: 50})
-        h5.get_anchor.return_value = S1
+        h5.get_local_anchor.return_value = S1
         chain = Chain(h5, mocker, sessions=5)
         assert h5.latest.name == S1
         chain.run(common=S2)                         # steps by txg: S3, S4, S5, S1
@@ -1662,7 +1669,7 @@ class TestResumeBehindANewerAnchor:
     def test_the_pin_stays_after_the_resume_and_the_next_step_replaces_and_clears_it(self, h, mocker):
         h.rm.get(h.url, [{'json': {'resume_token': TOKEN_FULL}}, {'json': {'resume_token': None}}])
         h.decodes_to(toguid=222, fromguid=111)
-        h.get_anchor.return_value = NEW                       # already ahead of the resumed MID
+        h.get_local_anchor.return_value = NEW                       # already ahead of the resumed MID
         chain = Chain(h, mocker)
         assert chain.run() is True
         assert h.order == [('pin', OLD, MID), 'send-t', ('pin', MID, NEW), 'send']
@@ -1778,67 +1785,67 @@ class TestAlreadyOnTheServer:
     # -- the anchor ---------------------------------------------------------------
 
     def test_a_missing_anchor_is_written(self, h):
-        h.get_anchor.return_value = None
+        h.get_local_anchor.return_value = None
         self.run(h)
         h.set_anchor.assert_called_once()
         assert h.set_anchor.call_args.args[1:] == ('offsite', NEW)
 
     def test_an_anchor_that_is_already_right_is_not_rewritten(self, h):
-        h.get_anchor.return_value = NEW
+        h.get_local_anchor.return_value = NEW
         self.run(h)
         h.set_anchor.assert_not_called()
 
     def test_an_anchor_on_an_older_snapshot_is_moved_forward(self, h):
-        h.get_anchor.return_value = OLD
+        h.get_local_anchor.return_value = OLD
         self.run(h)
         assert h.set_anchor.call_args.args[1:] == ('offsite', NEW)
 
     def test_an_anchor_naming_an_unknown_snapshot_is_replaced(self, h):
-        h.get_anchor.return_value = 'autosnap_20990101000000'
+        h.get_local_anchor.return_value = 'autosnap_20990101000000'
         self.run(h)
         assert h.set_anchor.call_args.args[1:] == ('offsite', NEW)
 
     def test_an_anchor_on_a_newer_managed_snapshot_is_never_moved_backwards(self, h):
-        h.get_anchor.return_value = NEW
+        h.get_local_anchor.return_value = NEW
         self.run(h, latest=h.snaps[1])                            # latest == common == MID, anchor already NEW
         h.set_anchor.assert_not_called()
 
     def test_the_anchor_is_read_for_the_destination(self, h):
         self.run(h)
-        assert h.get_anchor.call_args.args[1] == 'offsite'
+        assert h.get_local_anchor.call_args.args[1] == 'offsite'
 
     # -- the in-flight pin ----------------------------------------------------------
 
     def test_a_stale_pin_is_cleared_once_the_anchor_is_written(self, h):
-        h.get_inflight.return_value = (OLD, MID)
+        h.get_own_inflight.return_value = (OLD, MID)
         self.run(h)
         h.set_anchor.assert_called_once()
         h.clear_inflight.assert_called_once()
         assert h.clear_inflight.call_args.args[1] == 'offsite'
 
     def test_a_stale_pin_is_cleared_when_the_anchor_was_already_right(self, h):
-        h.get_anchor.return_value = NEW
-        h.get_inflight.return_value = (OLD, NEW)
+        h.get_local_anchor.return_value = NEW
+        h.get_own_inflight.return_value = (OLD, NEW)
         self.run(h)
         h.set_anchor.assert_not_called()
         h.clear_inflight.assert_called_once()
 
     def test_a_stale_pin_is_cleared_when_a_newer_anchor_was_left_alone(self, h):
-        h.get_anchor.return_value = NEW
-        h.get_inflight.return_value = (OLD, MID)
+        h.get_local_anchor.return_value = NEW
+        h.get_own_inflight.return_value = (OLD, MID)
         self.run(h, latest=h.snaps[1])
         h.set_anchor.assert_not_called()
         h.clear_inflight.assert_called_once()
 
     def test_the_pin_is_kept_when_the_anchor_write_fails(self, h):
         h.set_anchor.return_value = False
-        h.get_inflight.return_value = (OLD, MID)
+        h.get_own_inflight.return_value = (OLD, MID)
         self.run(h)
         h.set_anchor.assert_called_once()
         h.clear_inflight.assert_not_called()
 
     def test_no_pin_means_nothing_to_clear(self, h):
-        h.get_inflight.return_value = None
+        h.get_own_inflight.return_value = None
         self.run(h)
         h.clear_inflight.assert_not_called()
 
@@ -1847,13 +1854,13 @@ class TestAlreadyOnTheServer:
     def test_a_dry_run_writes_nothing_and_does_not_announce_a_send(self, h, mocker, caplog):
         h.rbm.config.dry_run = True
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
-        h.get_inflight.return_value = (OLD, MID)
+        h.get_own_inflight.return_value = (OLD, MID)
         with caplog.at_level(logging.DEBUG):
             assert self.run(h) is True
         h.set_anchor.assert_not_called()
         h.clear_inflight.assert_not_called()
-        h.get_anchor.assert_not_called()
-        h.get_inflight.assert_not_called()
+        h.get_local_anchor.assert_not_called()
+        h.get_own_inflight.assert_not_called()
         ws_cls.assert_not_called()
         self.assert_nothing_started(h)
         assert 'DRY RUN' not in caplog.text and 'Would send' not in caplog.text
@@ -1946,6 +1953,8 @@ class TestTransfer:
     @pytest.fixture(autouse=True)
     def _no_local_zfs(self, mocker):
         mocker.patch.object(DatasetManager, 'get_anchor', return_value=None)
+        mocker.patch.object(DatasetManager, 'get_own_anchor', return_value=None)
+        mocker.patch.object(DatasetManager, 'get_local_anchor', return_value=None)
         mocker.patch.object(DatasetManager, 'set_inflight', return_value=True)
         mocker.patch.object(DatasetManager, 'clear_inflight', return_value=True)
 
@@ -2065,7 +2074,7 @@ class TestTransfer:
         mock_ws.recv.return_value = _json.dumps({'status': 'ok'})
         mocker.patch('zfsbackup.remote.websocket.WebSocket', return_value=mock_ws)
 
-        mocker.patch.object(rbm.local_manager, 'get_anchor', return_value='autosnap_OLD')
+        mocker.patch.object(rbm.local_manager, 'get_local_anchor', return_value='autosnap_OLD')
         mocker.patch.object(rbm.local_manager, 'set_anchor')
 
         latest = self._make_snap('autosnap_20240202120000')
@@ -2629,7 +2638,7 @@ class TestUrlPathEncoding:
             mocker.patch.object(rbm, '_try_resume', return_value=('fresh', None))
             mocker.patch.object(rbm, '_start_fresh', return_value=_SendStream(
                 _finite_stream(), 'fresh', False, latest, common_snap))
-        mocker.patch.object(rbm.local_manager, 'get_anchor', return_value=None)
+        mocker.patch.object(rbm.local_manager, 'get_local_anchor', return_value=None)
         mocker.patch.object(rbm.local_manager, 'set_anchor', return_value=True)
         ws = MagicMock()
         ws.recv.return_value = '{"status": "ok"}'
@@ -2895,7 +2904,7 @@ class TestAnchorNotMovedBackwardsFollowsTxg:
     def resume_to_mid(self, h, mocker, anchor):
         """A resumed MID (txg 20), stopped right after it, with the anchor on `anchor`."""
         inverted_snaps(h)
-        h.get_anchor.return_value = anchor
+        h.get_local_anchor.return_value = anchor
         h.rm.get(h.url, json={'resume_token': TOKEN_FULL})
         h.decodes_to(toguid=222, fromguid=None)                 # a full send of MID resumes
         chain = Chain(h, mocker, sessions=1)
@@ -2928,7 +2937,7 @@ class TestAnchorNotMovedBackwardsFollowsTxg:
 
     def test_a_fresh_send_of_the_newest_moves_an_older_anchor(self, h, mocker):
         inverted_snaps(h)
-        h.get_anchor.return_value = by_name(h.snaps, MID).name
+        h.get_local_anchor.return_value = by_name(h.snaps, MID).name
         chain = Chain(h, mocker, sessions=1, negotiate=None)
         assert chain.run() is True
         assert [c.args[1:] for c in h.set_anchor.call_args_list] == [('offsite', OLD)]    # latest by txg
@@ -2937,7 +2946,7 @@ class TestAnchorNotMovedBackwardsFollowsTxg:
         """Common NEW (txg 10); the steps by txg are MID (20) then OLD (900); the anchor is on
         OLD: MID must not pull it back, and OLD itself rewrites it."""
         inverted_snaps(h)
-        h.get_anchor.return_value = OLD
+        h.get_local_anchor.return_value = OLD
         chain = Chain(h, mocker, sessions=2)
         assert chain.run(common=NEW) is True
         assert chain.sent() == [(NEW, MID), (MID, OLD)]
@@ -2951,7 +2960,7 @@ class TestSettleUpToDateFollowsTxg:
     def settle(self, h, anchor, latest_name=MID):
         inverted_snaps(h)
         latest = by_name(h.snaps, latest_name)
-        h.get_anchor.return_value = anchor
+        h.get_local_anchor.return_value = anchor
         return h.rbm._transfer(h.transport, 'client1', h.dsi, latest, latest, 'offsite', snapshots=h.snaps)
 
     def test_an_anchor_newer_by_txg_is_left_alone(self, h):
@@ -2967,7 +2976,7 @@ class TestSettleUpToDateFollowsTxg:
         assert h.set_anchor.call_args.args[1:] == ('offsite', MID)
 
     def test_the_stale_pin_is_cleared_when_a_newer_anchor_was_left(self, h):
-        h.get_inflight.return_value = (OLD, MID)
+        h.get_own_inflight.return_value = (OLD, MID)
         self.settle(h, anchor=OLD)
         h.set_anchor.assert_not_called()
         h.clear_inflight.assert_called_once()
@@ -3058,7 +3067,7 @@ class TestSnapshotNewerHelperInRemoteContext:
     def test_an_anchor_on_an_unorderable_snapshot_is_rewritten(self, h):
         bare = listed_info(OLD, 'autosnap', txg=ABSENT, guid=111)
         snaps = [sinfo(NEW), sinfo(MID), bare]
-        h.get_anchor.return_value = OLD
+        h.get_local_anchor.return_value = OLD
         latest = by_name(snaps, MID)
         assert h.rbm._transfer(h.transport, 'client1', h.dsi, latest, latest, 'offsite', snapshots=snaps) is True
         assert h.set_anchor.call_args.args[1:] == ('offsite', MID)
@@ -3604,8 +3613,8 @@ class TestDryRunPlansTheChain:
         h.nothing_started()
         h.set_anchor.assert_not_called()
         h.clear_inflight.assert_not_called()
-        h.get_anchor.assert_not_called()
-        h.get_inflight.assert_not_called()
+        h.get_local_anchor.assert_not_called()
+        h.get_own_inflight.assert_not_called()
         assert not h.token_gets()
         h.resume_info.assert_not_called()
 
@@ -3711,7 +3720,7 @@ class TestSnapshotDestroyedWhileSending:
         chain.run(common=S1)
         assert [c[0].split('@')[1] for c in snapshot_presence.calls] == [S2, S3, S4, S5]
         snapshot_presence.calls.clear()
-        h5.get_anchor.return_value = S5          # a newer anchor is kept: nothing is written, nothing to check
+        h5.get_local_anchor.return_value = S5          # a newer anchor is kept: nothing is written, nothing to check
         again = Chain(h5, mocker, sessions=5)
         again.run(common=S1)
         assert [c[0].split('@')[1] for c in snapshot_presence.calls] == [S5]
@@ -3720,7 +3729,7 @@ class TestSnapshotDestroyedWhileSending:
     def test_a_destroyed_step_restores_the_anchor_to_its_base_keeps_the_pin_and_stops(
         self, h5, mocker, caplog, snapshot_presence, how
     ):
-        h5.get_anchor.return_value = S1                  # not the base of the failing step: told apart
+        h5.get_local_anchor.return_value = S1                  # not the base of the failing step: told apart
         if how == 'gone':
             snapshot_presence.gone.add(S3)
         else:
@@ -3737,7 +3746,7 @@ class TestSnapshotDestroyedWhileSending:
         assert f'Backup complete: pool/data@{S3}' not in caplog.text    # not reported as a clean step
 
     def test_a_destroyed_full_send_restores_the_previous_anchor(self, h5, mocker, snapshot_presence):
-        h5.get_anchor.return_value = 'autosnap_20230101000000'
+        h5.get_local_anchor.return_value = 'autosnap_20230101000000'
         snapshot_presence.gone.add(S5)
         chain = Chain(h5, mocker, sessions=2)
         assert chain.run(common=None) is True                           # it was the last (only) step
@@ -3746,7 +3755,7 @@ class TestSnapshotDestroyedWhileSending:
         h5.clear_inflight.assert_not_called()
 
     def test_a_destroyed_full_send_with_no_previous_anchor_clears_it(self, h5, mocker, snapshot_presence):
-        h5.get_anchor.return_value = None
+        h5.get_local_anchor.return_value = None
         snapshot_presence.gone.add(S5)
         chain = Chain(h5, mocker, sessions=2)
         assert chain.run(common=None) is True
@@ -4186,8 +4195,8 @@ class TestSettleBackstop:
     holds is checked to still be here."""
 
     def run(self, h5, mocker, anchor, pin=(S4, S5), dry=False):
-        h5.get_anchor.return_value = anchor
-        h5.get_inflight.return_value = pin
+        h5.get_local_anchor.return_value = anchor
+        h5.get_own_inflight.return_value = pin
         h5.rbm.config.dry_run = dry
         chain = Chain(h5, mocker, sessions=1)
         return chain.run(common=S5)
@@ -4252,8 +4261,8 @@ class TestSettleBackstop:
 
     def test_a_newer_anchor_left_alone_still_checks_before_releasing(self, h5, mocker, snapshot_presence):
         """Settling for S4 (latest) with the anchor on a newer S5: nothing written, so nothing to restore."""
-        h5.get_anchor.return_value = S5
-        h5.get_inflight.return_value = (S3, S4)
+        h5.get_local_anchor.return_value = S5
+        h5.get_own_inflight.return_value = (S3, S4)
         chain = Chain(h5, mocker, sessions=1)
         snapshot_presence.gone.add(S4)
         assert chain.run(common=S4, latest=by_name(h5.snaps, S4)) is True
@@ -4271,7 +4280,7 @@ class TestSettleBackstop:
     def test_after_a_resume_the_renegotiate_settle_has_the_same_backstop(self, h5, mocker, snapshot_presence):
         h5.token(TOKEN_INCR)
         h5.decodes_to(toguid=222, fromguid=111)
-        h5.get_inflight.return_value = (S2, S5)
+        h5.get_own_inflight.return_value = (S2, S5)
         snapshot_presence.gone.add(S5)
         chain = Chain(h5, mocker, sessions=2, negotiate=S5)
         assert chain.run(common=S1) is True
@@ -4882,13 +4891,13 @@ class TestRollbackPermit:
         assert ok is True
         assert chain.urls() == [f'?mode=fresh&{frm(a)}' for a in (S2, S3, S4)]
         assert all('discard' not in u for u in chain.urls())
-        h5.get_local_anchor.assert_not_called()
+        assert h5.get_local_anchor.call_count == h5.set_anchor.call_count   # only `_record_step` reads it (once per step): the permit did not
 
     def test_an_older_server_that_reports_nothing_sends_as_before(self, h5, mocker):
         chain, ok = self.cycle(h5, mocker)                     # no server_newer, no server_newer_count
         assert ok is True
         assert chain.urls() == [f'?mode=fresh&{frm(a)}' for a in (S2, S3, S4)]
-        h5.get_local_anchor.assert_not_called()
+        assert h5.get_local_anchor.call_count == h5.set_anchor.call_count   # only `_record_step` reads it (once per step): the permit did not
 
     def test_garbage_in_the_new_fields_is_no_information(self, h5, mocker):
         chain, ok = self.cycle(h5, mocker, newer='garbage', count='many')
@@ -4913,7 +4922,7 @@ class TestRollbackPermit:
 
     def test_the_local_anchor_is_read_for_this_dataset_and_destination(self, h5, mocker):
         self.cycle(h5, mocker, newer=[entry()])
-        h5.get_local_anchor.assert_called_once_with(h5.dsi, 'offsite')
+        assert {tuple(c.args) for c in h5.get_local_anchor.call_args_list} == {(h5.dsi, 'offsite')}
 
     def test_the_effective_anchor_is_not_what_counts(self, h5, mocker, caplog):
         """The anchor an ancestor passes down is not evidence about THIS dataset's own history (a
@@ -5129,22 +5138,22 @@ class TestRollbackPermit:
         """A rolled-back client whose newest snapshot is on the server: `_settle_up_to_date` would
         write `latest` as the anchor (the anchor named a snapshot that no longer exists) and the
         next cycle would look exactly like a backstop. The check runs first."""
-        h5.get_inflight.return_value = (S4, S5)
+        h5.get_own_inflight.return_value = (S4, S5)
         with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
             chain, ok = self.cycle(h5, mocker, common=S5, newer=[entry(GONE_NEWEST)], anchor=None)
         self.assert_refused(h5, chain, ok)
-        h5.get_anchor.assert_not_called()                       # not even read: the settle did not run
-        h5.get_inflight.assert_not_called()
+        h5.get_local_anchor.assert_called_once_with(h5.dsi, 'offsite')   # the permit's read only: the settle did not run
+        h5.get_own_inflight.assert_not_called()
         assert messages(caplog, 'snapshot(s) newer than', 'ERROR')
 
     def test_latest_equal_to_common_with_a_stale_anchor_on_a_lost_snapshot_does_not_settle(self, h5, mocker):
         """The anchor is the newest snapshot the host ever sent -- which a rollback destroyed."""
         chain, ok = self.cycle(h5, mocker, common=S5, newer=[entry(GONE_NEWEST)], anchor=GONE_NEWEST)
         self.assert_refused(h5, chain, ok)
-        h5.get_anchor.assert_not_called()
+        h5.get_local_anchor.assert_called_once_with(h5.dsi, 'offsite')   # the permit's read only: the settle did not run
 
     def test_latest_equal_to_common_with_a_genuine_backstop_anchor_settles_and_sends_nothing(self, h5, mocker):
-        h5.get_anchor.return_value = S5
+        h5.get_local_anchor.return_value = S5
         chain, ok = self.cycle(h5, mocker, common=S5, newer=[entry(GONE_NEWEST)], anchor=S5)
         assert ok is True
         chain.ws_cls.assert_not_called()
@@ -5203,7 +5212,6 @@ class TestBackstopThenContinue:
 
     def test_two_cycles(self, h5, mocker, caplog, snapshot_presence):
         anchors = {'offsite': S2}
-        h5.get_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
         h5.get_local_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
 
         def set_anchor(dsi, dest, name):
@@ -5521,10 +5529,9 @@ class TestServerRefusesTheStream:
 
 
 def wire_anchor(h, anchor):
-    """Make the harness's anchor a real, mutable value: `get_anchor` / `get_local_anchor` read it,
+    """Make the harness's anchor a real, mutable value: `get_local_anchor` reads it,
     `set_anchor` / `clear_anchor` change it. -> the `{destination: name}` dict."""
     anchors = {'offsite': anchor} if anchor is not None else {}
-    h.get_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
     h.get_local_anchor.side_effect = lambda dsi, dest: anchors.get(dest)
 
     def set_anchor(dsi, dest, name):
@@ -5892,10 +5899,16 @@ class TestAnUnreadableLocalAnchorIsNotARollback:
         h5.get_local_anchor.assert_not_called()
         assert len(messages(caplog, 'snapshot(s) newer than', 'ERROR')) == 1
 
-    def test_no_newer_snapshots_never_read_the_anchor(self, h5, mocker):
-        chain, ok = self.cycle(h5, mocker, newer=[], sessions=8)
-        assert ok is True
-        h5.get_local_anchor.assert_not_called()
+    def test_no_newer_snapshots_never_read_the_anchor_for_the_permit(self, h5, mocker, caplog):
+        """The permit does not read the anchor, so the failing reader is first met by `_record_step`
+        after the first stream: the permit's warning never appears (that one says "nothing is sent")
+        and the stream does go out."""
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
+            chain, ok = self.cycle(h5, mocker, newer=[], sessions=8)
+        assert chain.urls() and not messages(caplog, 'which decides whether')
+        assert [c.args[1:] for c in h5.get_local_anchor.call_args_list] == [('offsite',)]   # one read: the step's
+        assert ok is False                                     # the step's own fail-closed read (L1)
+        h5.set_anchor.assert_not_called()
 
     def test_the_effective_anchor_failing_is_unaffected(self, h5, mocker):
         """Only the local reader raises; `get_anchor` keeps its own behaviour (a mock here)."""
@@ -5912,8 +5925,8 @@ class TestSettleHardening:
     predates B-2b (`absent`) keeps the old overwrite."""
 
     def run(self, h5, mocker, anchor, status, pin=(S4, S5), dry=False):
-        h5.get_anchor.return_value = anchor
-        h5.get_inflight.return_value = pin
+        h5.get_local_anchor.return_value = anchor
+        h5.get_own_inflight.return_value = pin
         h5.rbm.config.dry_run = dry
         if status is not None:
             h5.rbm._server_newer_status[(h5.dsi.name, 'offsite')] = status
@@ -5965,7 +5978,7 @@ class TestSettleHardening:
 
     def test_an_empty_listing_does_not_trigger_it(self, h5, mocker, snapshot_presence):
         """`snapshots` empty: there is nothing to compare the anchor with, the old path runs."""
-        h5.get_anchor.return_value = GONE
+        h5.get_local_anchor.return_value = GONE
         h5.rbm._server_newer_status[(h5.dsi.name, 'offsite')] = 'known'
         h5.rbm._settle_up_to_date(h5.dsi, h5.latest, 'offsite', [])
         assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S5]
@@ -5981,7 +5994,7 @@ class TestSettleHardening:
         h5.snaps = [s for s in h5.snaps if s.name in (S1, S2, S3)]       # S4 and S5 are gone locally
         h5.latest = h5.snaps[0]
         anchors = wire_anchor(h5, S4)
-        h5.get_inflight.return_value = (S2, S3)
+        h5.get_own_inflight.return_value = (S2, S3)
         h5.server_says(common=S3, copy='plain', **server)
         chain = Chain(h5, mocker, sessions=2, negotiate=REAL)
         return chain, h5.rbm.backup_dataset(h5.dsi, cfg_for(None)), anchors
