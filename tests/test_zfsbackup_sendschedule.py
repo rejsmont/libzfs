@@ -35,6 +35,8 @@ D = 86400
 T0 = 20000 * D               # a UTC midnight
 FRESH = T0 - 10              # on the 1 h grid below: inside the current slot, so not overdue
 OFFSET = 1980                # frac 0.5, ci 300, W = 1 h
+CI = 300                     # `make()`'s check interval
+GAP = max(WAIT_RECHECK, CI)  # the re-arm spacing after the last start: max(WAIT_RECHECK, check_interval)
 
 
 class Clock:
@@ -1433,15 +1435,18 @@ class TestUnconfirmedAndRearm:
         s = self._tree()                       # last attempt T0 - 10
         s.confirmed(('p', 'A'))
         s.unconfirmed(('p', 'A'), now=T0)
-        assert s.due(T0) == [] and s.due(T0 - 10 + WAIT_RECHECK) == [key('p')]
+        assert s.due(T0) == [] and s.due(T0 - 10 + GAP - 1) == []
+        assert s.due(T0 - 10 + GAP) == [key('p')]
 
-    def test_unconfirmed_is_due_no_earlier_than_a_minute_after_the_last_start(self):
+    def test_unconfirmed_is_due_no_earlier_than_the_recheck_gap_after_the_last_start(self):
+        """The gap is `max(WAIT_RECHECK, check_interval)`: 300 s here, not 60 s."""
         s = self._tree()
         cycle(s, ('p', 'A'), T0 + 10)
         s.confirmed(('p', 'A'))
         s.unconfirmed(('p', 'A'), now=T0 + 20)
-        assert s.due(T0 + 20) == [] and s.due(T0 + 10 + WAIT_RECHECK - 1) == []
-        assert s.due(T0 + 10 + WAIT_RECHECK) == [key('p')]
+        assert s.due(T0 + 20) == [] and s.due(T0 + 10 + WAIT_RECHECK) == []
+        assert s.due(T0 + 10 + GAP - 1) == []
+        assert s.due(T0 + 10 + GAP) == [key('p')]
 
     def test_unconfirmed_is_due_no_earlier_than_a_pending_retry(self):
         s = make()
@@ -1488,21 +1493,71 @@ class TestUnconfirmedAndRearm:
 
     # -- finished re-arms an unconfirmed parent with children ---------------------------------------
 
-    @pytest.mark.parametrize('kind, extra', [('not_due', 0), ('stopped', 0), ('waiting', 1)])
-    def test_an_unconfirmed_parent_that_confirmed_nothing_is_asked_again_in_a_minute(self, kind, extra):
-        """A minute after the start; a WAITING finish also sets its own recheck, a minute after the finish."""
+    @pytest.mark.parametrize('kind, gap', [
+        ('ok', GAP), ('not_due', GAP), ('stopped', GAP),
+        # WAITING also sets its own retry, `WAIT_RECHECK` after the finish: that one is due first
+        ('waiting', WAIT_RECHECK + 1),
+    ])
+    def test_an_unconfirmed_parent_that_confirmed_nothing_is_asked_again_after_the_gap(self, kind, gap):
+        """`max(WAIT_RECHECK, check_interval)` after the start (an OK that confirmed nothing, a run
+        that found no snapshot yet, included); a WAITING finish also sets its own recheck, a minute
+        after the finish."""
         s = self._tree()
         s.started(('p', 'A'), now=T0)
         assert s.wants_confirmation(('p', 'A')) is True
         s.finished(('p', 'A'), kind, now=T0 + 1)
         assert s.due(T0 + 2) == [], 'not hot'
-        assert s.due(T0 + WAIT_RECHECK + extra - 1) == []
-        assert s.due(T0 + WAIT_RECHECK + extra) == [key('p')]
+        assert s.due(T0 + gap - 1) == []
+        assert s.due(T0 + gap) == [key('p')]
         assert s.held_by(('p/c', 'A')) == key('p')
 
-    @pytest.mark.parametrize('kind', ['not_due', 'stopped', 'waiting'])
+    def test_an_ok_that_confirmed_nothing_rearms_the_confirmation(self):
+        s = self._tree()
+        s.started(('p', 'A'), now=T0)
+        assert s.finished(('p', 'A'), 'ok', now=T0 + 1) is True     # OK still records
+        assert s.wants_confirmation(('p', 'A')) is True
+        assert s.due_time(('p', 'A'), T0 + 2) == T0 + GAP
+
+    def test_an_ok_followed_by_confirmed_leaves_nothing_due_early(self):
+        """The caller's `confirmed()` after `finished('ok')` clears the re-arm."""
+        s = self._tree()
+        s.started(('p', 'A'), now=T0)
+        s.finished(('p', 'A'), 'ok', now=T0 + 1)
+        s.confirmed(('p', 'A'))
+        assert s.wants_confirmation(('p', 'A')) is False
+        assert s.held_by(('p/c', 'A')) is None
+        for t in (T0 + 2, T0 + WAIT_RECHECK, T0 + GAP, T0 + 2 * GAP):
+            assert s.due(t) == [] and key('p') not in s.dispatch(now=t)
+        assert s.due_time(('p', 'A'), T0 + 2) == T0 + OFFSET        # only its next regular slot
+
+    @pytest.mark.parametrize('kind', ['ok', 'not_due', 'stopped'])
+    def test_with_a_small_check_interval_the_gap_is_still_a_minute(self, kind):
+        s = self._tree(ci=10)
+        s.started(('p', 'A'), now=T0)
+        s.finished(('p', 'A'), kind, now=T0 + 1)
+        assert s.due(T0 + WAIT_RECHECK - 1) == []
+        assert s.due(T0 + WAIT_RECHECK) == [key('p')]
+
+    @pytest.mark.parametrize('ci', [10, 60, 300, 900])
+    def test_the_gap_is_the_larger_of_the_recheck_and_the_check_interval(self, ci):
+        s = self._tree(ci=ci)
+        s.started(('p', 'A'), now=T0)
+        s.finished(('p', 'A'), 'ok', now=T0 + 1)
+        assert s.due_time(('p', 'A'), T0 + 2) == T0 + max(WAIT_RECHECK, ci)
+
+    def test_a_rearm_is_no_earlier_than_the_retry_of_a_failed_run_whatever_the_gap(self):
+        """A failure's backoff (1 h) still governs a later `unconfirmed`, the gap being far shorter."""
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0)
+        cycle(s, ('p', 'A'), T0 + 10, 'failed')
+        s.confirmed(('p', 'A'))
+        s.unconfirmed(('p', 'A'), now=T0 + 20)
+        assert s.due_time(('p', 'A'), T0 + 20) == T0 + 10 + FAILURE_RETRY_CAP
+
+    @pytest.mark.parametrize('kind', ['ok', 'not_due', 'stopped', 'waiting'])
     def test_it_is_never_a_hot_loop(self, kind):
-        """A sender that keeps answering "nothing" is asked at most once per `WAIT_RECHECK`."""
+        """A sender that keeps answering "nothing" is asked at most once per `WAIT_RECHECK`
+        (once per `GAP` unless the finish sets its own, shorter retry: WAITING)."""
         s = self._tree()
         starts = []
         now = T0
@@ -1545,29 +1600,74 @@ class TestUnconfirmedAndRearm:
 
     def test_the_rearm_survives_the_unstall_that_runs_on_every_query(self):
         """`_unstall` must not cancel the spacing: queried between the finish and the due time, the
-        confirmation is still exactly `WAIT_RECHECK` after the start."""
+        confirmation is still exactly `GAP` after the start."""
         s = self._tree()
         s.started(('p', 'A'), now=T0)
         s.finished(('p', 'A'), 'not_due', now=T0 + 1)
-        for t in (T0 + 2, T0 + 10, T0 + 30, T0 + 59):
-            assert s.due_time(('p', 'A'), t) == T0 + WAIT_RECHECK
+        for t in (T0 + 2, T0 + 10, T0 + 30, T0 + 59, T0 + 299):
+            assert s.due_time(('p', 'A'), t) == T0 + GAP
             assert s.due(t) == []
 
-    def test_a_clock_step_back_pulls_a_far_confirmation_to_now(self):
-        """The confirm clamp is `confirm_at - now > FAILURE_RETRY_CAP`."""
+    def test_a_clock_step_back_pulls_a_far_confirmation_to_the_clamped_retry(self):
+        """The confirm clamp is `confirm_at - now > FAILURE_RETRY_CAP`; with a retry pending (itself
+        clamped to `now + FAILURE_RETRY_CAP` in the same pass) the confirmation goes to that retry,
+        so a failure's backoff still governs."""
         s = make()
         s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0)
         cycle(s, ('p', 'A'), T0 + 100, 'failed')                 # retry_at = T0 + 100 + 1 h
         s.confirmed(('p', 'A'))
         s.unconfirmed(('p', 'A'), now=T0 + 101)                  # confirm_at = the retry time
         back = T0 + 101 - 2 * H                                   # the clock steps back two hours
-        assert s.due_time(('p', 'A'), back) == back
+        assert s.due_time(('p', 'A'), back) == back + FAILURE_RETRY_CAP
+        assert s.due(back) == [] and s.due(back + FAILURE_RETRY_CAP) == [key('p')]
+
+    def test_a_clock_step_back_leaves_the_confirmation_at_the_retry_never_before_now(self):
+        """`max(now, retry_at)`: a clamped retry in the future is the bound, never an earlier time."""
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0)
+        cycle(s, ('p', 'A'), T0 + 100, 'failed')
+        s.confirmed(('p', 'A'))
+        s.unconfirmed(('p', 'A'), now=T0 + 101)
+        for back_by in (2 * H, 5 * H, 2 * D):
+            probe = T0 + 101 - back_by
+            t = s.due_time(('p', 'A'), probe)
+            assert t == probe + FAILURE_RETRY_CAP and t > probe
+
+    def test_a_clock_step_back_pulls_a_far_confirmation_to_now_when_no_retry_is_pending(self):
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0)
+        s.started(('p', 'A'), now=T0 + 100)
+        s.finished(('p', 'A'), 'not_due', now=T0 + 101)           # confirm_at = T0 + 100 + GAP, no retry
+        assert s.due_time(('p', 'A'), T0 + 102) == T0 + 100 + GAP
+        back = T0 + 101 - 2 * H
+        assert s.due_time(('p', 'A'), back) == back               # no backoff to honour: due now
+        assert s.due(back) == [key('p')]
 
     def test_a_confirmation_within_the_cap_is_not_shortened_by_a_small_step_back(self):
         s = self._tree()
         s.started(('p', 'A'), now=T0 + 100)
         s.finished(('p', 'A'), 'not_due', now=T0 + 101)
-        assert s.due_time(('p', 'A'), T0 + 50) == T0 + 100 + WAIT_RECHECK
+        assert s.due_time(('p', 'A'), T0 + 50) == T0 + 100 + GAP
+
+    def test_a_confirmation_exactly_at_the_cap_ahead_is_not_clamped(self):
+        """The test is `confirm_at - now > FAILURE_RETRY_CAP`: equal is a legitimate delay."""
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0)
+        cycle(s, ('p', 'A'), T0 + 100, 'failed')                  # retry_at = confirm_at = T0 + 3700
+        s.confirmed(('p', 'A'))
+        s.unconfirmed(('p', 'A'), now=T0 + 101)
+        assert s.due_time(('p', 'A'), T0 + 100) == T0 + 100 + FAILURE_RETRY_CAP
+
+    def test_a_far_confirmation_end_to_end_with_a_retry_pending_goes_to_the_retry_not_now(self):
+        """The release it protects: after a failure and a big step back, the retry is not
+        pre-empted by an immediate confirmation."""
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0)
+        cycle(s, ('p', 'A'), T0 + 100, 'failed')
+        s.confirmed(('p', 'A'))
+        s.unconfirmed(('p', 'A'), now=T0 + 101)
+        back = T0 - 3 * D
+        assert key('p') not in s.dispatch(now=back)
 
     # -- released children are not staggered -----------------------------------------------------
 
@@ -1618,6 +1718,72 @@ class TestUnconfirmedAndRearm:
         s.update_pairs([sp('p/c', last=FRESH, order=1)], now=now)
         assert key('p/c') in s.due(now)
         assert s.due_time(('p/c', 'A'), now) <= now
+
+
+class TestConfirmationRunThatFoundNothing:
+    """End to end with the real class: a new parent whose first confirmation run is OK but confirmed
+    nothing (no snapshot yet). Before the fix the one-shot confirmation stayed spent and the child
+    waited for the parent's next regular slot, up to P (~P - F, 82800 s here)."""
+
+    @staticmethod
+    def _world(ci=CI):
+        """F = 1 h, P = 1 d, a new parent with one child, first seen 400 s after its first slot.
+        Returns (schedule, the time of the parent's first run)."""
+        s = make(ci=ci)
+        base = T0 + slot_offset(0.5, H, D, ci) + 400
+        s.update_pairs([sp('p', F=H, P=D, last=None), sp('p/c', F=H, P=D, last=None, order=1)], now=base)
+        return s, base + 300                                     # past the catch-up (frac * 300)
+
+    @staticmethod
+    def _run(s, name, now, outcome, confirmed):
+        s.started((name, 'A'), now=now)
+        s.finished((name, 'A'), outcome, now=now + 1)
+        if confirmed:
+            s.confirmed((name, 'A'))
+
+    @pytest.mark.parametrize('ci', [10, 60, 300, 900])
+    def test_the_child_is_released_within_the_gap_after_a_later_confirmed_run(self, ci):
+        s, now = self._world(ci)
+        gap = max(WAIT_RECHECK, ci)
+        assert s.dispatch(now=now) == [key('p')]                 # the confirmation run
+        self._run(s, 'p', now, 'ok', confirmed=False)            # OK, but no snapshot yet
+        first_start = now
+        assert s.held_by(('p/c', 'A')) == key('p')
+        assert key('p/c') not in s.due(now + 2)
+
+        wake = s.next_wakeup(now + 1)
+        assert wake is not None and wake - first_start <= gap, (wake, first_start, gap)
+        assert s.dispatch(now=wake - 1) == []                    # nothing earlier
+        assert s.dispatch(now=wake) == [key('p')]
+        self._run(s, 'p', wake, 'ok', confirmed=True)            # now the copy is confirmed
+
+        released = wake + 2
+        assert s.held_by(('p/c', 'A')) is None
+        assert key('p/c') in s.dispatch(now=released)
+        assert released - first_start <= gap + 2, 'not ~P - F later'
+
+    def test_the_wait_the_fix_removes_was_the_regular_slot_about_a_period_away(self):
+        """A confirmed run's own next regular slot is far beyond the re-arm gap."""
+        s, now = self._world()
+        self._run(s, 'p', now, 'ok', confirmed=True)
+        assert s.due_time(('p', 'A'), now + 2) - now > 10 * GAP
+
+    def test_the_unconfirmed_parent_is_due_again_at_the_gap_not_at_its_next_slot(self):
+        s, now = self._world()
+        self._run(s, 'p', now, 'ok', confirmed=False)
+        assert s.due_time(('p', 'A'), now + 2) == now + GAP
+
+    def test_it_keeps_asking_at_the_gap_while_nothing_is_confirmed(self):
+        s, now = self._world()
+        starts = []
+        for _ in range(5):
+            now = max(now, s.due_time(('p', 'A'), now))
+            assert s.dispatch(now=now) == [key('p')]
+            starts.append(now)
+            self._run(s, 'p', now, 'ok', confirmed=False)
+            now += 1
+        assert all(b - a == GAP for a, b in zip(starts, starts[1:]))
+        assert s.held_by(('p/c', 'A')) == key('p')
 
 
 class TestRegridKeepsTheRetry:
@@ -2055,7 +2221,15 @@ class TestNextWakeup:
         s.started(('p', 'A'), now=T0)
         assert s.next_wakeup(T0) is None                       # p runs, p/c is held
         s.finished(('p', 'A'), 'ok', now=T0 + 1)
+        s.confirmed(('p', 'A'))                                # a confirming run, as the worker feeds it
         assert s.next_wakeup(T0 + 1) == T0 + OFFSET            # p's next slot, not p/c's
+
+    def test_an_ok_that_confirmed_nothing_wakes_for_its_rearmed_confirmation_not_for_the_child(self):
+        s = make()
+        s.update_pairs([sp('p', last=FRESH), sp('p/c', last=FRESH, order=1)], now=T0)
+        s.started(('p', 'A'), now=T0)
+        s.finished(('p', 'A'), 'ok', now=T0 + 1)               # unconfirmed: re-armed at start + gap
+        assert s.next_wakeup(T0 + 1) == T0 + GAP
 
     def test_a_retry_is_a_wakeup(self):
         s = make()

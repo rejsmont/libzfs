@@ -64,7 +64,7 @@ from _remote_support import snapshot_presence  # noqa: F401  (fixture)
 from test_zfsbackup_chain import DEST as CHAIN_DEST, DS as CHAIN_DS, S1, S2, S3, Rig as ChainRig, listing, sinfo
 from zfsbackup.sendmemory import COPY_CONFIRMED, DRY_RUN_SENT, WAITING, SendMemory
 from zfsbackup.stopflag import StopFlag
-from zfsbackup.workers import ExitReason, RemoteBackupWorker
+from zfsbackup.workers import BaseWorker, ExitReason, RemoteBackupWorker
 
 PREFIX = 'autosnap'
 DEST = 'off'
@@ -1978,6 +1978,10 @@ class TestA2ParentFirst:
         rig.sender.confirm_raises = True
         cycle(rig.worker, rig.manager)
         assert rig.sender.confirm_calls == []
+        # The memory, not the sender, confirms: the parent's acknowledged send confirmed it, so the
+        # tree is sent in one cycle exactly as with a sender whose `copy_confirmed` does not raise
+        # (before B1 fix 1c a raising sender meant "not confirmed" and only the parent went).
+        assert rig.sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)]
 
     def test_only_the_memory_confirms_a_copy_a_senders_claim_does_not(self, rig, mocker):
         mocker.patch.object(rig.sender, 'copy_confirmed', return_value=True)       # the sender claims it
@@ -2184,6 +2188,40 @@ class TestA2ParentFirst:
         assert sender.attempts == []
         (warning,) = worker_warnings(caplog)
         assert f'cannot find {PARENT}, which it was expanded from; not sent' in warning
+
+    def test_the_orphan_warning_is_once_per_cycle_in_the_serial_worker(self, zfs_world, caplog, mocker):
+        """The ORPHAN_HOLD latch is once per episode in the memory (a scheduler asks every minute);
+        the serial worker's episode is one cycle, so `_get_datasets` resets it: the "cannot find ...
+        expanded from" WARNING is logged once in every cycle, twice over two cycles."""
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        sender = ScriptedSender(zfs_world)
+        worker = make_worker(cfg, sender)
+        # the configured parent is not among this cycle's pairs: the expanded child is an orphan
+        mocker.patch.object(BaseWorker, '_get_datasets', return_value=[])
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            for _ in range(2):
+                datasets = cycle(worker, manager)
+                assert [d.name for d in datasets] == [A] and PARENT not in worker._pairs
+        orphan = [w for w in worker_warnings(caplog)
+                  if f'cannot find {PARENT}, which it was expanded from; not sent' in w]
+        assert len(orphan) == 2, orphan
+        assert all(w.startswith(f'{A} -> {DEST}: ') for w in orphan)
+        assert sender.attempts == [], 'an orphan is never sent'
+
+    def test_within_one_cycle_the_orphan_warning_is_not_repeated(self, zfs_world, caplog, mocker):
+        """Contrast: without a new `_get_datasets` between them, the second ask is DEBUG only."""
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        manager = DatasetManager(cfg)
+        worker = make_worker(cfg, ScriptedSender(zfs_world))
+        mocker.patch.object(BaseWorker, '_get_datasets', return_value=[])
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            datasets = worker._get_datasets(manager)
+            for _ in range(3):
+                worker._process_dataset(manager, datasets[0])
+        assert len([w for w in worker_warnings(caplog) if 'which it was expanded from' in w]) == 1
 
     def test_a_configured_pair_is_never_held_whatever_the_lookup_says(self, zfs_world):
         add_tree(zfs_world, PARENT, A)

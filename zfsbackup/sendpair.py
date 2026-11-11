@@ -320,13 +320,17 @@ def send_pair(
     before and after the call. A NOT_DUE or WAITING pair learned nothing."""
     logger = logger if logger is not None else _logger
     destination = remote_cfg.destination
-    memory = rule.memory if rule is not None else _memory_of(sender)
     key = (dsi.name, destination)
-    before = memory.noted(COPY_CONFIRMED, key) if memory is not None else None
+    # What the copy's confirmation was before the call, read from the memory the
+    # rule carries, else from the RESOLVED sender: a `LazySender` has none, so
+    # `_send_pair` fills it in right after resolving it (still after R-2).
+    probe = _Probe()
+    if rule is not None or not isinstance(sender, LazySender):
+        probe.read(rule.memory if rule is not None else _memory_of(sender), key)
     try:
         outcome = _send_pair(
             manager, dsi, remote_cfg, sender, should_stop, exit_pending, rule, logger,
-            force_confirm,
+            force_confirm, probe, key,
         )
     except Exception as e:
         logger.error(
@@ -340,7 +344,24 @@ def send_pair(
             PAIR_STOPPED if exit_pending() else PAIR_FAILED,
             error=f"{type(e).__name__}: {e}",
         )
-    return replace(outcome, confirmed=_confirmation(outcome, manager, memory, key, before))
+    return replace(
+        outcome, confirmed=_confirmation(outcome, manager, probe.memory, key, probe.before)
+    )
+
+
+class _Probe:
+    """The sender memory a call reads its `PairOutcome.confirmed` from, and the
+    confirmation it held before the call."""
+
+    __slots__ = ('memory', 'before')
+
+    def __init__(self) -> None:
+        self.memory: Optional[SendMemory] = None
+        self.before: Optional[bool] = None
+
+    def read(self, memory: Optional[SendMemory], key) -> None:
+        self.memory = memory
+        self.before = memory.noted(COPY_CONFIRMED, key) if memory is not None else None
 
 
 def _memory_of(sender) -> Optional[SendMemory]:
@@ -369,7 +390,7 @@ def _confirmation(outcome: PairOutcome, manager, memory, key, before) -> Optiona
 
 def _send_pair(
     manager, dsi, remote_cfg, sender, should_stop, exit_pending, rule, logger,
-    force_confirm=False,
+    force_confirm=False, probe=None, key=None,
 ):
     destination = remote_cfg.destination
     if rule is not None:
@@ -381,6 +402,8 @@ def _send_pair(
             return PairOutcome(dsi.name, destination, PAIR_WAITING, detail=verdict)
     if isinstance(sender, LazySender):
         sender = sender.resolve()
+        if probe is not None and rule is None:
+            probe.read(_memory_of(sender), key)
     freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
     confirm = force_confirm or (rule is not None and rule.confirmation_due(manager, dsi, destination))
     anchor_name = None if confirm else manager.get_own_anchor(dsi, destination)

@@ -1086,6 +1086,49 @@ class TestConfirmedOutcome:
         outcome = run(sender=MemorySender(memory, True, confirms=True), rule=None)
         assert outcome.confirmed is True
 
+    def test_a_lazy_sender_without_a_rule_reports_the_confirmation_of_the_resolved_sender(self):
+        """No rule and a `LazySender`: the memory is the resolved sender's, read right after
+        `resolve()` (before it is asked to send). It was always `None` before."""
+        memory = SendMemory()
+        sender = LazySender(lambda: MemorySender(memory, True, confirms=True))
+        outcome = run(sender=sender, rule=None)
+        assert (outcome.kind, outcome.confirmed) == (PAIR_DONE, True)
+
+    def test_a_lazy_sender_without_a_rule_reports_a_vanished_copy_as_false(self):
+        """The resolved sender's memory held the note before the call and does not after it."""
+        memory = SendMemory()
+        memory.note(COPY_CONFIRMED, self.KEY)
+        sender = LazySender(lambda: MemorySender(memory, True, forgets=True))
+        outcome = run(sender=sender, rule=None)
+        assert (outcome.kind, outcome.confirmed) == (PAIR_DONE, False)
+
+    def test_a_lazy_sender_without_a_rule_that_learned_nothing_is_none(self):
+        memory = SendMemory()
+        sender = LazySender(lambda: MemorySender(memory, True))
+        assert run(sender=sender, rule=None).confirmed is None
+
+    def test_a_lazy_sender_without_a_rule_and_a_confirmed_copy_that_stays_is_true(self):
+        memory = SendMemory()
+        memory.note(COPY_CONFIRMED, self.KEY)
+        sender = LazySender(lambda: MemorySender(memory, True))
+        assert run(sender=sender, rule=None).confirmed is True
+
+    def test_a_lazy_sender_whose_resolve_raises_has_no_confirmation(self):
+        def resolve():
+            raise RuntimeError('no local manager')
+
+        outcome = run(sender=LazySender(resolve), rule=None)
+        assert (outcome.kind, outcome.error, outcome.confirmed) == (
+            PAIR_FAILED, 'RuntimeError: no local manager', None)
+
+    def test_a_lazy_sender_with_a_rule_still_reads_the_rules_memory(self):
+        """The rule's memory wins; the resolved sender's own is not consulted."""
+        rule_memory, sender_memory = SendMemory(), SendMemory()
+        rule = make_rule([make_dsi()], memory=rule_memory)
+        sender = LazySender(lambda: MemorySender(sender_memory, True, confirms=True))
+        outcome = run(sender=sender, rule=rule)
+        assert (outcome.kind, outcome.confirmed) == (PAIR_DONE, None)
+
     def test_an_exception_after_the_copy_was_confirmed_still_reports_it(self):
         memory = SendMemory()
         rule = make_rule([make_dsi()], memory=memory)

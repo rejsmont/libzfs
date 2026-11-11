@@ -592,8 +592,11 @@ class SendSchedule:
         * A catch-up, retry or confirmation time lying further ahead than the
           longest delay it is ever given (``CATCH_UP_CAP``, ``FAILURE_RETRY_CAP``;
           a confirmation is armed at ``now`` or, by `_rearm_confirmation`, no
-          later than a retry) is pulled back to that bound. The test is the distance itself,
-          so no legitimate delay is ever shortened.
+          later than a retry) is pulled back to that bound: a catch-up or retry
+          to ``now`` plus the cap, a confirmation to the pending retry (itself
+          just clamped) or, with none, to ``now``, so a failure's own backoff
+          still governs. The test is the distance itself, so no legitimate delay
+          is ever shortened.
         """
         p = st.spec.effective_period
         k = slot_index(now, p, st.offset)
@@ -606,7 +609,7 @@ class SendSchedule:
         if st.retry_at is not None and st.retry_at - now > FAILURE_RETRY_CAP:
             st.retry_at = now + FAILURE_RETRY_CAP
         if st.confirm_due and st.confirm_at - now > FAILURE_RETRY_CAP:
-            st.confirm_at = now
+            st.confirm_at = now if st.retry_at is None else max(now, st.retry_at)
 
     def _regular_due(self, st: _PairState, now: float) -> float:
         """The slot-based due time. Never re-runs an attempted slot: when the
@@ -803,10 +806,12 @@ class SendSchedule:
         ``WAITING``                False       asked again after ``WAIT_RECHECK``
         =========================  ==========  =====================================
 
-        ``NOT_DUE``, ``STOPPED`` and ``WAITING`` confirmed nothing: a pair that
-        is still unconfirmed with children waiting has its one-shot R-2
-        confirmation re-armed (`_rearm_confirmation`), or its children would
-        wait for ever (`started` spent the one-shot).
+        Every outcome but a failure may have confirmed nothing (``NOT_DUE``,
+        ``STOPPED`` and ``WAITING`` always; an ``OK`` when there was no snapshot
+        yet): a pair that is still unconfirmed with children waiting has its
+        one-shot R-2 confirmation re-armed (`_rearm_confirmation`), or its
+        children would wait for ever (`started` spent the one-shot). The
+        caller's `confirmed()` after an ``OK`` that did confirm clears it.
 
         A pair no longer in the schedule only releases its cap slot and
         returns ``False`` (its record goes at the next ``retain``).
@@ -837,8 +842,11 @@ class SendSchedule:
                 # Overrun: slots passed while it ran. One coalesced follow-up,
                 # due now (armed on time: not an outage catch-up).
                 st.armed, st.catchup_at = k, None
-            if kind is Outcome.NOT_DUE:
-                self._rearm_confirmation(st, now)
+            # A DONE that confirmed nothing (no snapshot yet, a sender that
+            # settled no copy) has used up the one-shot too: re-arm it. The
+            # caller's `confirmed()`, which follows, clears it again when the
+            # run did confirm the copy.
+            self._rearm_confirmation(st, now)
             return kind is Outcome.OK
         if kind is Outcome.STOPPED:
             self._rearm_confirmation(st, now)
@@ -885,13 +893,15 @@ class SendSchedule:
     def _rearm_confirmation(self, st: _PairState, now: float) -> None:
         """Make the one-shot R-2 confirmation due again, for an unconfirmed
         pair with children (else nothing). Never hot: it is due no earlier than
-        ``WAIT_RECHECK`` after the pair's last start and no earlier than a
-        pending retry, so a sender that keeps answering "nothing" (or failing)
-        is asked once a minute at most, and a failure's own backoff still
-        governs."""
+        ``max(WAIT_RECHECK, check_interval)`` after the pair's last start (the
+        snapshot worker needs a ``check_interval`` to make the snapshot a
+        "nothing" answer is waiting for) and no earlier than a pending retry,
+        so a sender that keeps answering "nothing" (or failing) is asked that
+        rarely at most, and a failure's own backoff still governs."""
         if st.confirmed or not st.children:
             return
-        at = now if st.last_start is None else max(now, st.last_start + WAIT_RECHECK)
+        gap = max(WAIT_RECHECK, self.check_interval)
+        at = now if st.last_start is None else max(now, st.last_start + gap)
         if st.retry_at is not None:
             at = max(at, st.retry_at)
         st.confirm_used = False
