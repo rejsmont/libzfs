@@ -27,6 +27,7 @@ and the faults a test can inject, per PARENT (the batch is the unit):
 
     "fail_tree": [parent, ...]         # the recursive snapshot listing exits 1
     "garbage_tree": [parent, ...]      # ... prints a row nobody can trust (strict listing refuses it)
+    "garbage_first": [parent, ...]     # ... prints such a row FIRST and then the real listing
     "fail_props1": [parent, ...]       # phase 1 exits 1
     "fail_rows": [parent, ...]         # phase 2 exits 1 (a received server's batch read too)
     "vanish": {dataset: [prop, ...]}   # phase 2 prints them unset though phase 1 listed them: a disagreement, always
@@ -39,6 +40,8 @@ A server's `check` also lists the target (`list -H [-r] -t filesystem[,volume] -
 "datasets") and reads the received datasets' `client_id`/`config` in ONE batch (B-1d):
 `get -H -o name,property,value,source -r -t filesystem,volume name,type,<p1>,<p2> <target>`, printed the way
 zfs does: `name`, `type`, then each requested property in order, `-` when unset, every set one `local`.
+A snapshot or dataset name may contain a non-ASCII character (printed as UTF-8): libzfseasy cannot represent
+it and skips it.
 A recursive dataset's descendants (A3) are named by `list -H -r -t filesystem,volume -o name,type <parent>` (from
 "datasets") and its backup-copy markers by the value-free
 `get -H -o name,property,source -s local,received,inherited -r -t filesystem,volume <props> <parent>`: one
@@ -52,6 +55,11 @@ import json
 import os
 import sys
 import time
+
+# Names are printed as UTF-8 whatever the locale says: a test plants a non-ASCII snapshot or dataset name that
+# libzfseasy cannot represent. (zfs prints names as bytes; a surrogate escape stays a byte.)
+sys.stdout.reconfigure(encoding="utf-8", errors="surrogateescape")
+sys.stderr.reconfigure(encoding="utf-8", errors="surrogateescape")
 
 args = sys.argv[1:]
 with open(os.environ["FAKECHECK_LOG"], "a", encoding="utf-8") as log:
@@ -201,6 +209,8 @@ if args[:2] == ["list", "-H"] and flag("-t") == "snapshot":
         if root in spec.get("garbage_tree", []):
             print("garbage with the wrong number of columns")
             sys.exit(0)
+        if root in spec.get("garbage_first", []):
+            print("garbage with the wrong number of columns")
         order = list(spec.get("datasets", {}))
         below = [n for n in snapshots if n == root or n.startswith(root + "/")]
         below.sort(key=lambda n: (order.index(n) if n in order else len(order), n))

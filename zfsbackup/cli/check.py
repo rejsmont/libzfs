@@ -326,7 +326,8 @@ def worker_entries(
 #: 2 x this + 30 s, so it assumes this default.
 DEFAULT_TIME_LIMIT = 60.0
 #: `--per-call-timeout` default: seconds one `zfs` command may run (the same
-#: value as `health_collect.DEFAULT_PER_CALL_SECONDS`).
+#: value as `health_collect.DEFAULT_PER_CALL_SECONDS`), except the batched reads
+#: of a large tree, which may use all the time left of `--time-limit`.
 DEFAULT_PER_CALL_TIMEOUT = 10.0
 
 
@@ -360,8 +361,9 @@ def gather(
 ) -> Tuple[Any, List[Any]]:
     """Everything `check` reports: -> `(health module, entries)`. Read-only.
     `time_limit` bounds the whole ZFS collection and `per_call` each `zfs`
-    command (seconds; `None` = unbounded); what a passed limit left unchecked is
-    one WARN entry."""
+    command (seconds; `None` = unbounded), except the batched reads of a large
+    tree, which get the time left of `time_limit`; what a passed limit left
+    unchecked is one WARN entry."""
     from zfsbackup import health
 
     # Validate the factors before any ZFS or database work.
@@ -652,8 +654,12 @@ def register(
             "output to FILE atomically instead of stdout (for node_exporter's textfile "
             "collector).\n\n"
             "Time bound: the ZFS reads stop after --time-limit seconds (default 60) in all, "
-            "and any one zfs command after --per-call-timeout seconds (default 10); what was "
-            "not checked in time is reported as one WARN entry '(time limit)', never as OK. "
+            "and any one zfs command after --per-call-timeout seconds (default 10), except "
+            "the batched reads of a large tree (a recursive dataset's snapshot and property "
+            "reads, the received datasets' listing and property read), which may use all the "
+            "time left of --time-limit; what was not checked in time is reported as one WARN "
+            "entry '(time limit)', never as OK. --time-limit may be overshot by a few seconds "
+            "at most (a timed-out zfs child needs up to about 6 s to be killed). "
             "0 or none turns a limit off. A caller's own timeout must exceed --time-limit "
             "plus a few seconds: NRPE's -t (command_timeout) must be larger than it, or NRPE "
             "kills the check and reports a timeout instead. The systemd unit "
@@ -691,8 +697,12 @@ def register(
     @click.option("--per-call-timeout", "per_call_timeout", default=str(int(DEFAULT_PER_CALL_TIMEOUT)),
                   show_default=True, metavar="SECONDS",
                   callback=_seconds_option("per_call_timeout"),
-                  help="Give up on one zfs command after SECONDS (a hung pool then costs this, "
-                       "not the whole --time-limit). 0 or none: no per-command limit.")
+                  help="Give up on one zfs command after SECONDS, except the batched reads of a "
+                       "large tree (a recursive dataset's snapshot and property reads, the "
+                       "received datasets' listing and property read), which may use all the "
+                       "time left of --time-limit (or SECONDS if --time-limit is off); a hung "
+                       "pool then costs this, not the whole --time-limit. 0 or none: no "
+                       "per-command limit.")
     @click.option("--output", "-o", "output", default=None, metavar="FILE",
                   help="Write the output to FILE (atomically) instead of stdout.")
     @click.option("--warn-factor", type=float, default=2.0, show_default=True, metavar="N",

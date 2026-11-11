@@ -201,6 +201,19 @@ Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 a
 
 ## Follow-ups found during Track A (not yet scheduled)
 
+- **`check` docs and residuals, from the last collector review (low; fold into A5):**
+  - `--per-call-timeout` help: "a hung pool then costs this, not the whole --time-limit" is no longer true for the
+    batched reads (a slow or killable-hung pool can spend the time left there). The help also omits the expansion and
+    `_copy_roots` from the batched reads.
+  - Docstrings: the M1 example "an umlaut in its name" is wrong (zfs names are ASCII; the real triggers are names zfs
+    allows and libzfseasy refuses, e.g. a component starting with `.`/`-`); the overshoot text says "up to 2 s to
+    join the stderr reader" (it is 0.05 s).
+  - M1 relies on libzfseasy's error text ("…the first: libzfseasy cannot represent the name"). It is pinned by
+    `test_framing.py` today, but not across repositories once libzfseasy moves. Better: `zfs.list(strict=True,
+    skip_unrepresentable=True)` in libzfseasy (an API addition, needs approval), which also avoids listing twice.
+  - Optional: skip a parent's batched reads when its own read just timed out. Optional: re-read the properties when
+    an anchor name is missing from the listing (a send plus a prune inside the batch window).
+
 - **From the final A2d/A2e review (all low):**
   1. The boundary retry gives up inside the `-r` FALLBACK. That fallback runs when an unrepresentable name sits below
      the dataset, or when the argv bound is hit. The retry's strict re-listing, or `many`'s bound, fails again, so the

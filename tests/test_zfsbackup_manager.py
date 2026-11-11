@@ -5217,3 +5217,423 @@ class TestReceivedDatasetsScope:
     def test_a_remote_backup_that_is_off_never_enters_it(self):
         scope = self.Scope()
         assert DatasetManager(_make_config()).received_datasets(scope=scope) == [] and scope.calls == 0
+
+
+# ===========================================================================
+# check's review fixes (M1): `_list_snapshot_tree_strict` and a name libzfseasy cannot represent
+# ===========================================================================
+
+class TestListSnapshotTreeUnrepresentableNames:
+    """A snapshot or dataset name with a non-ASCII character (libzfseasy's names are ASCII) beside a good
+    snapshot used to refuse the whole strict listing ("could not be trusted") and with it EVERY child of the
+    parent. Now the listing is read once more without `strict` (libzfseasy skips and logs the name), but only
+    when that name is the FIRST untrusted row; every other refusal still raises."""
+
+    GOOD = 'autosnap_20240101120000'
+    GOOD2 = 'autosnap_20240102120000'
+    ODD_SNAP = list_row('autosnap_20240103120000é', 'pool/data/x', txg=9)
+    ODD_DATASET = list_row('autosnap_20240103120000', 'pool/data/über', txg=9)
+    WRONG_COLUMNS = 'pool/data@autosnap_20240102120000\tsnapshot\t6\n'
+
+    @pytest.fixture(autouse=True)
+    def _fresh_warning_registry(self):
+        import libzfseasy.zfs as lz
+
+        lz._warned_names.clear()
+        yield
+        lz._warned_names.clear()
+
+    def run(self, mock_subprocess, mocker, *rows, execs=2, **kw):
+        """The tree of `pool/data` over `rows` (the same stdout for each of `execs` execs); the `zfs.list`
+        spy is returned with it."""
+        mock_subprocess.setup_multi(*[(list(rows),)] * execs)
+        spy = mocker.patch('zfsbackup.backup_manager.zfs.list', wraps=zfs_list_real())
+        return _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'), **kw), spy
+
+    @staticmethod
+    def names(tree):
+        return {k: [s.name for s in v] for k, v in tree.items()}
+
+    @pytest.mark.parametrize('odd', [ODD_SNAP, ODD_DATASET], ids=['snapshot', 'dataset'])
+    def test_a_non_ascii_name_is_skipped_and_the_good_snapshots_are_listed(self, mock_subprocess, mocker, odd):
+        tree, _ = self.run(
+            mock_subprocess, mocker,
+            list_row(self.GOOD, 'pool/data', txg=5), odd, list_row(self.GOOD2, 'pool/data/y', txg=6))
+        assert self.names(tree) == {'pool/data': [self.GOOD], 'pool/data/y': [self.GOOD2]}
+
+    def test_the_name_path_is_exactly_two_execs_strict_first_then_not(self, mock_subprocess, mocker):
+        _, spy = self.run(
+            mock_subprocess, mocker, list_row(self.GOOD, 'pool/data', txg=5), self.ODD_SNAP)
+        assert mock_subprocess.call_count == 2
+        assert [c.kwargs['strict'] for c in spy.call_args_list] == [True, False]
+        assert all(c.kwargs['roots'].name == 'pool/data' and c.kwargs['recursive'] for c in spy.call_args_list)
+
+    def test_a_clean_listing_is_one_strict_exec(self, mock_subprocess, mocker):
+        _, spy = self.run(mock_subprocess, mocker, list_row(self.GOOD, 'pool/data', txg=5), execs=1)
+        assert mock_subprocess.call_count == 1
+        assert [c.kwargs['strict'] for c in spy.call_args_list] == [True]
+
+    def test_libzfseasy_logs_the_skipped_name_once_at_warning(self, mock_subprocess, mocker, caplog):
+        with caplog.at_level(logging.DEBUG):
+            self.run(mock_subprocess, mocker, list_row(self.GOOD, 'pool/data', txg=5), self.ODD_SNAP)
+        skips = [r for r in caplog.records if r.name == 'libzfseasy' and r.levelno == logging.WARNING
+                 and r.getMessage().startswith('skipping ') and 'cannot represent' in r.getMessage()]
+        assert len(skips) == 1 and 'pool/data/x@autosnap_20240103120000é' in skips[0].getMessage()
+        # zfsbackup itself does not escalate: no ERROR, and no "could not be trusted" outside DEBUG
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not [r for r in caplog.records if r.levelno > logging.DEBUG and 'could not be trusted' in r.getMessage()]
+
+    def test_a_wrong_column_count_first_still_raises_after_one_exec(self, mock_subprocess, mocker):
+        mock_subprocess.setup_multi(
+            ([self.WRONG_COLUMNS, list_row(self.GOOD, 'pool/data', txg=5), self.ODD_SNAP],),
+            ([self.WRONG_COLUMNS, list_row(self.GOOD, 'pool/data', txg=5), self.ODD_SNAP],))
+        with pytest.raises(Exception, match='could not be trusted.*expected 8 columns'):
+            _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+        assert mock_subprocess.call_count == 1
+
+    @pytest.mark.parametrize('rows', [
+        [list_row('autosnap_20240101120000', 'pool/other', txg=5)],
+        [list_row('autosnap_20240101120000', 'pool/data', txg=5)] * 2,
+    ], ids=['out-of-scope', 'duplicate'])
+    def test_other_first_refusals_raise_without_a_second_read(self, mock_subprocess, rows):
+        mock_subprocess.setup_multi((rows,), (rows,))
+        with pytest.raises(Exception, match='could not be trusted') as info:
+            _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+        assert 'cannot represent' not in str(info.value)
+        assert mock_subprocess.call_count == 1
+
+    def test_a_failed_exec_raises_without_a_second_read(self, mock_subprocess):
+        _fail_get(mock_subprocess, 'cannot open pool/data: pool I/O is currently suspended')
+        with pytest.raises(Exception, match='suspended'):
+            _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+        assert mock_subprocess.call_count == 1
+
+    @pytest.mark.parametrize('message', [
+        'zfs list output could not be trusted: 1 row skipped, the first: expected 8 columns, got 3',
+        'something else entirely, the first: libzfseasy cannot represent the name',     # not the untrusted refusal
+        'zfs list output could not be trusted: 2 rows skipped, the first: name outside the requested roots',
+        'zfs list timed out after 10 s',
+    ])
+    def test_only_the_untrusted_refusal_about_a_name_is_retried(self, mocker, message):
+        spy = mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=Exception(message))
+        with pytest.raises(Exception) as info:
+            _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+        assert str(info.value) == message and spy.call_count == 1
+
+    def test_the_refusal_about_a_name_is_retried_exactly_once(self, mocker):
+        message = ('zfs list output could not be trusted: 1 row skipped, the first: '
+                   'libzfseasy cannot represent the name (x)')
+        spy = mocker.patch('zfsbackup.backup_manager.zfs.list', side_effect=[Exception(message), Exception(message)])
+        with pytest.raises(Exception, match='cannot represent the name'):
+            _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+        assert spy.call_count == 2
+
+    @pytest.mark.parametrize('corrupt', [
+        [WRONG_COLUMNS],
+        [list_row('autosnap_20240101120000', 'pool/data', txg=5)] * 2,
+    ], ids=['wrong-columns', 'duplicate'])
+    def test_the_documented_residual_a_corrupt_row_beside_an_unrepresentable_name_is_tolerated(
+            self, mock_subprocess, mocker, corrupt):
+        """libzfseasy's refusal names only the FIRST untrusted row (a duplicate is found after all the rows, so
+        any unrepresentable name outranks it); zfs cannot print either from these columns, so the second read
+        skips the row with a WARNING instead of refusing. This pins the documented trade-off."""
+        tree, spy = self.run(
+            mock_subprocess, mocker, self.ODD_SNAP, list_row(self.GOOD2, 'pool/data/y', txg=6), *corrupt)
+        assert mock_subprocess.call_count == 2
+        assert [c.kwargs['strict'] for c in spy.call_args_list] == [True, False]
+
+
+def zfs_list_real():
+    from zfsbackup import backup_manager
+    return backup_manager.zfs.list
+
+
+class TestListSnapshotTreeScope:
+    """`_list_snapshot_tree_strict(scope=)`: one scope entry per `zfs list` exec, the second read included."""
+
+    class Scope:
+        def __init__(self, refuse_from=None):
+            self.entries, self.refuse_from = 0, refuse_from
+
+        def __call__(self):
+            self.entries += 1
+            if self.refuse_from is not None and self.entries >= self.refuse_from:
+                from libzfseasy.zfs import ZFSTimeoutError
+                raise ZFSTimeoutError("the check's time limit (60 s) is spent")
+            import contextlib
+            return contextlib.nullcontext()
+
+    ODD = list_row('autosnap_20240103120000é', 'pool/data', txg=9)
+
+    @pytest.fixture(autouse=True)
+    def _fresh_warning_registry(self):
+        import libzfseasy.zfs as lz
+
+        lz._warned_names.clear()
+        yield
+        lz._warned_names.clear()
+
+    def test_a_clean_listing_enters_the_scope_once(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[list_row('autosnap_20240101120000', 'pool/data', txg=5)])
+        scope = self.Scope()
+        _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'), scope=scope)
+        assert scope.entries == 1 and mock_subprocess.call_count == 1
+
+    def test_the_second_read_after_a_name_enters_it_again(self, mock_subprocess):
+        rows = [list_row('autosnap_20240101120000', 'pool/data', txg=5), self.ODD]
+        mock_subprocess.setup_multi((rows,), (rows,))
+        scope = self.Scope()
+        _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'), scope=scope)
+        assert scope.entries == 2 and mock_subprocess.call_count == 2
+
+    def test_a_refused_second_entry_runs_no_second_exec(self, mock_subprocess):
+        from libzfseasy.zfs import ZFSTimeoutError
+        rows = [list_row('autosnap_20240101120000', 'pool/data', txg=5), self.ODD]
+        mock_subprocess.setup_multi((rows,), (rows,))
+        with pytest.raises(ZFSTimeoutError, match='time limit'):
+            _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'), scope=self.Scope(refuse_from=2))
+        assert mock_subprocess.call_count == 1
+
+    def test_a_refused_first_entry_runs_nothing(self, mock_subprocess):
+        from libzfseasy.zfs import ZFSTimeoutError
+        mock_subprocess.setup(stdout=[])
+        with pytest.raises(ZFSTimeoutError):
+            _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'), scope=self.Scope(refuse_from=1))
+        assert mock_subprocess.call_count == 0
+
+    def test_without_a_scope_nothing_changes(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[list_row('autosnap_20240101120000', 'pool/data', txg=5)])
+        tree = _hourly_manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+        assert list(tree) == ['pool/data']
+
+
+# ===========================================================================
+# check's review fixes (L1): every exec of the two-step property read enters the scope
+# ===========================================================================
+
+class TestPropertyReadScopePerExec:
+    ANCHOR = PROP_ANCHOR_PREFIX + 'a'
+    PIN = PROP_INFLIGHT_PREFIX + 'a'
+    BOTH = (PROP_ANCHOR_PREFIX, PROP_INFLIGHT_PREFIX)
+    PHASE1 = ['get', '-H', '-o', 'name,property,source']
+    PHASE2 = ['get', '-H', '-o', 'name,property,value,source']
+
+    @pytest.fixture
+    def world(self, mock_subprocess):
+        w = ZfsWorld(mock_subprocess)
+        w.add('pool/data')
+        w.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (self.PIN, 'a,b', 'local')])
+        return w
+
+    @pytest.fixture
+    def events(self, world):
+        """`[('scope',) | ('exec', verb-ish), ...]` in the order they happen."""
+        log = []
+        world.on_exec = lambda argv: log.append(('exec', 'phase1' if argv[:4] == self.PHASE1 else 'phase2'))
+        return log
+
+    def scope(self, log, refuse_from=None):
+        entries = []
+
+        def enter():
+            entries.append(1)
+            log.append(('scope',))
+            if refuse_from is not None and len(entries) >= refuse_from:
+                from libzfseasy.zfs import ZFSTimeoutError
+                raise ZFSTimeoutError('time limit spent')
+            import contextlib
+            return contextlib.nullcontext()
+        return enter
+
+    def read(self, **kw):
+        from zfsbackup.backup_manager import read_descendant_zfsbackup_properties
+        return read_descendant_zfsbackup_properties(Filesystem('pool/data'), prefix=self.BOTH, **kw)
+
+    def test_each_exec_enters_the_scope_right_before_it_runs(self, world, events):
+        assert self.read(scope=self.scope(events)) == {'pool/data/x': {self.ANCHOR: 's1', self.PIN: 'a,b'}}
+        assert events == [('scope',), ('exec', 'phase1'), ('scope',), ('exec', 'phase2')]
+
+    def test_a_retry_enters_it_four_times_in_all(self, world, events):
+        state = {'phase2': 0}
+        inner = world.on_exec
+
+        def lose_the_pin_once(argv):
+            inner(argv)
+            if argv[:4] == self.PHASE2:
+                state['phase2'] += 1
+                if state['phase2'] == 1:
+                    world.set_props('pool/data/x', [(self.ANCHOR, 's1', 'local')])
+
+        world.on_exec = lose_the_pin_once
+        got = self.read(scope=self.scope(events))
+        assert got == {'pool/data/x': {self.ANCHOR: 's1'}}
+        assert events == [('scope',), ('exec', 'phase1'), ('scope',), ('exec', 'phase2')] * 2
+
+    def test_nothing_below_carries_a_property_is_one_scope_and_one_exec(self, world, events):
+        world.set_props('pool/data/x', [])
+        assert self.read(scope=self.scope(events)) == {}
+        assert events == [('scope',), ('exec', 'phase1')]
+
+    def test_a_scope_refused_before_phase_two_runs_no_phase_two(self, world, events):
+        from libzfseasy.zfs import ZFSTimeoutError
+        with pytest.raises(ZFSTimeoutError, match='time limit'):
+            self.read(scope=self.scope(events, refuse_from=2))
+        assert events == [('scope',), ('exec', 'phase1'), ('scope',)]
+        assert world.value_reads == []
+
+    def test_a_scope_refused_before_the_retry_runs_nothing_more(self, world, events):
+        from libzfseasy.zfs import ZFSTimeoutError
+        inner = world.on_exec
+
+        def lose_the_pin(argv):
+            inner(argv)
+            if argv[:4] == self.PHASE2:
+                world.set_props('pool/data/x', [(self.ANCHOR, 's1', 'local')])
+
+        world.on_exec = lose_the_pin
+        with pytest.raises(ZFSTimeoutError):
+            self.read(scope=self.scope(events, refuse_from=3))
+        assert [e for e in events if e[0] == 'exec'] == [('exec', 'phase1'), ('exec', 'phase2')]
+
+    def test_the_own_read_enters_it_per_exec_too(self, world, events):
+        from zfsbackup.backup_manager import _read_own_properties
+        got = _read_own_properties(Filesystem('pool/data/x'), False, scope=self.scope(events))
+        assert got == {'pool/data/x': {self.ANCHOR: 's1', self.PIN: 'a,b'}}
+        assert events == [('scope',), ('exec', 'phase1'), ('scope',), ('exec', 'phase2')]
+
+    def test_without_a_scope_nothing_changes(self, world):
+        assert self.read() == {'pool/data/x': {self.ANCHOR: 's1', self.PIN: 'a,b'}}
+        assert len(world.discoveries) == 1 and len(world.value_reads) == 1
+
+    def test_scope_is_keyword_only(self, world):
+        from zfsbackup.backup_manager import read_descendant_zfsbackup_properties
+        with pytest.raises(TypeError):
+            read_descendant_zfsbackup_properties(Filesystem('pool/data'), None, self.BOTH, lambda: None)
+
+
+# ===========================================================================
+# check's review fixes (M2, L1): the received discovery's bulk scope, one scope per fallback read
+# ===========================================================================
+
+class TestReceivedDatasetsBulkScope:
+    NAMES = TestReceivedDatasetsScope.NAMES
+
+    class Scope(TestReceivedDatasetsScope.Scope):
+        def __init__(self, log=None, label='scope', error=None):
+            super().__init__(error)
+            self.log, self.label = log, label
+
+        def __call__(self):
+            if self.log is not None:
+                self.log.append(('scope', self.label))
+            return super().__call__()
+
+    def traced(self, fake):
+        """Record each of `fake`'s execs in `log` (it shares the list with the scopes)."""
+        log = []
+        for kind in ('list', 'rows', 'value'):
+            mock = getattr(fake, kind)
+            inner = mock.side_effect
+            mock.side_effect = (lambda *a, _k=kind, _i=inner, **kw: (log.append(('exec', _k)), _i(*a, **kw))[1])
+        return log
+
+    def local(self):
+        return {n: _client_props('c') for n in self.NAMES}
+
+    def test_the_listing_and_the_batch_use_the_bulk_scope_and_nothing_else_does(self, mocker):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        log = self.traced(fake)
+        found = _remote_manager().received_datasets(
+            scope=self.Scope(log, 'single'), bulk_scope=self.Scope(log, 'bulk'))
+        assert [d.name for d in found] == self.NAMES
+        assert log == [('scope', 'bulk'), ('exec', 'list'), ('scope', 'bulk'), ('exec', 'rows')]
+
+    def test_the_per_dataset_fallback_uses_the_plain_scope(self, mocker):
+        """The batch read fails (a batch that cannot be trusted): the dataset is read one property at a time,
+        each read in a scope of its own, the plain one (it does not grow with the tree)."""
+        fake = FakeReceived(mocker, self.NAMES, local=self.local())          # no batch rows: the exact path
+        log = self.traced(fake)
+        found = _remote_manager().received_datasets(
+            scope=self.Scope(log, 'single'), bulk_scope=self.Scope(log, 'bulk'))
+        assert [d.name for d in found] == self.NAMES
+        assert log[:4] == [('scope', 'bulk'), ('exec', 'list'), ('scope', 'bulk'), ('exec', 'rows')]
+        reads = log[4:]
+        assert reads == [('scope', 'single'), ('exec', 'value'), ('scope', 'single'), ('exec', 'value')] * 2
+
+    def test_without_a_bulk_scope_the_plain_scope_is_used_for_everything(self, mocker):
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        log = self.traced(fake)
+        _remote_manager().received_datasets(scope=self.Scope(log, 'single'), bulk_scope=None)
+        assert log == [('scope', 'single'), ('exec', 'list'), ('scope', 'single'), ('exec', 'rows')]
+
+    def test_a_bulk_scope_that_refuses_is_a_failed_discovery_not_an_exception(self, mocker):
+        from libzfseasy.zfs import ZFSTimeoutError
+        fake = FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        log = self.traced(fake)
+        manager = _remote_manager()
+        assert manager.received_datasets(
+            scope=self.Scope(log, 'single'),
+            bulk_scope=self.Scope(log, 'bulk', error=ZFSTimeoutError('time limit spent'))) == []
+        assert manager.last_received_error == 'ZFSTimeoutError: time limit spent'
+        assert [e for e in log if e[0] == 'exec'] == []
+
+    def test_the_bulk_scope_alone_changes_nothing_about_the_result(self, mocker):
+        FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        manager = _remote_manager()
+        plain = [d.name for d in manager.received_datasets()]
+        bulk = [d.name for d in manager.received_datasets(bulk_scope=self.Scope())]
+        assert plain == bulk == self.NAMES
+
+    def test_the_fallback_enters_one_scope_per_get_value_three_for_a_container(self, mocker):
+        """client_id, config (local), then config (received): a container has neither locally, so three
+        execs, three scopes (they were one scope for all three)."""
+        fake = FakeReceived(mocker, ['pool/backups/c'])
+        log = self.traced(fake)
+        info, problem = _remote_manager()._received_dataset_info(
+            Filesystem('pool/backups/c'), 'pool/backups', None, scope=self.Scope(log, 'single'))
+        assert (info, problem) == (None, None)
+        assert log == [('scope', 'single'), ('exec', 'value')] * 3
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        assert [r[1:] for r in fake.reads] == [(PROP_CLIENT_ID, 'local'), (PROP_CONFIG, 'local'),
+                                              (PROP_CONFIG, 'received')]
+
+    def test_the_fallback_of_a_client_dataset_is_two_scopes(self, mocker):
+        fake = FakeReceived(mocker, self.NAMES[:1], local=self.local())
+        log = self.traced(fake)
+        info, problem = _remote_manager()._received_dataset_info(
+            Filesystem(self.NAMES[0]), 'pool/backups', None, scope=self.Scope(log, 'single'))
+        assert info is not None and problem is None
+        assert log == [('scope', 'single'), ('exec', 'value')] * 2
+
+    def test_a_scope_refused_for_the_second_read_runs_no_third(self, mocker):
+        from libzfseasy.zfs import ZFSTimeoutError
+        fake = FakeReceived(mocker, ['pool/backups/c'])
+        scope = self.Scope()
+        entries = []
+
+        def enter():
+            entries.append(1)
+            if len(entries) == 2:
+                raise ZFSTimeoutError('time limit spent')
+            return scope()
+
+        with pytest.raises(ZFSTimeoutError):
+            _remote_manager()._received_dataset_info(
+                Filesystem('pool/backups/c'), 'pool/backups', None, scope=enter)
+        assert len(fake.reads) == 1
+
+    def test_local_copies_do_not_pass_a_bulk_scope(self, mocker):
+        """The daemon's local discovery is unchanged: `_discover_under` gets its own `scope` and no `bulk_scope`."""
+        from zfsbackup.config import Destination
+        FakeReceived(mocker, [])
+        spy = mocker.spy(DatasetManager, '_discover_under')
+        manager = DatasetManager(_make_config(destinations={'loc': Destination(url='zfs:pool/bk')}))
+        manager.local_copies('cid')
+        assert spy.call_count == 1
+        assert callable(spy.call_args.kwargs['scope']) and spy.call_args.kwargs.get('bulk_scope') is None
+
+    def test_the_servers_own_call_passes_no_scope_at_all(self, mocker):
+        FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        spy = mocker.spy(DatasetManager, '_discover_under')
+        _remote_manager().received_datasets()
+        assert spy.call_args.kwargs.get('scope') is None and spy.call_args.kwargs.get('bulk_scope') is None

@@ -60,11 +60,11 @@ CLOCK_TOLERANCE = timedelta(minutes=5)
 #: as it always was.
 #:
 #: The overall budget is checked when a scope is entered, not during a
-#: command: a scope entered just before the deadline still runs its commands
-#: (the per-dataset fallback reads three properties in one scope), each up to
-#: `min(LOCAL_DISCOVER_COMMAND_BUDGET, time left)`, so one target's discovery
-#: can end up to about two minutes past `LOCAL_DISCOVER_BUDGET` (plus the
-#: seconds a timed-out child needs to be terminated).
+#: command, and every command enters its own scope (the per-dataset fallback
+#: reads its three properties in three), each up to
+#: `min(LOCAL_DISCOVER_COMMAND_BUDGET, time left)`: one target's discovery
+#: ends within the seconds a timed-out child needs to be terminated of
+#: `LOCAL_DISCOVER_BUDGET`.
 LOCAL_DISCOVER_COMMAND_BUDGET = 60.0
 LOCAL_DISCOVER_BUDGET = 600.0
 
@@ -184,8 +184,11 @@ def _read_own_properties_once(
     ds: Dataset, recursive: bool, also: Tuple[str, ...] = (),
     sources: Optional[Dict[str, Dict[str, str]]] = None,
     prefix: Union[str, Tuple[str, ...]] = PROP_PREFIX,
+    scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
 ) -> Dict[str, Dict[str, str]]:
-    """One attempt of `_read_own_properties` (two execs). `also` (own read only)
+    """One attempt of `_read_own_properties` (two execs, each in its own
+    `scope()`, a context manager such as a `libzfseasy.timeout`; none by
+    default, and `scope` may raise to refuse an exec). `also` (own read only)
     names properties that are asked for in phase 2 whether or not phase 1 saw
     them. `sources`, when given, is filled with `{object: {property: source}}`
     (`local` or `received`) of the rows that were read. `prefix` narrows phase
@@ -201,13 +204,15 @@ def _read_own_properties_once(
 
     # Phase 1: which org.zfsbackup:* properties exist, and where they come
     # from. No value column, so nothing an owner writes can disturb it.
-    found = [
-        r for r in zfs.get.property_sources(
-            ds, types='filesystem,volume', sources=list(_OWN_SOURCES),
-            recursive=recursive, prefix=prefix if isinstance(prefix, str) else list(prefix),
-        )
-        if in_scope(r.name)
-    ]
+    scope = scope or _no_scope
+    with scope():
+        found = [
+            r for r in zfs.get.property_sources(
+                ds, types='filesystem,volume', sources=list(_OWN_SOURCES),
+                recursive=recursive, prefix=prefix if isinstance(prefix, str) else list(prefix),
+            )
+            if in_scope(r.name)
+        ]
     expected = {(r.name, r.property) for r in found}
     if recursive and not expected:
         # Nothing below `ds` carries a property of ours: that is the answer,
@@ -221,14 +226,15 @@ def _read_own_properties_once(
     # missing row cannot go unnoticed. With no names the read asks for `type`
     # alone, which is what proves the dataset itself was read.
     names = list(dict.fromkeys([r.property for r in found] + list(also))) or ['type']
-    rows = zfs.get.rows(
-        ds, names, types='filesystem,volume', recursive=recursive,
-        received=False, strict=True,
-        # Phase 1 (unforgeable, names only) is the completeness oracle: every
-        # object that has one of our properties is in it and must come back
-        # below with the same ones, so a name-only `zfs list` adds nothing.
-        verify_names=False,
-    )
+    with scope():
+        rows = zfs.get.rows(
+            ds, names, types='filesystem,volume', recursive=recursive,
+            received=False, strict=True,
+            # Phase 1 (unforgeable, names only) is the completeness oracle: every
+            # object that has one of our properties is in it and must come back
+            # below with the same ones, so a name-only `zfs list` adds nothing.
+            verify_names=False,
+        )
     if not recursive and not any(r.name == ds.name and r.property == 'type' for r in rows):
         raise ZFSOutputError(f"zfs get printed no usable rows for {ds.name!r}")
     got = _own_zfsbackup_rows(r for r in rows if in_scope(r.name))
@@ -257,6 +263,7 @@ def _read_own_properties(
     ds: Dataset, recursive: bool, also: Tuple[str, ...] = (),
     sources: Optional[Dict[str, Dict[str, str]]] = None,
     prefix: Union[str, Tuple[str, ...]] = PROP_PREFIX,
+    scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
 ) -> Dict[str, Dict[str, str]]:
     """`{object name: {org.zfsbackup:* property: value}}` for `ds` (or, with
     `recursive`, its descendants), local/received only. The two-phase read
@@ -269,17 +276,20 @@ def _read_own_properties(
     (an `inflight.*` cleared and an `anchor.*` set between the execs would
     otherwise read as "nothing pinned"). `also` (non-recursive only) closes the
     remaining hole: names the caller knows it cares about are always asked for,
-    so one created after phase 1 is still seen, and such an addition is accepted."""
+    so one created after phase 1 is still seen, and such an addition is accepted.
+
+    `scope()` (the health check passes one) is entered once per exec, the
+    retry's included, so a time limit applies to each command separately."""
     if also and recursive:
         raise ValueError("`also` is for the own read only")
     also = tuple(dict.fromkeys(also))
     try:
-        return _read_own_properties_once(ds, recursive, also, sources, prefix)
+        return _read_own_properties_once(ds, recursive, also, sources, prefix, scope)
     except _PropertiesChanged as e:
         logger.debug(f"{e}; reading again")
     if sources is not None:
         sources.clear()
-    return _read_own_properties_once(ds, recursive, also, sources, prefix)
+    return _read_own_properties_once(ds, recursive, also, sources, prefix, scope)
 
 
 def read_zfsbackup_properties(ds: Dataset, also: Iterable[str] = ()) -> Dict[str, str]:
@@ -318,6 +328,8 @@ def read_descendant_zfsbackup_properties(
     ds: Dataset,
     sources: Optional[Dict[str, Dict[str, str]]] = None,
     prefix: Union[str, Tuple[str, ...]] = PROP_PREFIX,
+    *,
+    scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
 ) -> Dict[str, Dict[str, str]]:
     """`read_zfsbackup_properties` for every DESCENDANT of `ds` (not `ds`
     itself), recursively: `{descendant name: {property: value}}`, only
@@ -339,8 +351,12 @@ def read_descendant_zfsbackup_properties(
     only LOCAL ones (the health check). `prefix` (a string or a tuple of
     them) narrows the read to properties whose name starts with it, so an
     unrelated `org.zfsbackup:*` value (a newline in a `config`) cannot break
-    it; the default is every `org.zfsbackup:*` property."""
-    return _read_own_properties(ds, True, sources=sources, prefix=prefix)
+    it; the default is every `org.zfsbackup:*` property.
+
+    `scope()` (the health check passes one) returns a context manager that
+    every exec runs in (a `libzfseasy.timeout`); it is entered once per exec
+    (two, or four after a retry), and it may raise to refuse one."""
+    return _read_own_properties(ds, True, sources=sources, prefix=prefix, scope=scope)
 
 
 def copy_anchor_property(
@@ -612,6 +628,9 @@ class Expansion(NamedTuple):
 
 #: The start of the error `zfs.list(strict=True)` raises for output it cannot trust.
 _UNTRUSTED_LISTING = 'zfs list output could not be trusted'
+#: What that refusal says when the first row it could not trust was a name
+#: libzfseasy cannot represent (`_SkippedRows.unrepresentable`).
+_FIRST_UNTRUSTED_IS_A_NAME = ', the first: libzfseasy cannot represent the name'
 
 
 class _CopyTops(Dict[str, str]):
@@ -1462,6 +1481,7 @@ class DatasetManager:
     def received_datasets(
         self, should_stop: Optional[Callable[[], bool]] = None,
         *, scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
+        bulk_scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
     ) -> List[DatasetInfo]:
         """Discover datasets received from remote clients under the configured target.
 
@@ -1522,8 +1542,12 @@ class DatasetManager:
 
         `scope()` (the health check passes one) returns a context manager
         every `zfs` call of the discovery runs in (as for `local_copies`); it
-        may raise to refuse a call. A failure, a timeout included, is then
-        what it always is: `[]` and `last_received_error`.
+        may raise to refuse a call, and every call enters its own. A failure,
+        a timeout included, is then what it always is: `[]` and
+        `last_received_error`. `bulk_scope()` (default: `scope`) is the one for
+        the two calls whose run time grows with the number of received
+        datasets (the recursive listing and the batched property read); the
+        per-dataset fallback reads use `scope`.
         """
         self.last_received_error = None
         rb = self.config.remote_backup
@@ -1531,7 +1555,8 @@ class DatasetManager:
             return []
         target = rb.target_dataset.rstrip('/')
         result, failure = self._discover_under(
-            target, should_stop=should_stop, noted=self._received_skip_noted, scope=scope
+            target, should_stop=should_stop, noted=self._received_skip_noted, scope=scope,
+            bulk_scope=bulk_scope,
         )
         if failure is not None:
             self.last_received_error = f"{type(failure).__name__}: {failure}"
@@ -1661,6 +1686,7 @@ class DatasetManager:
         *,
         noted: Optional[Dict[str, str]] = None,
         scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
+        bulk_scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
     ) -> Tuple[List[DatasetInfo], Optional[Exception]]:
         """`(datasets, failure)`: the client datasets under `target`
         (`received_datasets` documents the checks), or `([], exception)` if the
@@ -1674,11 +1700,14 @@ class DatasetManager:
         (`_received_skip_noted` for the server). `scope()` returns a context
         manager every `zfs` call of the discovery runs in (the local
         discovery's timeouts); it raises `ZFSTimeoutError` when the overall
-        budget is spent."""
+        budget is spent. `bulk_scope` (default: `scope`) wraps the recursive
+        listing and the batched property read, the two calls that grow with the
+        tree; each call enters its own scope."""
         scope = scope or _no_scope
+        bulk_scope = bulk_scope or scope
         root = target if only_client_id is None else f"{target}/{only_client_id}"
         try:
-            with scope():
+            with bulk_scope():
                 all_ds = zfs.list(
                     roots=Dataset(root),
                     recursive=True,
@@ -1712,7 +1741,8 @@ class DatasetManager:
 
         try:
             batch = self._received_property_batch(
-                root, {ds.name for ds in all_ds}, scope, raise_timeout=only_client_id is not None
+                root, {ds.name for ds in all_ds}, bulk_scope,
+                raise_timeout=only_client_id is not None,
             )
         except ZFSTimeoutError as e:
             return [], e
@@ -1853,11 +1883,15 @@ class DatasetManager:
         server's pruner passes neither and keeps the skip-with-WARNING."""
         if props is None:
             try:
-                with (scope or _no_scope)():
+                # One scope per exec: a time limit applies to each command.
+                enter = scope or _no_scope
+                with enter():
                     client_id = zfs.get.value(ds, PROP_CLIENT_ID, sources='local')
+                with enter():
                     config_value = zfs.get.value(ds, PROP_CONFIG, sources='local')
-                    only_received = False
-                    if client_id is None and config_value is None:
+                only_received = False
+                if client_id is None and config_value is None:
+                    with enter():
                         only_received = zfs.get.value(ds, PROP_CONFIG, sources='received') is not None
             except Exception as e:
                 if (only_client_id is not None or (scope is not None and scope is not _no_scope)) and isinstance(e, ZFSTimeoutError):
@@ -2173,24 +2207,56 @@ class DatasetManager:
         dsi.listed_names = names
         return dsi.snapshots
 
-    def _list_snapshot_tree_strict(self, ds: Dataset) -> Dict[str, List['SnapshotInfo']]:
+    def _list_snapshot_tree_strict(
+        self, ds: Dataset,
+        *, scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
+    ) -> Dict[str, List['SnapshotInfo']]:
         """The managed snapshots of `ds` AND every descendant, in ONE recursive
         `zfs list` (`SNAPSHOT_LIST_PROPERTIES`), as `{dataset name: [newest
         first by createtxg, ...]}` (the order of `_list_snapshots_strict`). A
         dataset with no managed snapshot has no key. For the health check,
         which asks once per recursive parent instead of once per child.
 
-        STRICT: raises (`Exception`) when any row of the listing cannot be
-        trusted (`zfs.list(strict=True)`), because a dropped row may be a
-        child's newest snapshot and the answer would then be wrong, not
-        smaller; and whatever `zfs list` raises. Read-only: unlike
+        Strict, with one exception. Whatever `zfs list` raises (a non-zero
+        exit, a timeout) propagates instead of reading as an empty tree, and
+        so does `zfs.list(strict=True)`'s refusal of a row it cannot trust (a
+        wrong column count, a row outside the tree, a duplicate), because a
+        dropped row may be a child's newest snapshot and the answer would be
+        wrong, not smaller. The exception is a listing refused because its
+        FIRST untrusted row is a name libzfseasy cannot represent (its names
+        are ASCII: a user's snapshot or dataset with an umlaut in its name)
+        anywhere under the parent. Strict alone made one such name fail EVERY
+        child of the parent ("could not be trusted") while the daemon, which
+        skips the name with a WARNING, and the parent's own observation carry
+        on. That listing is read again without `strict` (libzfseasy logs each
+        skipped name itself). This is safe because no column of this listing
+        is writable by a user (`createtxg`, `guid` and `userrefs` are numbers,
+        `clones` holds dataset names, `encryption` and `keystatus` are enums),
+        so a skipped name cannot hide a forged row, and a managed snapshot
+        (`{prefix}_{14 digits}`) of a child that `expand_recursive` listed is
+        always representable. Residual: libzfseasy's refusal names only the
+        first untrusted row, so a second, corrupt row in a listing that also
+        has an unrepresentable name is skipped with a WARNING instead of
+        refused (zfs cannot print one from these columns). `scope()` (the health
+        check passes one) is entered once per `zfs list`, the second one
+        included. Read-only: unlike
         `_list_snapshots_strict` it sets no `DatasetInfo.snapshots` and logs
         no WARNING for a managed snapshot without `createtxg` (it is left out,
         as there, so it is never "newest")."""
-        listed = zfs.list(
-            roots=ds, types='snapshot', recursive=True,
-            properties=list(SNAPSHOT_LIST_PROPERTIES), strict=True,
-        )
+        def listing(strict: bool):
+            with (scope or _no_scope)():
+                return zfs.list(
+                    roots=ds, types='snapshot', recursive=True,
+                    properties=list(SNAPSHOT_LIST_PROPERTIES), strict=strict,
+                )
+        try:
+            listed = listing(True)
+        except Exception as e:
+            message = str(e)
+            if not (message.startswith(_UNTRUSTED_LISTING) and _FIRST_UNTRUSTED_IS_A_NAME in message):
+                raise
+            logger.debug(f"The listing of {ds.name} was refused for a name ({e}); reading it again")
+            listed = listing(False)
         tree: Dict[str, List[SnapshotInfo]] = {}
         for snap in listed:
             if not isinstance(snap, ZFSSnapshot):

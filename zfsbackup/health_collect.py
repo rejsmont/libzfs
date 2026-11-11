@@ -13,12 +13,21 @@ list`. The result mixes `health.Observation` (a lag to grade) and
 is a WARN, so is a part of the check that ran out of time) and goes straight to
 `health.evaluate`.
 
-**Bounded.** Every `zfs` read here runs under `libzfseasy.timeout(min(per_call,
-time left))`, so a hung pool cannot hang `check`. `per_call` (seconds, default
-`DEFAULT_PER_CALL_SECONDS`; `None` = no per-call limit) bounds each command;
-`deadline` (seconds for the whole collection, measured from the call; default
-`None` = unbounded, the caller sets it) bounds the run. A read that times out
-is an ordinary failure: "cannot read" (CRIT) for exactly what it was reading.
+**Bounded.** Every `zfs` read here runs under its own `libzfseasy.timeout`,
+entered right before that command starts (a function that runs several
+commands enters one scope per command), so a hung pool cannot hang `check`.
+`per_call` (seconds, default `DEFAULT_PER_CALL_SECONDS`; `None` = no per-call
+limit) bounds each command that reads ONE dataset, at `min(per_call, time
+left)`; `deadline` (seconds for the whole collection, measured from the call;
+default `None` = unbounded, the caller sets it) bounds the run. The BATCHED
+reads, whose run time grows with the size of a tree rather than with the
+health of the pool (the recursive listings under a recursive dataset, the
+two-step property read of its descendants, and the listing and batched
+property read of the received datasets), get the time LEFT of `deadline`
+instead of `per_call`: ~60 000 snapshots can take longer than 10 s on a
+healthy host. Without a `deadline` they get `per_call`, as everything else.
+A read that times out is an ordinary failure: "cannot read" (CRIT) for exactly
+what it was reading.
 Once the deadline passes, no further read starts and everything not yet
 checked is named in ONE WARN `check` entry ("not checked within the time
 limit"), never silence. The unit of work is a configured dataset, one recursive
@@ -27,7 +36,12 @@ mid-way contributes none of its observations and is named in that entry, so
 every reported observation is complete. A command that timed out and could not
 be killed (a hung pool) makes every later timed call fail fast (libzfseasy):
 the rest of the run then reads as "cannot read", which is the right answer
-for a probe. The overshoot of the deadline is at most one command's kill time.
+for a probe. The overshoot of the deadline is at most one command's kill time
+(libzfseasy terminates a timed-out child: SIGTERM, then SIGKILL after 2 s,
+each waited for at most 2 s, plus up to 2 s to join its stderr reader, so
+about 4-6 s): a command starts only if its scope is entered with time left,
+and is cut at the deadline, and the next command's scope is refused. What
+runs between commands (parsing a listing) is not timed.
 
 What is observed, per enabled dataset (a disabled one is skipped):
 
@@ -48,11 +62,16 @@ What is observed, per enabled dataset (a disabled one is skipped):
   observation of its own: the parent's covers the `-r` snapshot. A parent whose
   descendants cannot be listed is one WARN `descendants` entry, never silence.
   The descendants are read in BATCHES, O(parents) not O(children), four execs
-  per parent: one recursive strict snapshot listing, the two-step
+  per parent: the two-step
   `org.zfsbackup:anchor.*`/`inflight.*` read of
   `read_descendant_zfsbackup_properties` (value-free `property_sources`, then a
-  strict explicit-list `get.rows`), and a name-only listing that drops a child
-  destroyed or renamed since the expansion. Only LOCAL values count (a child
+  strict explicit-list `get.rows`; read FIRST, so an anchor that moves to a
+  snapshot created in between is still found in the listing), one recursive
+  snapshot listing, and a name-only listing that drops a child destroyed or
+  renamed since the expansion. The snapshot listing skips (with libzfseasy's
+  own WARNING) a snapshot or dataset name libzfseasy cannot represent, as the
+  daemon does, instead of failing every child of the parent
+  (`DatasetManager._list_snapshot_tree_strict`). Only LOCAL values count (a child
   never inherits its parent's progress). A batch that cannot be read makes
   EVERY child of that parent an error observation (CRIT) for each destination,
   never a smaller or wrong answer. A child with no managed snapshot yet
@@ -133,7 +152,9 @@ class _OutOfTime(BaseException):
 class _Budget:
     """The collection's time limits: `per_call` seconds per `zfs` command,
     `deadline` seconds in all (measured from construction); either may be
-    `None` for no limit."""
+    `None` for no limit. Bulk reads (`bulk_scope`, `call_bulk`,
+    `call_with_bulk_scope`) get the time left of `deadline` instead of
+    `per_call` (`per_call` when there is no `deadline`)."""
 
     def __init__(self, deadline: Optional[float], per_call: Optional[float]):
         for name, value in (('deadline', deadline), ('per_call', per_call)):
@@ -153,29 +174,62 @@ class _Budget:
         left = self.left()
         return left is not None and left <= 0
 
-    def scope(self):
-        """A `libzfseasy.timeout` of `min(per_call, time left)`, for a manager
-        method that takes `scope=`; once the deadline has passed it raises
-        `ZFSTimeoutError`, which such a method reports as its own failure."""
+    def _timeout(self, bulk: bool):
+        # `left` is read once, here, so the check and the limit agree.
         left = self.left()
         if left is not None and left <= 0:
             raise ZFSTimeoutError(f'the check\'s time limit ({self.deadline:g} s) is spent')
+        if bulk and left is not None:
+            return zfs.timeout(left)
         limits = [x for x in (self.per_call, left) if x is not None]
         return zfs.timeout(min(limits) if limits else None)
 
-    def call(self, fn: Callable, *args, **kwargs):
-        """`fn(*args, **kwargs)` under the budget. Raises `_OutOfTime` when
-        the deadline has passed before the call, or passes while it fails (a
-        failure that ends at the deadline is the limit's, not a finding)."""
+    def scope(self):
+        """A `libzfseasy.timeout` of `min(per_call, time left)`, for a manager
+        method that takes `scope=` and enters it once per command; once the
+        deadline has passed it raises `ZFSTimeoutError`, which such a method
+        reports as its own failure."""
+        return self._timeout(False)
+
+    def bulk_scope(self):
+        """`scope` for a read that grows with the size of a tree: a
+        `libzfseasy.timeout` of the time left (`per_call` without a deadline)."""
+        return self._timeout(True)
+
+    def _run(self, fn: Callable, args, kwargs, enter: Optional[Callable]):
+        """`fn(*args, **kwargs)`, inside `enter()` if given, converting a
+        failure at or after the deadline into `_OutOfTime`. `enter()` is inside
+        the `try`: a deadline that passes between the check and the scope is
+        the limit's, not a finding."""
         if self.expired():
             raise _OutOfTime()
-        with self.scope():
-            try:
+        try:
+            if enter is None:
                 return fn(*args, **kwargs)
-            except Exception as exc:
-                if self.expired():
-                    raise _OutOfTime() from exc
-                raise
+            with enter():
+                return fn(*args, **kwargs)
+        except Exception as exc:
+            if self.expired():
+                raise _OutOfTime() from exc
+            raise
+
+    def call(self, fn: Callable, *args, **kwargs):
+        """`fn(*args, **kwargs)`, ONE `zfs` command, under `scope`. Raises
+        `_OutOfTime` when the deadline has passed before the call, or passes
+        while it fails (a failure that ends at the deadline is the limit's, not
+        a finding)."""
+        return self._run(fn, args, kwargs, self.scope)
+
+    def call_bulk(self, fn: Callable, *args, **kwargs):
+        """`call` for ONE bulk command, under `bulk_scope`."""
+        return self._run(fn, args, kwargs, self.bulk_scope)
+
+    def call_with_bulk_scope(self, fn: Callable, *args, **kwargs):
+        """`call` for a function that runs several bulk commands and takes
+        `scope=`: it gets `bulk_scope` and enters it once per command, so each
+        is timed separately."""
+        kwargs['scope'] = self.bulk_scope
+        return self._run(fn, args, kwargs, None)
 
 
 def collect(
@@ -196,8 +250,13 @@ def collect(
     `deadline`: seconds, from this call, for the whole collection (positive,
     finite; `None` = unbounded). `per_call`: seconds any one `zfs` command may
     run (positive, finite; `None` = unlimited; default
-    `DEFAULT_PER_CALL_SECONDS`). Both keyword-only; anything else raises
-    `ValueError` before a command runs. When the deadline passes, what is not
+    `DEFAULT_PER_CALL_SECONDS`), except the batched reads (a recursive
+    dataset's snapshot listing and property read, the received datasets'
+    listing and property read), which may run for the time left of `deadline`
+    (for `per_call` when there is no `deadline`). Each command is timed
+    separately, and the deadline is overshot by at most the time a timed-out
+    child needs to be killed (about 4-6 s). Both keyword-only; anything else
+    raises `ValueError` before a command runs. When the deadline passes, what is not
     yet checked is named in one WARN `CheckEntry` (`source` `check`, subject
     `(time limit)`) at the end of the result; the order of work is the
     configured datasets, then the descendants of the recursive ones, then the
@@ -388,7 +447,7 @@ def _observe_descendants(
     roots = [c.name for c in manager.config.enabled_datasets if c.recursive and c.remote]
     try:
         expansion = manager.expand_recursive(
-            should_stop=budget.expired, scope=budget.scope, quiet=True)
+            should_stop=budget.expired, scope=budget.bulk_scope, quiet=True)
     except Exception as exc:  # it never raises; belt and braces
         logger.debug('cannot expand the recursive datasets: %r', exc)
         result.append(CheckEntry(
@@ -475,24 +534,27 @@ def _observe_parent_children(
     that cannot be read is the error of every child and destination it was
     meant to answer. Raises `_OutOfTime` if the deadline passes first."""
     ds = Dataset(parent)
-    tree: Dict[str, List[SnapshotInfo]] = {}
-    list_error: Optional[str] = None
-    try:
-        tree = budget.call(manager._list_snapshot_tree_strict, ds)
-    except Exception as exc:
-        list_error = _error_text(exc)
+    # The properties first: an anchor that moves to a snapshot created after
+    # this read is then found in the listing below, never "not among the local
+    # managed snapshots".
     props: Dict[str, Dict[str, str]] = {}
     sources: Dict[str, Dict[str, str]] = {}
     prop_error: Optional[str] = None
     try:
-        props = budget.call(
+        props = budget.call_with_bulk_scope(
             read_descendant_zfsbackup_properties, ds, sources,
             (PROP_ANCHOR_PREFIX, PROP_INFLIGHT_PREFIX),
         )
     except Exception as exc:
         prop_error = _error_text(exc)
+    tree: Dict[str, List[SnapshotInfo]] = {}
+    list_error: Optional[str] = None
     try:
-        existing = budget.call(_existing_names, ds)
+        tree = budget.call_with_bulk_scope(manager._list_snapshot_tree_strict, ds)
+    except Exception as exc:
+        list_error = _error_text(exc)
+    try:
+        existing = budget.call_bulk(_existing_names, ds)
     except Exception as exc:  # keep the children as expanded: the reads above stand on their own
         logger.debug('cannot re-list the descendants of %s: %r', parent, exc)
     else:
@@ -555,7 +617,8 @@ def _observe_received(
         received: List[DatasetInfo] = []
         if problem is None:
             try:
-                received = manager.received_datasets(scope=budget.scope)
+                received = manager.received_datasets(
+                    scope=budget.scope, bulk_scope=budget.bulk_scope)
             except Exception as exc:  # it swallows its own failures; belt and braces
                 problem = _error_text(exc)
             else:

@@ -872,8 +872,9 @@ class TestTheOverallBudget:
         assert local.LOCAL_ZFS_BUDGET == LOCAL_DISCOVER_COMMAND_BUDGET
 
     def test_the_budget_shrinks_the_command_limit_near_the_deadline_and_then_runs_out(self, world, mocker):
-        """100 s in all, 30 s per command on a fake monotonic clock: 60 s, 60 s, then what is left (40 s),
-        then the budget is spent and the discovery ends in an error without another command."""
+        """100 s in all, 30 s per command on a fake monotonic clock: 60 s, 60 s, then what is left, re-read
+        for each command (40 s, then 10 s), then the budget is spent and the discovery ends in an error
+        without another command."""
         clock = FakeTime()
         clock.frozen = 1000.0
         mocker.patch.object(bm, 'time', clock)
@@ -885,10 +886,10 @@ class TestTheOverallBudget:
         (outcome,) = mgr.last_local_discovery
         assert outcome.count == 0
         assert outcome.error == 'ZFSTimeoutError: the 100 s budget for discovering local copies is spent'
-        # list (left 100) and batch (left 70) at the command budget, then the first dataset's two reads
-        # (left 40) at what is left
+        # list (left 100) and batch (left 70) at the command budget, then the first dataset's two reads,
+        # each timed on its own: the first at what is left (40), the second at what is left after it (10)
         assert world.timeouts[:2] == [60.0, 60.0]
-        assert world.timeouts[2:] == [40.0, 40.0]
+        assert world.timeouts[2:] == [40.0, 10.0]
         assert len(world.argvs) == 4, 'nothing runs after the budget is spent'
 
     def test_a_spent_budget_before_the_first_command_runs_nothing(self, world, mocker):

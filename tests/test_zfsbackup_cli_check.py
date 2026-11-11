@@ -2965,9 +2965,12 @@ class TestTimeLimitOptions:
     def test_the_help_texts(self, healthy):
         text = " ".join(healthy.run("check", "--help").stdout.split())
         assert ("Time bound: the ZFS reads stop after --time-limit seconds (default 60) in all, and any "
-                "one zfs command after --per-call-timeout seconds (default 10); what was not checked in "
-                "time is reported as one WARN entry '(time limit)', never as OK. 0 or none turns a "
-                "limit off.") in text
+                "one zfs command after --per-call-timeout seconds (default 10), except the batched reads "
+                "of a large tree") in text
+        assert ("which may use all the time left of --time-limit; what was not checked in time is "
+                "reported as one WARN entry '(time limit)', never as OK.") in text
+        assert ("--time-limit may be overshot by a few seconds at most (a timed-out zfs child needs up "
+                "to about 6 s to be killed). 0 or none turns a limit off.") in text
         assert "--time-limit SECONDS" in text and "[default: 60]" in text
         assert "--per-call-timeout SECONDS" in text and "[default: 10]" in text
         assert "one WARN entry '(time limit)'" in text

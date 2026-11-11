@@ -1018,7 +1018,7 @@ class CheckFake:
         self.log_path = directory / 'check-log.jsonl'
         self.spec = {'snapshots': {}, 'props': {}, 'fail': [], 'datasets': {}, 'markers': {},
                      'fail_names': [], 'fail_markers': [], 'fail_get': [],
-                     'fail_tree': [], 'garbage_tree': [], 'fail_props1': [], 'fail_rows': [],
+                     'fail_tree': [], 'garbage_tree': [], 'garbage_first': [], 'fail_props1': [], 'fail_rows': [],
                      'fail_names_again': []}
         self.log_path.write_text('')
         wrapper = directory / 'zfs-check'
@@ -1951,8 +1951,8 @@ class TestEveryReadIsTimed:
         check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
         check_zfs.prop(f'{RECURSIVE}/x', ANCHOR_A, at(1800))
         collect(config(parent_ds()), per_call=6)
-        # every read runs in a scope of its own (the two property phases share one: each COMMAND is timed)
-        assert len(self.seen(timeouts)) == 10 and len(check_zfs.calls) == 11
+        # every COMMAND enters a scope of its own (the two property phases each have one), bulk or not
+        assert len(self.seen(timeouts)) == len(check_zfs.calls) == 11
         assert set(self.seen(timeouts)) == {6}
 
 
@@ -2222,8 +2222,8 @@ class TestDeadlineAndTheDescendants:
         check_zfs.tree('pool/one', 'pool/one/c1', 'pool/one/c2', 'pool/two', 'pool/two/c3')
         real = DatasetManager._list_snapshot_tree_strict
 
-        def spend_on_pool_one(self_, ds_):
-            result = real(self_, ds_)
+        def spend_on_pool_one(self_, ds_, **kw):
+            result = real(self_, ds_, **kw)
             if ds_.name == 'pool/one':
                 clock.advance(100)
             return result
@@ -2240,8 +2240,8 @@ class TestDeadlineAndTheDescendants:
         check_zfs.tree('pool/one', 'pool/one/c1', 'pool/one/c2', 'pool/two', 'pool/two/c3')
         real = DatasetManager._list_snapshot_tree_strict
 
-        def spend_after_pool_two(self_, ds_):
-            result = real(self_, ds_)
+        def spend_after_pool_two(self_, ds_, **kw):
+            result = real(self_, ds_, **kw)
             if ds_.name == 'pool/two':
                 clock.advance(100)
             return result
@@ -2491,3 +2491,532 @@ class TestBudget:
     def test_out_of_time_is_not_an_exception(self):
         """So no `except Exception` that turns a failed read into a finding can swallow it."""
         assert not issubclass(health_collect._OutOfTime, Exception)
+
+
+# ---------------------------------------------------------------------------------------------
+# Review fixes: the batched reads get the time left, each exec is timed on its own
+# ---------------------------------------------------------------------------------------------
+
+class Trace:
+    """Every `libzfseasy.timeout` scope the collector enters and every `zfs` exec it makes, in order.
+    `pairs()` joins an exec with the limit of the scope entered right before it (`None` when no scope
+    was entered since the previous exec). `before_exec(argv)` / `after_exec(argv)` are test hooks; an
+    exec is recorded before `before_exec` runs."""
+
+    def __init__(self):
+        self.events = []
+        self.before_exec = None
+        self.after_exec = None
+
+    def record(self, argv):
+        """An exec is about to start (the `world.hook` signature)."""
+        self.events.append(('exec', list(argv)))
+        if self.before_exec is not None:
+            self.before_exec(list(argv))
+
+    def pairs(self):
+        out, pending = [], None
+        for kind, value in self.events:
+            if kind == 'scope':
+                pending = value
+            else:
+                out.append((value, pending))
+                pending = None
+        return out
+
+    @staticmethod
+    def kind(argv):
+        """What an exec is, by its argv (after the binary)."""
+        sub = argv[0]
+        if sub == 'list' and 'snapshot' in argv:
+            return 'tree' if '-r' in argv else 'snapshots'
+        if sub == 'list':
+            return 'names' if '-r' in argv else 'target'
+        if sub == 'get':
+            columns = argv[argv.index('-o') + 1]
+            if columns == 'name,property,source':
+                return 'sources' if argv[-2] == 'all' else 'markers'
+            return {'name,property,value,source': 'rows', 'value': 'value'}[columns]
+        return sub
+
+    def kinds(self):
+        return [self.kind(argv) for argv, _ in self.pairs()]
+
+    def limits(self, *kinds):
+        """`[(kind, limit)]` of the execs of these kinds, in order."""
+        return [(self.kind(argv), limit) for argv, limit in self.pairs() if self.kind(argv) in kinds]
+
+
+@pytest.fixture
+def trace(mocker):
+    """A `Trace` of the budget's `zfs.timeout` scopes. With the Popen-level `world` set
+    `world.hook = trace.record`; with `real_trace` the executables are traced too."""
+    import libzfseasy
+    t = Trace()
+    real_timeout = libzfseasy.timeout
+
+    def timeout(limit):
+        t.events.append(('scope', limit))
+        return real_timeout(limit)
+
+    mocker.patch.object(health_collect.zfs, 'timeout', side_effect=timeout)
+    return t
+
+
+@pytest.fixture
+def real_trace(trace, mocker):
+    """`trace` over the real `subprocess.Popen` too (for the `check_zfs` executable). `before_exec` runs before
+    the child starts, so it may rewrite the fake's spec without a race; `after_exec` runs once it has started
+    (use it to move the clock, not the spec)."""
+    import subprocess
+    real_popen = subprocess.Popen
+
+    def popen(argv, *args, **kwargs):
+        rest = [os.fspath(a) for a in argv][1:]
+        trace.record(rest)
+        proc = real_popen(argv, *args, **kwargs)
+        if trace.after_exec is not None:
+            trace.after_exec(rest)
+        return proc
+
+    mocker.patch('subprocess.Popen', side_effect=popen)
+    return trace
+
+
+class TestBudgetBulkScope:
+    """`_Budget.bulk_scope` and the wrappers: the batched reads get the time LEFT; `scope` stays `min(per_call, left)`."""
+
+    @pytest.fixture
+    def timeout(self, mocker):
+        return mocker.patch.object(health_collect.zfs, 'timeout')
+
+    def test_bulk_scope_is_the_time_left_not_per_call(self, clock, timeout):
+        budget = health_collect._Budget(60, 10)
+        budget.bulk_scope()
+        clock.advance(25)
+        budget.bulk_scope()
+        assert [c.args for c in timeout.call_args_list] == [(60,), (35,)]
+
+    def test_scope_stays_the_smaller_of_the_two_beside_it(self, clock, timeout):
+        budget = health_collect._Budget(60, 10)
+        budget.scope()
+        clock.advance(55)
+        budget.scope()
+        assert [c.args for c in timeout.call_args_list] == [(10,), (5,)]
+
+    @pytest.mark.parametrize('deadline, per_call', [(None, 10), (None, None)])
+    def test_without_a_deadline_bulk_scope_is_per_call(self, clock, timeout, deadline, per_call):
+        health_collect._Budget(deadline, per_call).bulk_scope()
+        assert [c.args for c in timeout.call_args_list] == [(per_call,)]
+
+    def test_bulk_scope_without_per_call_is_still_the_time_left(self, clock, timeout):
+        health_collect._Budget(60, None).bulk_scope()
+        assert [c.args for c in timeout.call_args_list] == [(60,)]
+
+    def test_bulk_scope_refuses_once_the_deadline_has_passed(self, clock, timeout):
+        budget = health_collect._Budget(10, 4)
+        clock.advance(10)
+        with pytest.raises(ZFSTimeoutError, match=r'time limit \(10 s\) is spent'):
+            budget.bulk_scope()
+        assert timeout.call_count == 0
+
+    @pytest.mark.parametrize('method', ['scope', 'bulk_scope'])
+    def test_the_time_left_is_read_once_per_scope(self, mocker, timeout, method):
+        budget = health_collect._Budget(60, 10)
+        left = mocker.patch.object(health_collect._Budget, 'left', return_value=7.0)
+        getattr(budget, method)()
+        assert left.call_count == 1
+        assert timeout.call_args.args == (7.0,)                  # the time left, which is below per_call
+
+    def test_call_bulk_runs_under_the_time_left(self, clock, timeout):
+        budget = health_collect._Budget(100, 5)
+        budget.call_bulk(lambda: None)
+        budget.call(lambda: None)
+        assert [c.args for c in timeout.call_args_list] == [(100,), (5,)]
+
+    def test_call_bulk_passes_the_arguments_and_returns_the_value(self, clock, timeout):
+        assert health_collect._Budget(100, 5).call_bulk(lambda a, b=0: a + b, 1, b=2) == 3
+
+    def test_call_with_bulk_scope_hands_over_the_scope_and_enters_none_itself(self, clock, timeout):
+        budget = health_collect._Budget(100, 5)
+        got = []
+
+        def fn(x, *, scope):
+            got.append((x, scope))
+            return 'done'
+
+        assert budget.call_with_bulk_scope(fn, 'x') == 'done'
+        assert got == [('x', budget.bulk_scope)] and timeout.call_count == 0
+
+    def test_call_with_bulk_scope_refuses_to_start_after_the_deadline(self, clock):
+        budget = health_collect._Budget(10, 5)
+        clock.advance(11)
+        ran = []
+        with pytest.raises(health_collect._OutOfTime):
+            budget.call_with_bulk_scope(lambda scope: ran.append(1))
+        assert ran == []
+
+    def test_call_with_bulk_scope_failure_at_the_deadline_is_out_of_time(self, clock):
+        budget = health_collect._Budget(10, 5)
+
+        def fail_late(scope):
+            clock.advance(20)
+            raise RuntimeError('boom')
+
+        with pytest.raises(health_collect._OutOfTime):
+            budget.call_with_bulk_scope(fail_late)
+
+    def test_call_with_bulk_scope_lets_an_ordinary_failure_through(self, clock):
+        def fail(scope):
+            raise RuntimeError('boom')
+
+        with pytest.raises(RuntimeError, match='boom'):
+            health_collect._Budget(10, 5).call_with_bulk_scope(fail)
+
+    # -- L3: the scope is entered inside the try -----------------------------------------------
+
+    @pytest.mark.parametrize('how', ['call', 'call_bulk'])
+    def test_a_deadline_that_passes_between_the_check_and_the_scope_is_out_of_time(self, mocker, how):
+        """`left()` is positive for `expired()`, then non-positive when the scope is entered: the scope's
+        refusal is the limit's (`_OutOfTime`), not a `ZFSTimeoutError` for the caller to report as a finding."""
+        mocker.patch.object(health_collect._Budget, 'left', side_effect=[5.0, 0.0, 0.0])
+        ran = []
+        with pytest.raises(health_collect._OutOfTime):
+            getattr(health_collect._Budget(10, 4), how)(lambda: ran.append(1))
+        assert ran == []
+
+    def test_the_same_for_a_function_that_enters_the_scope_itself(self, mocker):
+        mocker.patch.object(health_collect._Budget, 'left', side_effect=[5.0, 0.0, 0.0])
+        budget = health_collect._Budget(10, 4)
+
+        def fn(scope):
+            with scope():
+                raise AssertionError('the scope must refuse')
+
+        with pytest.raises(health_collect._OutOfTime):
+            budget.call_with_bulk_scope(fn)
+
+    def test_a_refusal_that_is_not_after_the_deadline_stays_an_ordinary_failure(self, mocker):
+        """The deadline still has time, yet the scope refuses (any `ZFSTimeoutError`): not the limit's."""
+        mocker.patch.object(health_collect._Budget, 'left', return_value=5.0)
+        mocker.patch.object(health_collect.zfs, 'timeout', side_effect=ZFSTimeoutError('boom'))
+        with pytest.raises(ZFSTimeoutError, match='boom'):
+            health_collect._Budget(10, 4).call(lambda: None)
+
+
+@pytest.mark.subprocess
+class TestBulkReadsGetTheTimeLeft:
+    """With `deadline=60, per_call=10`: the batched reads of a recursive parent run under `zfs.timeout(left)`, a
+    single dataset's reads under `min(per_call, left)`."""
+
+    def setup_tree(self, fake):
+        fake.tree(RECURSIVE, f'{RECURSIVE}/x')
+        fake.prop(f'{RECURSIVE}/x', ANCHOR_A, at(1800))
+
+    def test_the_recursive_discovery_and_batches_use_the_time_left_the_rest_per_call(self, check_zfs, clock, real_trace):
+        self.setup_tree(check_zfs)
+        real_trace.after_exec = lambda argv: clock.advance(5) if Trace.kind(argv) == 'snapshots' else None
+        collect(config(parent_ds()), deadline=60, per_call=10)
+        assert real_trace.limits('snapshots', 'value') == [('snapshots', 10)] + [('value', 10)] * 4
+        # the expansion (names + markers), both property phases, the tree and the re-listing: 60 - 5 left
+        assert real_trace.kinds()[5:] == ['names', 'markers', 'sources', 'rows', 'tree', 'names']
+        assert real_trace.limits('names', 'markers', 'sources', 'rows', 'tree') == [
+            ('names', 55), ('markers', 55), ('sources', 55), ('rows', 55), ('tree', 55), ('names', 55)]
+
+    def test_without_a_deadline_every_read_has_per_call(self, check_zfs, real_trace):
+        self.setup_tree(check_zfs)
+        collect(config(parent_ds()), per_call=6)
+        assert len(real_trace.pairs()) == 11 and {limit for _, limit in real_trace.pairs()} == {6}
+
+    def test_without_either_limit_every_read_has_none(self, check_zfs, real_trace):
+        self.setup_tree(check_zfs)
+        collect(config(parent_ds()), per_call=None)
+        assert len(real_trace.pairs()) == 11 and {limit for _, limit in real_trace.pairs()} == {None}
+
+    def test_a_small_deadline_caps_the_single_reads_and_the_bulk_ones_alike(self, check_zfs, clock, real_trace):
+        self.setup_tree(check_zfs)
+        collect(config(parent_ds()), deadline=8, per_call=10)
+        assert {limit for _, limit in real_trace.pairs()} == {8}
+
+    def test_the_configured_datasets_reads_are_the_smaller_of_per_call_and_left(self, check_zfs, clock, real_trace):
+        check_zfs.tree('pool/one')
+        check_zfs.prop('pool/one', ANCHOR_A, at(1800))
+        real_trace.after_exec = lambda argv: clock.advance(4) if Trace.kind(argv) == 'snapshots' else None
+        collect(config(ds('pool/one', '1h', remote('a'))), deadline=12, per_call=10)
+        # the listing started with 12 left (min -> 10); the two property reads with 8 left (min -> 8)
+        assert real_trace.limits('snapshots', 'value') == [('snapshots', 10), ('value', 8), ('value', 8)]
+
+    def test_each_bulk_exec_re_reads_the_time_left(self, check_zfs, clock, real_trace):
+        """Both property phases, the tree and the re-listing are commands of their own: a second goes by
+        after each, and each scope sees the smaller `left`."""
+        self.setup_tree(check_zfs)
+        real_trace.after_exec = lambda argv: (clock.advance(1) if Trace.kind(argv) in
+                                              ('names', 'markers', 'sources', 'rows', 'tree') else None)
+        collect(config(parent_ds()), deadline=60, per_call=10)
+        assert real_trace.limits('names', 'markers', 'sources', 'rows', 'tree') == [
+            ('names', 60), ('markers', 59), ('sources', 58), ('rows', 57), ('tree', 56), ('names', 55)]
+
+    def test_every_exec_has_a_scope_entered_right_before_it(self, check_zfs, real_trace):
+        self.setup_tree(check_zfs)
+        collect(config(parent_ds()), deadline=60, per_call=10)
+        assert len(real_trace.pairs()) == len(check_zfs.calls) == 11
+        assert all(limit is not None for _, limit in real_trace.pairs())
+
+    def test_the_property_retry_is_four_scopes_each_with_its_own_left(self, check_zfs, clock, real_trace):
+        child = f'{RECURSIVE}/x'
+        self.setup_tree(check_zfs)
+        check_zfs.spec['vanish_once'] = {child: [ANCHOR_A]}                   # phase 2 disagrees once
+        check_zfs.save()
+        real_trace.after_exec = lambda argv: (clock.advance(1) if Trace.kind(argv) in ('sources', 'rows') else None)
+        result = collect(config(parent_ds()), deadline=60, per_call=10)
+        assert [o.error for o in result if o.subject == child] == [None, None]
+        assert real_trace.limits('sources', 'rows') == [
+            ('sources', 60), ('rows', 59), ('sources', 58), ('rows', 57)]
+
+    def test_a_deadline_passing_between_the_property_phases_runs_no_second_phase(self, check_zfs, clock, real_trace):
+        """Phase 2 needs its own scope: after the clock ran out following phase 1 it is refused, so neither it
+        nor the tree listing runs, and the parent's descendants are named, not reported as unreadable."""
+        self.setup_tree(check_zfs)
+        real_trace.after_exec = lambda argv: clock.advance(100) if Trace.kind(argv) == 'sources' else None
+        result = collect(config(parent_ds()), deadline=60, per_call=10)
+        assert 'rows' not in real_trace.kinds() and 'tree' not in real_trace.kinds()
+        assert not [o for o in result if isinstance(o, Observation) and o.error]
+        (entry,) = limit_entries(result)
+        assert f'{RECURSIVE} (descendants)' in entry.reason
+        assert [e.state for e in evaluate(result, NOW) if e.state == STATE_CRIT] == []
+
+
+class TestReceivedReadsGetTheTimeLeft:
+    """The received datasets: the target check and every per-dataset read are `min(per_call, left)`; the recursive
+    listing and the batched property read get what is left of the deadline."""
+
+    def setup_world(self, world):
+        for n in 'xy':
+            add_received(world, f'{TARGET}/c/{n}', 'c', client_ds(f'pool/{n}'), [at(60)])
+
+    def test_the_listing_and_the_batch_use_the_time_left(self, world, clock, trace):
+        self.setup_world(world)
+        world.hook = trace.record
+        trace.before_exec = lambda argv: clock.advance(3) if Trace.kind(argv) == 'target' else None
+        result = collect(server_config(), deadline=60, per_call=10)
+        assert [o.error for o in result] == [None, None]
+        assert trace.limits('target', 'names', 'rows', 'snapshots') == [
+            ('target', 10), ('names', 57), ('rows', 57), ('snapshots', 10), ('snapshots', 10)]
+
+    def test_without_a_deadline_per_call_bounds_them_too(self, world, clock, trace):
+        self.setup_world(world)
+        world.hook = trace.record
+        collect(server_config(), per_call=4)
+        assert {limit for _, limit in trace.pairs()} == {4}
+        assert len(trace.pairs()) == len(world.calls)
+
+    def test_the_fallback_reads_use_per_call_not_the_time_left(self, world, clock, trace):
+        """The batch read fails: each dataset's properties are read one `get.value` at a time, each in a scope of
+        its own, bounded by `per_call` (they do not grow with the tree)."""
+        self.setup_world(world)
+        world.get_fails.add(TARGET)                                          # the batch exits 1
+        world.hook = trace.record
+        collect(server_config(), deadline=60, per_call=10)
+        limits = trace.limits('target', 'names', 'rows', 'value', 'snapshots')
+        assert limits[:3] == [('target', 10), ('names', 60), ('rows', 60)]
+        values = [limit for kind, limit in limits if kind == 'value']
+        assert len(values) == 4 and set(values) == {10}              # 2 properties per client dataset, 2 datasets
+
+    def test_the_fallback_of_a_dataset_without_properties_is_three_scopes(self, world, clock, trace):
+        world.filesystems += [TARGET, f'{TARGET}/c']
+        add_received(world, f'{TARGET}/c/x', 'c', client_ds('pool/x'), [at(60)])
+        world.get_fails.add(TARGET)
+        world.hook = trace.record
+        collect(server_config(), deadline=60, per_call=10)
+        values = [(argv[-2:], limit) for argv, limit in trace.pairs() if Trace.kind(argv) == 'value']
+        by_dataset = {}
+        for (prop, name), limit in values:
+            by_dataset.setdefault(name, []).append((prop, limit))
+        # the container has no local property: client_id, config, then config's received source, one scope each
+        assert by_dataset[f'{TARGET}/c'] == [(PROP_CLIENT_ID, 10), (PROP_CONFIG, 10), (PROP_CONFIG, 10)]
+        assert by_dataset[f'{TARGET}/c/x'] == [(PROP_CLIENT_ID, 10), (PROP_CONFIG, 10)]
+        assert all(limit is not None for _, limit in trace.pairs())      # nothing runs scope-less
+
+    def test_a_deadline_passing_between_the_listing_and_the_batch_runs_no_batch(self, world, clock, trace):
+        self.setup_world(world)
+        world.hook = trace.record
+        trace.before_exec = lambda argv: clock.advance(100) if Trace.kind(argv) == 'names' else None
+        result = collect(server_config(), deadline=60, per_call=10)
+        assert 'rows' not in trace.kinds()
+        assert not [o for o in result if isinstance(o, Observation) and o.error]
+        (entry,) = limit_entries(result)
+        assert entry.reason == f'not checked within the time limit (60 s): {TARGET} (received datasets)'
+
+
+@pytest.fixture
+def fresh_name_warnings():
+    """libzfseasy reports an unrepresentable name once per name per hour; start each test with none reported."""
+    import libzfseasy.zfs as lz
+
+    lz._warned_names.clear()
+    yield
+    lz._warned_names.clear()
+
+
+@pytest.mark.subprocess
+class TestNonAsciiNamesBelowARecursiveParent:
+    """A snapshot or dataset name libzfseasy cannot represent (a user's `zfs snapshot 'pool/data/x@café'`) made the
+    strict tree listing refuse EVERY child of the parent as "could not be trusted" (CRIT, each destination)."""
+
+    X, Y = f'{RECURSIVE}/x', f'{RECURSIVE}/y'
+
+    def setup_tree(self, fake):
+        fake.tree(RECURSIVE, self.X, self.Y)
+        fake.prop(self.X, ANCHOR_A, at(1800))
+        fake.prop(self.Y, ANCHOR_A, at(1800))
+
+    def children(self, result):
+        return [o for o in result if isinstance(o, Observation) and o.subject in (self.X, self.Y)]
+
+    def test_a_non_ascii_snapshot_beside_a_good_one_leaves_every_child_graded(
+            self, check_zfs, caplog, fresh_name_warnings):
+        self.setup_tree(check_zfs)
+        check_zfs.spec['snapshots'][self.X].append([at(900) + 'é', 200])
+        check_zfs.save()
+        with caplog.at_level('DEBUG'):
+            result = collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        kids = self.children(result)
+        assert [(o.subject, o.error) for o in kids] == [(self.X, None), (self.Y, None)]
+        assert all(o.newest_ts == epoch_of(at(1800)) for o in kids)           # the anchor is found
+        assert 'CRIT' not in {e.state for e in evaluate(result, NOW)}
+        assert not [o for o in result if isinstance(o, Observation) and o.error]
+        assert not [r for r in caplog.records if r.levelno >= 30 and 'could not be trusted' in r.getMessage()]
+        # libzfseasy says so itself, once
+        assert len([r for r in caplog.records if r.name == 'libzfseasy' and r.levelno == 30
+                    and 'cannot represent' in r.getMessage() and 'skipping' in r.getMessage()]) == 1
+
+    def test_the_name_path_is_exactly_two_tree_listings(self, check_zfs, fresh_name_warnings):
+        self.setup_tree(check_zfs)
+        check_zfs.spec['snapshots'][self.X].append([at(900) + 'é', 200])
+        check_zfs.save()
+        collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        trees = [c for c in check_zfs.calls_of('list') if '-r' in c and 'snapshot' in c]
+        assert len(trees) == 2 and trees[0] == trees[1]
+
+    def test_a_clean_tree_is_one_listing(self, check_zfs):
+        self.setup_tree(check_zfs)
+        collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        assert len([c for c in check_zfs.calls_of('list') if '-r' in c and 'snapshot' in c]) == 1
+
+    def test_a_non_ascii_dataset_below_the_parent_does_not_fail_its_siblings(self, check_zfs, fresh_name_warnings):
+        self.setup_tree(check_zfs)
+        odd = f'{RECURSIVE}/über'
+        check_zfs.tree(odd)
+        result = collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        assert [(o.subject, o.error) for o in self.children(result)] == [(self.X, None), (self.Y, None)]
+        assert 'CRIT' not in {e.state for e in evaluate(result, NOW)}
+
+    def test_a_wrong_column_count_first_still_fails_every_child(self, check_zfs, fresh_name_warnings):
+        self.setup_tree(check_zfs)
+        check_zfs.spec['snapshots'][self.X].append([at(900) + 'é', 200])
+        check_zfs.fail('garbage_first', RECURSIVE)
+        result = collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        kids = self.children(result)
+        assert len(kids) == 2 and all('could not be trusted' in o.error for o in kids)
+        assert {e.state for e in evaluate(kids, NOW)} == {STATE_CRIT}
+        assert len([c for c in check_zfs.calls_of('list') if '-r' in c and 'snapshot' in c]) == 1
+
+    def test_a_failed_tree_listing_is_not_retried(self, check_zfs, fresh_name_warnings):
+        self.setup_tree(check_zfs)
+        check_zfs.fail('fail_tree', RECURSIVE)
+        result = collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        assert all('suspended' in o.error for o in self.children(result))
+        assert len([c for c in check_zfs.calls_of('list') if '-r' in c and 'snapshot' in c]) == 1
+
+
+class TestDeadlinePassingAtTheScope:
+    """L3: `_Budget._run` enters the scope inside its `try`. A deadline that passes between the `expired()` check and
+    the scope entry makes the scope refuse (`ZFSTimeoutError`); that is the limit's, so the dataset goes on the
+    "(time limit)" list, never into a CRIT "cannot read"."""
+
+    @pytest.fixture
+    def spend_at_the_scope(self, monkeypatch, clock):
+        """`_Budget.left` is positive for every `expired()`, then non-positive (and for ever after) the first time
+        `_timeout` asks, once armed: exactly the window between the check and the scope entry."""
+        state = {'armed': False, 'spent': False}
+        real_left = health_collect._Budget.left
+
+        def left(self):
+            if state['armed'] and sys._getframe(1).f_code.co_name == '_timeout':
+                state['spent'] = True
+            return -1.0 if state['spent'] else real_left(self)
+
+        monkeypatch.setattr(health_collect._Budget, 'left', left)
+        return state
+
+    def test_a_configured_dataset_is_on_the_time_limit_list_not_a_crit(self, world, spend_at_the_scope):
+        world.snaps['pool/a'] = [at(60)]
+        world.snaps['pool/b'] = [at(60)]
+        world.hook = lambda rest: spend_at_the_scope.update(armed=True) if rest[-1] == 'pool/a' else None
+        result = collect(config(ds('pool/a'), ds('pool/b')), deadline=60)
+        assert [(o.subject, o.error) for o in result if isinstance(o, Observation)] == [('pool/a', None)]
+        (entry,) = limit_entries(result)
+        assert entry.reason == 'not checked within the time limit (60 s): pool/b'
+        assert [e.state for e in evaluate(result, NOW)] == [STATE_OK, STATE_WARN]
+        assert not [c for c in world.calls if c[-1] == 'pool/b']
+
+    def test_the_received_target_check_is_named_not_a_crit_on_the_target(self, world, spend_at_the_scope):
+        add_received(world, f'{TARGET}/c/x', 'c', client_ds(), [at(60)])
+        spend_at_the_scope['armed'] = True
+        result = collect(server_config(), deadline=60)
+        assert not [o for o in result if isinstance(o, Observation)]
+        (entry,) = limit_entries(result)
+        assert entry.reason == f'not checked within the time limit (60 s): {TARGET} (received datasets)'
+        assert world.calls == []
+
+    @pytest.mark.subprocess
+    def test_a_recursive_parents_descendants_are_named_not_unreadable(self, check_zfs, spend_at_the_scope, real_trace):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        # arm once the expansion is done: the batch's first bulk scope is then the one that finds the time gone
+        real_trace.before_exec = lambda argv: (spend_at_the_scope.update(armed=True)
+                                               if Trace.kind(argv) == 'markers' else None)
+        result = collect(config(parent_ds()), deadline=60)
+        assert not [o for o in result if isinstance(o, Observation) and o.error]
+        assert [o.subject for o in result if isinstance(o, Observation) and '/x' in o.subject] == []
+        (entry,) = limit_entries(result)
+        assert f'{RECURSIVE} (descendants)' in entry.reason
+        assert 'CRIT' not in {e.state for e in evaluate(result, NOW)}
+
+
+@pytest.mark.subprocess
+class TestAnchorOnASnapshotCreatedMeanwhile:
+    """Nit: `_observe_parent_children` reads the properties BEFORE the snapshot tree. A snapshot the daemon creates
+    and anchors between the two reads is then in the listing; read the other way round the anchor would name a
+    snapshot the listing (taken a moment earlier) lacks, "not among the local managed snapshots"."""
+
+    def test_an_anchor_on_a_snapshot_created_after_the_property_read_began_is_found(self, check_zfs, real_trace):
+        child = f'{RECURSIVE}/x'
+        check_zfs.tree(RECURSIVE)
+        check_zfs.tree(child, snapshots=False)
+        old, new = at(1800), at(600)
+        check_zfs.spec['snapshots'][child] = [[old, 100]]
+        check_zfs.prop(child, ANCHOR_A, old)
+        check_zfs.save()
+        state = {'done': False}
+
+        def snapshot_and_anchor(argv):
+            # the daemon snapshots and anchors right before the batch's value read: the properties read from
+            # here on name `new`, and `new` exists for every listing that starts from here on
+            if Trace.kind(argv) == 'rows' and not state['done']:
+                state['done'] = True
+                check_zfs.spec['snapshots'][child] = [[old, 100], [new, 101]]
+                check_zfs.prop(child, ANCHOR_A, new)
+
+        real_trace.before_exec = snapshot_and_anchor
+        result = collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        (obs,) = [o for o in result if o.subject == child]
+        assert state['done'] and obs.error is None
+        assert 'not among' not in (obs.detail or '')
+        assert obs.newest_ts == epoch_of(new) and obs.detail == new
+
+    def test_the_batch_order_is_properties_then_tree_then_the_re_listing(self, check_zfs, real_trace):
+        check_zfs.tree(RECURSIVE, f'{RECURSIVE}/x')
+        check_zfs.prop(f'{RECURSIVE}/x', ANCHOR_A, at(1800))
+        collect(config(parent_ds(RECURSIVE, '1h', remote('a'))))
+        kinds = real_trace.kinds()
+        assert kinds[-4:] == ['sources', 'rows', 'tree', 'names']
