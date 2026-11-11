@@ -374,10 +374,13 @@ class TestLastProblem:
         assert rig.rbm.last_problem(DS, 'nowhere') == "unknown destination 'nowhere'"
 
     def test_the_priority_is_the_note_then_the_pair_refusal_then_the_destination_refusal(self, rig):
+        """`last_problem` reports the refusals THIS call recorded (`_call_refusals`, B1 fix 9)."""
         rbm = rig.rbm
         rbm._refusal_logged[(None, DEST)] = 'destination refusal'
+        rbm._call_refusals.add((None, DEST))
         assert rbm.last_problem(DS, DEST) == 'destination refusal'
         rbm._refusal_logged[(f'{DS} [server refusal]', DEST)] = 'server refused this dataset'
+        rbm._call_refusals.add((f'{DS} [server refusal]', DEST))
         # sorted by label: '' (None) sorts before the dataset's, so the destination-wide one wins
         # over a pair refusal, exactly as the code orders them
         assert rbm.last_problem(DS, DEST) == 'destination refusal'
@@ -386,16 +389,26 @@ class TestLastProblem:
         rbm._call_note[(DS, DEST)] = 'a note'
         assert rbm.last_problem(DS, DEST) == 'a note'
 
+    def test_a_refusal_this_call_did_not_record_is_not_reported(self, rig):
+        """Another call's (another manager's, on a shared memory) refusal is not this call's problem."""
+        rig.rbm._refusal_logged[(DS, DEST)] = 'left by someone else'
+        assert rig.rbm.last_problem(DS, DEST) is None
+
     def test_refusals_of_other_datasets_and_destinations_are_not_reported(self, rig):
         rbm = rig.rbm
-        rbm._refusal_logged[('pool/data2', DEST)] = 'other dataset'
-        rbm._refusal_logged[(DS, 'elsewhere')] = 'other destination'
-        rbm._refusal_logged[(f'{DS}x [unsettled]', DEST)] = 'a dataset whose name merely starts the same'
+        for key, text in [
+            (('pool/data2', DEST), 'other dataset'),
+            ((DS, 'elsewhere'), 'other destination'),
+            ((f'{DS}x [unsettled]', DEST), 'a dataset whose name merely starts the same'),
+        ]:
+            rbm._refusal_logged[key] = text
+            rbm._call_refusals.add(key)             # recorded by this call, but not about this pair
         assert rbm.last_problem(DS, DEST) is None
 
     @pytest.mark.parametrize('label', [DS, f'{DS} [unsettled]', f'{DS} [server refusal]'])
     def test_a_refusal_for_the_dataset_with_or_without_a_tag_is_reported(self, rig, label):
         rig.rbm._refusal_logged[(label, DEST)] = 'the refusal'
+        rig.rbm._call_refusals.add((label, DEST))
         assert rig.rbm.last_problem(DS, DEST) == 'the refusal'
 
 

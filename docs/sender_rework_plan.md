@@ -162,8 +162,8 @@ Its main thread becomes the **scheduler**:
 Carried over from A2 (the serial worker's state that B must move or rework):
 - `_waiting_noted`, `_pairs_over_cap_noted`, `_expand_*_noted`, `_dry_run_sent` and the `_dependents` map are plain
   per-worker state. They belong in `SendMemory`, or in the scheduler thread only.
-- `copy_confirmed` lives on the sender instance. With fresh managers per send (B3) it must move to `SendMemory`, keyed
-  by (dataset, destination), so that confirmation survives across sends within the incarnation.
+- `copy_confirmed` is done (B1.3): it lives in `SendMemory` (`COPY_CONFIRMED`), keyed by (dataset, destination), so
+  confirmation survives fresh managers within the incarnation.
 - `_waits_for_ancestor` lists each held child's snapshots every cycle while its ancestor is unconfirmed. Under the
   scheduler, hold children without listing, and decide "no snapshots" in the sender.
 
@@ -171,7 +171,8 @@ Carried over from A2 (the serial worker's state that B must move or rework):
 
 - **Notation:** `F` = snapshot frequency; `P` = `remote.frequency or F`; `W = min(P, F)`;
   `lo = min(check_interval + 60 s, W/2)`.
-- **Offset:** `frac = int(sha256(client_id ‖ dataset ‖ destination)[:8]) / 2^64`; `offset = lo + frac·(W − lo)`.
+- **Offset:** `frac = (int(sha256(client_id \0 dataset \0 destination)[:8]) >> 11) / 2^53` (exactly representable, so
+  always in [0, 1)); `offset = lo + frac·(W − lo)`.
 - **Slots:** `s_k = k·P + offset`, aligned to UTC.
 - **The anchor-age due check stays in the sender,** on the own anchor from A1.
 - **Catch-up:** if the status record shows `last_attempt < s_prev`, run within `frac·min(W, 300 s)`.
@@ -198,6 +199,66 @@ Carried over from A2 (the serial worker's state that B must move or rework):
 | B4 | various | low-risk | README (lines ~922, 975, 1429) and CLAUDE.md; a `check`/`status` regression with many pairs; scenarios (overlapping sends, reload during a long send, concurrent local sends, hung target pool, throughput at 1, 2 and 4 senders); real-ZFS concurrent chains from one dataset to two destinations. |
 
 Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 after A2 and B2, then B4.
+
+### What B3 must handle (from the B1/B2 reviews, 2026-11-11)
+
+- **One sender factory.**
+  - Every per-send manager (`DatasetManager`, `RemoteBackupManager`, `LocalBackupManager`) is built in ONE factory
+    that passes `memory=self._mem()` and asserts the result shares it.
+  - A missing memory silently loses `COPY_CONFIRMED`, and R-2 then holds the children for ever.
+  - Each sender gets its own `DatasetManager` and `DatasetInfo`, never the scheduler's, and calls `close()` in a
+    `finally`.
+  - Latch the per-send "client TLS identity loaded" INFO (by fingerprint) and the "cannot reach" ERROR in the memory,
+    so they stay once per episode rather than once per send.
+- **Local negotiate claim.**
+  - Two sibling pairs on one `zfs:` target can both try to create the same missing ancestor. The second gets "dataset
+    already exists": an ERROR and a non-retryable failure.
+  - Fix: add a claim in `SendMemory` (`claim(name)`/`release(name)`) over the copy and its missing ancestors. A
+    claimed ancestor is a retryable `NegotiationFailed`, like the server's 503 for an unsettled ancestor. A per-target
+    lock held for the whole local `_negotiate` (bounded by `_Budget`) also works.
+- **Per-parent discovery.**
+  - It needs a per-parent entry point to `expand_recursive`.
+  - Its episode forgetting (`retain`, `reset_latches`) must be scoped to that parent, so one parent's discovery never
+    clears another root's latches.
+- **The daily certificate reminder** runs from `begin_cycle` today. If B3 drops `begin_cycle`, call
+  `claim_expiry_check` from the scheduler.
+- **Stopping.** Senders never call `_exit_reason()`: `should_stop` and `exit_pending` are "stop_event or leave".
+- **Invariants that `SendMemory` users rely on,** to be tested under real threads:
+  - one thread per pair;
+  - no ancestor and descendant pairs running at once on the same destination.
+
+  The `COPY_CONFIRMED` clear/note, the token counters and `AncestorRule.hold`'s confirmed-then-latch are
+  check-then-act across two lock acquisitions, and are correct only under these invariants.
+- **R-2 backstop for configured children.** B2 holds configured children too; `AncestorRule.hold` covers only
+  expanded ones. Extend the sender-side backstop to configured children, or rely on the schedule plus
+  `PairOutcome.confirmed`/`SendSchedule.unconfirmed`. Test either way.
+- **libzfseasy (low, libzfseasy-developer).** `_name_warnings` is a global before/after counter. Another thread's
+  WARNING can turn this listing's summary into a WARNING. Return the count from the build, or make it thread-local.
+- **Document:** after a reload, every unconfirmed parent with children negotiates at once. The caps bound this, but it
+  bypasses the stagger.
+
+### Decisions taken while building B2 (`zfsbackup/sendschedule.py`, 2026-11-11)
+
+- **Hash input.** It is NUL-joined (`client_id \0 dataset \0 destination`), so ("a","bc/d") and ("ab","c/d") differ.
+- **Clock steps back.** This deviates from "never re-run an attempted slot k".
+  - Whenever `attempted > slot_index(now)`, the attempted index is clamped to `slot_index(now)`. The next regular run
+    is then at most P away, whatever the pair's history.
+  - The cost is at most one extra run per step back, and the sender's anchor-age check turns it into a cheap
+    `NOT_DUE`.
+  - Pending catch-up, retry, R-2 confirmation and discovery times are capped by distance (`CATCH_UP_CAP`,
+    `FAILURE_RETRY_CAP`, now, the discovery interval).
+  - Why: the literal rule stalls every pair for the size of the step, which can be days on a host that boots before
+    NTP.
+- **Retries.** An "other failure" is retried at `min(next slot, now + 1 h)`, with no jitter. A retryable burst
+    (60/120/300 s) that is used up is recorded once, and the burst then resets.
+- **Immediate runs.**
+  - The overrun follow-up and the once-per-incarnation R-2 confirmation are due immediately.
+  - Children released by R-2 are not staggered; only the caps limit them.
+- **Additions to the plan.**
+  - `MAX_DISCOVERIES = 4` concurrent parent discoveries.
+  - `LATE_SLACK = 60 s`: a live idle pair that first sees its slot later than this gets one catch-up.
+- **Order.** A pair ranks by the earliest due time among itself and its due descendants, so an ancestor never ranks
+  behind its child. `dispatch` reserves nothing: the caller calls `started` for each pair it returns.
 
 ## Follow-ups found during Track A (not yet scheduled)
 

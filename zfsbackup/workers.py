@@ -61,6 +61,10 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 from zfsbackup import health, logsetup, procident
 from zfsbackup.backup_manager import DatasetInfo, DatasetManager, PruneResult, SnapshotRide
 from zfsbackup.config import BackupConfig, shared_receive_target
+from zfsbackup.sendmemory import DRY_RUN_SENT, ORPHAN_HOLD, WAITING, SendMemory
+from zfsbackup.sendpair import (
+    PAIR_DONE, PAIR_FAILED, AncestorRule, LazySender, PairOutcome, classify, send_pair,
+)
 from zfsbackup.stopflag import STOP_POLL, ReloadEpoch, StopFlag
 from zfsbackup.version import CodeSignature, code_signature
 
@@ -671,6 +675,12 @@ class BaseWorker(_SupervisorWatch, Process):
         """Return the list of datasets to iterate each cycle. Override to extend."""
         return manager.datasets
 
+    def _new_manager(self, config: BackupConfig) -> DatasetManager:
+        """The `DatasetManager` of this worker's loop. Override to hand it
+        state the worker shares with other objects (the remote worker's
+        `SendMemory`)."""
+        return DatasetManager(config)
+
     #: The status record kind an exception out of `_process_dataset` is
     #: charged to (`None`: the subclass records its own failures).
     _STATUS_KIND: Optional[str] = None
@@ -738,7 +748,7 @@ class BaseWorker(_SupervisorWatch, Process):
         logger.info(f"{self.name} started")
 
         config = self.config
-        manager = DatasetManager(config)
+        manager = self._new_manager(config)
         interval = self._get_interval(config)
         if interval < MIN_WORKER_INTERVAL:
             logger.warning(
@@ -1118,8 +1128,13 @@ class RemoteBackupWorker(BaseWorker):
     (`DatasetManager.expand_recursive`, once per cycle, in `_get_datasets`):
     its own `-i` chain and copy, never `send -R`. Ancestors go first, and an
     expanded child additionally waits until its nearest ancestor's copy at the
-    same destination is CONFIRMED in this incarnation (`_waits_for_ancestor`,
-    R-2); the snapshot and pruning workers never see a child."""
+    same destination is CONFIRMED in this incarnation (`sendpair.AncestorRule.hold`,
+    R-2); the snapshot and pruning workers never see a child.
+
+    One pair's turn is `sendpair.send_pair`, which returns a `PairOutcome` and
+    records nothing: this worker records it (`_record_outcome`) through its
+    `StatusWriter`. What the senders remember between sends lives in ONE
+    `SendMemory`, shared with the `DatasetManager` and both senders."""
 
     #: Imports `zfsbackup.remote` lazily from disk: leaves for an upgrade drain
     #: first (stage 1).
@@ -1161,30 +1176,64 @@ class RemoteBackupWorker(BaseWorker):
         # Built by `_before_loop` whenever the configuration has a local
         # destination (`_build_local_manager`), never later.
         self._local_manager = None
+        #: What the senders remember between sends (B1.3): ONE for the worker,
+        #: shared with its `DatasetManager` (`_new_manager`) and both senders
+        #: (`adopt_memory`). Pickles empty (a spawned worker starts with
+        #: nothing); a worker built without `__init__` makes one on first use
+        #: (`_mem`).
+        self._memory: Optional[SendMemory] = SendMemory()
         # Recursive datasets (A2).
         #: This cycle's pairs by dataset name (configured and expanded alike),
         #: for the nearest-ancestor lookup of the parent-first rule. Replaced
         #: each cycle, never changed in place; no expanded child, no use.
+        #: Scheduler-side state: only the loop thread writes it.
         self._pairs: Dict[str, DatasetInfo] = {}
         #: This cycle's expanded children per `(nearest ancestor pair,
         #: destination)`: the number the one WARNING per episode names.
+        #: Replaced each cycle, never changed in place (scheduler-side, like
+        #: `_pairs`).
         self._dependents: Dict[Tuple[str, str], int] = {}
-        #: `(ancestor, destination)` pairs whose waiting children were
-        #: announced (WARNING once per episode, INFO when it ends).
-        self._waiting_noted: Set[Tuple[str, str]] = set()
-        #: `--dry-run` only: pairs whose `backup_dataset` returned True in
-        #: this incarnation. A dry run sends nothing and creates nothing, so
-        #: no sender confirms a copy there; this alone lets its log show the
-        #: children's turn. Outside a dry run it is never consulted
-        #: (`_ancestor_confirmed`).
-        self._dry_run_sent: Set[Tuple[str, str]] = set()
         #: Parents whose descendants could not be listed this cycle -> why
         #: (replaced each cycle, never changed in place).
         self._expansion_failed: Dict[str, str] = {}
         #: `expand_recursive` raised this cycle: the list of pairs is not the
         #: truth, so `_status_keys` retains every record.
         self._expansion_crashed = False
+        #: Whether the "more pairs than the status file holds" WARNING was
+        #: logged (set by `_status_keys` only: scheduler-side state).
         self._pairs_over_cap_noted = False
+
+    #: A worker built without `__init__` (`RemoteBackupWorker.__new__`) has no
+    #: memory until `_mem` makes one.
+    _memory: Optional[SendMemory] = None
+
+    def _mem(self) -> SendMemory:
+        """The worker's `SendMemory`."""
+        if self._memory is None:
+            self._memory = SendMemory()
+        return self._memory
+
+    # Read-only views of the memory's latches, under the names the worker's
+    # state always had (properties, so a worker built without `__init__` can
+    # never hold a set detached from the memory the senders write).
+    #
+    # `(ancestor, destination)` pairs whose waiting children were announced
+    # (WARNING once per episode, INFO when it ends): the `WAITING` latch.
+    @property
+    def _waiting_noted(self) -> Set[Tuple[str, str]]:
+        return self._mem().latch_view(WAITING)
+
+    # `--dry-run` only: pairs whose `backup_dataset` returned True in this
+    # incarnation. A dry run sends nothing and creates nothing, so no sender
+    # confirms a copy there; this alone lets its log show the children's turn.
+    # Outside a dry run it is never consulted (`AncestorRule.confirmed`). The
+    # `DRY_RUN_SENT` latch.
+    @property
+    def _dry_run_sent(self) -> Set[Tuple[str, str]]:
+        return self._mem().latch_view(DRY_RUN_SENT)
+
+    def _new_manager(self, config: BackupConfig) -> DatasetManager:
+        return DatasetManager(config, memory=self._mem())
 
     def _finish(self, reason: ExitReason, logger) -> None:
         """A reload or an upgrade drain lets a successor start: a local
@@ -1273,6 +1322,9 @@ class RemoteBackupWorker(BaseWorker):
         self._remote_manager = RemoteBackupManager(
             config, manager, client_id=self.client_id, tls_dir=self.tls_dir
         )
+        # Built with the constructor's exact arguments (what the tests of the
+        # worker assert), then given the worker's shared memory.
+        self._remote_manager.adopt_memory(self._mem())
         local_names = {
             name for name, dest in config.destinations.items()
             if getattr(dest, 'is_local', False) is True
@@ -1319,6 +1371,7 @@ class RemoteBackupWorker(BaseWorker):
         self._local_manager = LocalBackupManager(
             manager.config, manager, client_id=self.client_id
         )
+        self._local_manager.adopt_memory(self._mem())
         self._local_manager.begin_cycle()
 
     def _get_datasets(self, manager: DatasetManager) -> List[DatasetInfo]:
@@ -1355,8 +1408,11 @@ class RemoteBackupWorker(BaseWorker):
                     key = (ancestor.name, rc.destination)
                     dependents[key] = dependents.get(key, 0) + 1
         self._dependents = dependents
-        for key in [k for k in self._waiting_noted if k not in dependents]:
-            self._waiting_noted.discard(key)
+        self._mem().retain(WAITING, lambda k: k in dependents)
+        # The "cannot find the dataset it was expanded from" WARNING is once
+        # per episode in the memory (a scheduler asks every minute); this
+        # worker's episode is one cycle, as it always was.
+        self._mem().reset_latches(ORPHAN_HOLD)
         return datasets
 
     def _expanded_children(self, manager: DatasetManager) -> List[DatasetInfo]:
@@ -1412,9 +1468,9 @@ class RemoteBackupWorker(BaseWorker):
         if not dsi.config.remote:
             return
         # The destination in hand, so that an exception is charged to it. Each
-        # destination's own exceptions are caught in `_send_to_destinations`;
-        # this is the fallback for anything raised outside them, which still
-        # propagates to the loop.
+        # destination's own exceptions are caught in `_send_to_destinations`
+        # (and in `send_pair`); this is the fallback for anything raised outside
+        # them, which still propagates to the loop.
         current: List[str] = []
         try:
             self._send_to_destinations(manager, dsi, current)
@@ -1426,31 +1482,48 @@ class RemoteBackupWorker(BaseWorker):
                 )
             raise
 
-    def _record_send(
-        self, dsi: DatasetInfo, destination: str, done: bool, sender=None
-    ) -> None:
-        """Remember what `backup_dataset` returned. A `False` while an exit
-        reason is pending is a stop or reload cutting the cycle short: neither
-        a success nor a failure, so nothing is recorded. Otherwise `False` is
-        a failure, with the manager's own account of why when it has one.
-        `sender` is the manager that ran it (default: the remote one)."""
-        if done:
-            self._dry_run_sent.add((dsi.name, destination))
+    def _record_outcome(self, outcome: PairOutcome) -> None:
+        """Record what `send_pair` returned (the worker, not `send_pair`, owns
+        the status writer): a DONE pair is a success, a FAILED one a failure
+        with the sender's account of why; every other kind (not due, waiting,
+        stopped) is neither a success nor a failure and records nothing. The
+        next destination may stream for hours, so a recorded outcome is written
+        now."""
         if self._status is None:
             return
-        if done:
-            self._record(health.KIND_SEND, dsi.name, destination, ok=True)
-        elif self._exit_reason() is None:
-            sender = self._remote_manager if sender is None else sender
-            problem = sender.last_problem(dsi.name, destination)
+        if outcome.kind == PAIR_DONE:
             self._record(
-                health.KIND_SEND, dsi.name, destination, ok=False,
-                error=problem if isinstance(problem, str) else 'not completed (see the journal)',
+                health.KIND_SEND, outcome.dataset, outcome.destination, ok=True,
+                warning=outcome.warning,
+            )
+        elif outcome.kind == PAIR_FAILED:
+            self._record(
+                health.KIND_SEND, outcome.dataset, outcome.destination, ok=False,
+                error=outcome.error, warning=outcome.warning,
             )
         else:
             return
-        # The next destination may stream for hours: write this outcome now.
         self._flush_status(force=True)
+
+    def _record_send(
+        self, dsi: DatasetInfo, destination: str, done: bool, sender=None
+    ) -> None:
+        """Remember what `backup_dataset` returned (`sendpair.classify`'s
+        classification: a `False` while an exit reason is pending is a stop or
+        reload cutting the cycle short, neither a success nor a failure, so
+        nothing is recorded; otherwise `False` is a failure, with the
+        manager's own account of why when it has one). `sender` is the manager
+        that ran it (default: the remote one). `send_pair` no longer goes
+        through here (it returns the outcome); kept for the callers that hold
+        a bare `backup_dataset` result."""
+        if done:
+            self._mem().note(DRY_RUN_SENT, (dsi.name, destination))
+        if self._status is None:
+            return
+        sender = self._remote_manager if sender is None else sender
+        self._record_outcome(classify(
+            dsi.name, destination, done, sender, lambda: self._exit_reason() is not None,
+        ))
 
     def _send_to_destinations(
         self, manager: DatasetManager, dsi: DatasetInfo, current: List[str]
@@ -1461,9 +1534,11 @@ class RemoteBackupWorker(BaseWorker):
                 # Between destinations no stream is open: a safe point.
                 return
             current[:] = [remote_cfg.destination]
-            # One destination's failure is its own: it is recorded against
-            # that destination and logged, and the dataset's remaining
-            # destinations still get their turn this cycle.
+            # One destination's failure is its own: `send_pair` turns an
+            # exception into a FAILED outcome (recorded against that
+            # destination and logged), and the dataset's remaining
+            # destinations still get their turn this cycle. What is raised
+            # outside it (resolving the sender, recording) is caught here.
             try:
                 self._send_to_destination(manager, dsi, remote_cfg, logger)
             except Exception as e:
@@ -1471,7 +1546,7 @@ class RemoteBackupWorker(BaseWorker):
                     f"{self.name} error on {dsi.name} -> {remote_cfg.destination}: {e}",
                     exc_info=True,
                 )
-                # As in `_record_send`: an exception while a stop or reload is
+                # As in `send_pair`: an exception while a stop or reload is
                 # pending is most likely that stop cutting the work short
                 # (a killed child, a closed stream) -- neither a success nor
                 # a failure of the destination, so nothing is recorded.
@@ -1484,16 +1559,8 @@ class RemoteBackupWorker(BaseWorker):
                     self._flush_status(force=True)
 
     def _nearest_pair(self, name: str, destination: str) -> Optional[DatasetInfo]:
-        """The nearest strict ancestor of `name` with a pair (a `remote:`
-        entry) to `destination` in this cycle's list, configured or expanded,
-        or `None`. A configured ancestor that is not a pair is passed over."""
-        ancestor = name.rpartition('/')[0]
-        while ancestor:
-            info = self._pairs.get(ancestor)
-            if info is not None and any(rc.destination == destination for rc in info.config.remote):
-                return info
-            ancestor = ancestor.rpartition('/')[0]
-        return None
+        """`AncestorRule.nearest_pair` over this cycle's pairs."""
+        return self._ancestor_rule().nearest_pair(name, destination)
 
     def _pair_sender(self, manager: DatasetManager, destination: str):
         """The sender that serves `destination` (the local manager for a
@@ -1504,160 +1571,41 @@ class RemoteBackupWorker(BaseWorker):
             return self._local_manager
         return self._remote_manager
 
+    def _ancestor_rule(self) -> AncestorRule:
+        """R-2 (`sendpair.AncestorRule`) over this cycle's pairs and
+        dependents and the worker's memory. Built per use: the state it reads
+        is replaced, never changed in place."""
+        return AncestorRule(self._pairs, self._dependents, self._mem(), self._pair_sender)
+
     def _ancestor_confirmed(
         self, manager: DatasetManager, ancestor: DatasetInfo, destination: str
     ) -> bool:
-        """Whether the destination's copy of `ancestor` has been CONFIRMED in
-        THIS incarnation (`ChainSender.copy_confirmed`): its `backup_dataset`
-        returned True after a negotiate that reported an existing copy, or a
-        stream to it committed. No anchor and no status record is evidence:
-        an anchor can be stale (a changed destination URL or `zfs:` target,
-        `identity set-client-id --force`, a copy the server lost), and a
-        child sent first would then make `create_ancestors` build the
-        ancestor's copy as an empty container that its own raw or
-        encrypted-target full stream can never replace. Anything but an exact
-        `True` (no sender, an exception) is "not confirmed".
-
-        `--dry-run` sends and creates nothing, so there the ancestor's
-        `backup_dataset` having returned True in this incarnation passes as
-        well (the log then shows the children's turn)."""
-        if manager.config.dry_run and (ancestor.name, destination) in self._dry_run_sent:
-            return True
-        sender = self._pair_sender(manager, destination)
-        if sender is None:
-            return False
-        try:
-            return sender.copy_confirmed(ancestor.name, destination) is True
-        except Exception:
-            logging.getLogger(__name__).debug(
-                "copy_confirmed(%s, %s) failed", ancestor.name, destination, exc_info=True
-            )
-            return False
-
-    def _confirmation_due(
-        self, manager: DatasetManager, dsi: DatasetInfo, destination: str
-    ) -> bool:
-        """`dsi` is the nearest ancestor pair of at least one waiting expanded
-        child and its copy at `destination` is not confirmed yet: it is DUE
-        whatever its anchor says (`_send_to_destination`), so it negotiates
-        once per incarnation. An up-to-date copy then settles cheaply (no
-        stream) and, being confirmed, releases the children."""
-        if self._dependents.get((dsi.name, destination), 0) <= 0:
-            return False
-        return not self._ancestor_confirmed(manager, dsi, destination)
-
-    def _waits_for_ancestor(
-        self, manager: DatasetManager, dsi: DatasetInfo, destination: str, logger
-    ) -> bool:
-        """R-2, on the serial worker: an EXPANDED child (a descendant of a
-        recursive dataset) is not sent to `destination` until the nearest
-        ancestor that has a pair to the same destination (configured or
-        expanded) is CONFIRMED there in this incarnation
-        (`_ancestor_confirmed`): the child's full stream would otherwise
-        create the ancestor as an unowned placeholder that the ancestor's own
-        (raw or encrypted-target) full stream can never replace. Fails closed:
-        with no ancestor pair found, the parent it was expanded from is the
-        ancestor, and without a way to look at it the child waits. One
-        WARNING per episode per (ancestor, destination) names the ancestor and
-        how many children wait, the children at DEBUG.
-
-        A child with no managed snapshots is not held: `backup_dataset`
-        returns before it negotiates, so it can create nothing (it is recorded
-        as sent, as `backup_dataset` would, and nothing is logged). A failed
-        listing holds it (silently: the next cycle lists again), so the
-        decision and the send never rest on two different listings.
-
-        NOTHING is recorded for a held pair (not an attempt, and not a
-        failure: the ancestor's own record carries the root cause, and the lag
-        of a never-sent child is graded from its anchor by `check`). A
-        configured dataset is never held by this rule (it keeps its
-        pre-recursive behaviour). Returns True when the pair needs nothing
-        more this cycle (held, or nothing to send)."""
-        if dsi.expanded_from is None:
-            return False
-        ancestor = self._nearest_pair(dsi.name, destination)
-        if ancestor is None:
-            # Fail closed: the parent it was expanded from.
-            ancestor = self._pairs.get(dsi.expanded_from)
-        if ancestor is None:
-            logger.warning(
-                f"{dsi.name} -> {destination}: cannot find {dsi.expanded_from}, which it was "
-                "expanded from; not sent"
-            )
-            return True
-        key = (ancestor.name, destination)
-        if self._ancestor_confirmed(manager, ancestor, destination):
-            if key in self._waiting_noted:
-                self._waiting_noted.discard(key)
-                logger.info(
-                    f"{ancestor.name} is confirmed at {destination}: its descendants follow"
-                )
-            return False
-        snapshots = manager.list_snapshots(dsi)
-        if not snapshots:
-            if manager.last_list_error is not None:
-                logger.debug(
-                    f"{dsi.name} -> {destination}: cannot list snapshots "
-                    f"({manager.last_list_error}); waiting for {ancestor.name}"
-                )
-                return True
-            logger.debug(f"No snapshots available to send for {dsi.name}")
-            self._record_send(dsi, destination, True)
-            return True
-        if key not in self._waiting_noted:
-            self._waiting_noted.add(key)
-            count = self._dependents.get(key, 1)
-            logger.warning(
-                f"{count} descendant{'' if count == 1 else 's'} of {ancestor.name} wait until "
-                f"its copy at {destination} is confirmed in this run (a negotiate that finds "
-                f"the copy, or an acknowledged send); they are not sent until then"
-            )
-        logger.debug(f"{dsi.name} -> {destination}: waiting for {ancestor.name}")
-        return True
+        """`AncestorRule.confirmed`: whether the destination's copy of
+        `ancestor` has been CONFIRMED in THIS incarnation."""
+        return self._ancestor_rule().confirmed(manager, ancestor, destination)
 
     def _send_to_destination(
         self, manager: DatasetManager, dsi: DatasetInfo, remote_cfg, logger
     ) -> None:
-        if self._waits_for_ancestor(manager, dsi, remote_cfg.destination, logger):
-            return
-        dest = manager.config.destinations.get(remote_cfg.destination)
-        # A local (`zfs:<dataset>`) destination goes to the local manager,
-        # anything else (an unknown name included: it says so) to the
-        # remote one, which speaks https only and must never be handed a
-        # `zfs:` destination. Same interval, order and records for both.
-        if dest is not None and getattr(dest, 'is_local', False) is True:
-            sender = self._local_backup_manager(manager)
-        else:
-            sender = self._remote_manager
-        freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
-        # A nearest ancestor of waiting children whose copy is not confirmed
-        # yet is due whatever its anchor says (R-2): one negotiate per
-        # incarnation, which settles an up-to-date copy without a stream.
-        confirm = self._confirmation_due(manager, dsi, remote_cfg.destination)
-        anchor_name = None if confirm else manager.get_own_anchor(dsi, remote_cfg.destination)
-        if anchor_name:
-            snapshots = manager.list_snapshots(dsi)
-            anchor = next((s for s in snapshots if s.name == anchor_name), None)
-            # An anchor dated beyond the clock tolerance in the future
-            # means the clock is behind it: its age says nothing, so the
-            # destination is due (`clock_behind` logs the ERROR once).
-            if (
-                anchor
-                and not manager.clock_behind(
-                    dsi, anchor, f"anchor for {remote_cfg.destination}"
-                )
-                and anchor.age.total_seconds() < freq
-            ):
-                logger.debug(
-                    f"Backup of {dsi.name} to {remote_cfg.destination} not due yet"
-                )
-                return
-        # `should_stop` is polled before every stream of the chain (never
-        # during one): no new stream during a stop or a reload (C3).
-        done = sender.backup_dataset(
-            dsi, remote_cfg, should_stop=lambda: self._exit_reason() is not None
+        """One pair's turn: run `send_pair` (R-2, the sender's resolution, the
+        due check, `backup_dataset`, the classification) and record the
+        outcome."""
+        def sender():
+            dest = manager.config.destinations.get(remote_cfg.destination)
+            # A local (`zfs:<dataset>`) destination goes to the local manager,
+            # anything else (an unknown name included: it says so) to the
+            # remote one, which speaks https only and must never be handed a
+            # `zfs:` destination. Same interval, order and records for both.
+            if dest is not None and getattr(dest, 'is_local', False) is True:
+                return self._local_backup_manager(manager)
+            return self._remote_manager
+
+        pending = lambda: self._exit_reason() is not None  # noqa: E731
+        outcome = send_pair(
+            manager, dsi, remote_cfg, LazySender(sender), pending, pending,
+            rule=self._ancestor_rule(), logger=logger, label=self.name,
         )
-        self._record_send(dsi, remote_cfg.destination, done, sender)
+        self._record_outcome(outcome)
 
 
 #: At most this many connections are served (handshaking or in a request) at

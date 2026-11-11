@@ -46,6 +46,7 @@ from zfsbackup.backup_manager import (
 )
 from zfsbackup.chain import ChainSender, NegotiationFailed, _FAILED, _OK, _STOP, _SendStream
 from zfsbackup.config import BackupConfig, Destination
+from zfsbackup.sendmemory import PENDING, REFUSALS, SendMemory
 
 
 logger = logging.getLogger(__name__)
@@ -570,17 +571,23 @@ class LocalBackupManager(ChainSender):
         local_manager: DatasetManager,
         *,
         client_id: Optional[str],
+        memory: Optional[SendMemory] = None,
     ):
-        super().__init__(config, local_manager, client_id=client_id)
+        super().__init__(config, local_manager, client_id=client_id, memory=memory)
         # destination name -> target dataset found to exist this cycle.
         self._checked: Dict[str, str] = {}
         # destinations whose target was found gone mid-cycle: skipped (silently,
         # it was logged) for the rest of the cycle.
         self._unavailable: set = set()
         self._per_cycle = False
-        # copy name -> `time.monotonic()` of the negotiate that found it
-        # missing (`LOCAL_PENDING_TTL`).
-        self._pending: Dict[str, float] = {}
+
+    # copy name -> `time.monotonic()` of the negotiate that found it missing
+    # (`LOCAL_PENDING_TTL`): in the shared `SendMemory`, so that a sender built
+    # for a child sees the parent's negotiate. The LIVE dict, for tests; the
+    # code uses `SendMemory.pending_put` / `pending_active` / `pending_clear`.
+    @property
+    def _pending(self) -> Dict[str, float]:
+        return self._memory.value_view(PENDING)
 
     # ----------------------------------------------------------- the cycle
 
@@ -620,7 +627,7 @@ class LocalBackupManager(ChainSender):
         self._logger.debug(f"{dsi.name} -> {destination}: zfs timed out {where}: {exc}")
 
     def _zfs_recovered(self, dsi: DatasetInfo, destination: str) -> None:
-        if self._refusal_logged.pop((f"{dsi.name} [local zfs timeout]", destination), None):
+        if self._memory.pop(REFUSALS, (f"{dsi.name} [local zfs timeout]", destination)):
             self._logger.info(f"{dsi.name} -> {destination}: zfs answers again on this host")
 
     @staticmethod
@@ -723,7 +730,7 @@ class LocalBackupManager(ChainSender):
                 return None
             if self._per_cycle:
                 self._checked[destination] = target
-        if self._refusal_logged.pop(key, None) is not None:
+        if self._memory.pop(REFUSALS, key) is not None:
             self._logger.info(f"local destination {destination} ({target}) is usable again")
         return _LocalTarget(target, self.client_id)
 
@@ -794,13 +801,7 @@ class LocalBackupManager(ChainSender):
         return None, missing, None
 
     def _is_pending(self, copy: str) -> bool:
-        since = self._pending.get(copy)
-        if since is None:
-            return False
-        if time.monotonic() - since < LOCAL_PENDING_TTL:
-            return True
-        del self._pending[copy]
-        return False
+        return self._memory.pending_active(copy, LOCAL_PENDING_TTL, time.monotonic())
 
     def _negotiate(
         self, transport: _LocalTarget, client_id: str, dsi: DatasetInfo, snapshots,
@@ -842,7 +843,7 @@ class LocalBackupManager(ChainSender):
                     message = self._owner_message(copy, dsi.name, client_id, verdict)
                     self._log_refusal_once(key, f"{dsi.name} -> {destination}: {message}")
                     raise NegotiationFailed(message)
-                self._pending.pop(copy, None)
+                self._memory.pending_clear(copy)
 
             missing: list = []
             if not exists and not dry_run:
@@ -882,7 +883,7 @@ class LocalBackupManager(ChainSender):
                     # one under an encrypted target, onto an existing
                     # dataset), outermost first, no `-p`.
                     receiver.create_ancestors(call, missing, client_id, lib=zfs)
-                    self._pending[copy] = time.monotonic()
+                    self._memory.pending_put(copy, time.monotonic())
 
             common = None
             copy_kind = 'none'
@@ -926,8 +927,8 @@ class LocalBackupManager(ChainSender):
             )
             raise NegotiationFailed(str(e)) from e
 
-        self._refusal_logged.pop(key, None)
-        self._refusal_logged.pop((f"{dsi.name} [unsettled]", destination), None)
+        self._memory.pop(REFUSALS, key)
+        self._memory.pop(REFUSALS, (f"{dsi.name} [unsettled]", destination))
         self._zfs_recovered(dsi, destination)
         # Every field, always (a missing one would read as a server that does
         # not report it, and fail open): `known` with nothing newer when there
@@ -1217,7 +1218,7 @@ class LocalBackupManager(ChainSender):
             ))
             self._logger.debug(f"{dsi.name} -> {destination}: enforcement error: {e}")
             return
-        if self._refusal_logged.pop(key, None):
+        if self._memory.pop(REFUSALS, key):
             self._logger.info(
                 f"{dsi.name} -> {destination}: the forced properties of {copy_fs} are local again"
             )
@@ -1279,7 +1280,7 @@ class LocalBackupManager(ChainSender):
                     f"({send_error}); zfs receive committed {copy}, so the step counts as done"
                     f"{stuck}"
                 )
-            self._pending.pop(copy, None)
+            self._memory.pending_clear(copy)
             return _OK
         if send_error is not None and outcome != PUMP_RECEIVE_GONE:
             self._logger.error(

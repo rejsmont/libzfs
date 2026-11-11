@@ -62,6 +62,7 @@ from zfsbackup.health import STATE_CRIT, STATE_OK, STATE_WARN, evaluate
 from zfsbackup.health_collect import collect
 from _remote_support import snapshot_presence  # noqa: F401  (fixture)
 from test_zfsbackup_chain import DEST as CHAIN_DEST, DS as CHAIN_DS, S1, S2, S3, Rig as ChainRig, listing, sinfo
+from zfsbackup.sendmemory import COPY_CONFIRMED, DRY_RUN_SENT, WAITING, SendMemory
 from zfsbackup.stopflag import StopFlag
 from zfsbackup.workers import ExitReason, RemoteBackupWorker
 
@@ -372,7 +373,16 @@ class RecordingSender:
     def __init__(self, world=None):
         self.world = world
         self.attempts: List[Tuple[str, str]] = []
-        self.confirmed: Set[Tuple[str, str]] = set()
+        #: The asks of `copy_confirmed` (R-2 no longer makes any: it reads the memory).
+        self.confirm_calls: List[Tuple[str, str]] = []
+        #: What a real sender's memory is: ONE `SendMemory` per worker (`make_worker` hands this one to
+        #: the worker). R-2 reads the confirmed copies from it, never from the sender (B1 fix 1c).
+        self.memory = SendMemory()
+
+    @property
+    def confirmed(self) -> Set[Tuple[str, str]]:
+        """The pairs this sender confirmed: the memory's live `COPY_CONFIRMED` latch."""
+        return self.memory.latch_view(COPY_CONFIRMED)
 
     def begin_cycle(self):
         pass
@@ -384,6 +394,7 @@ class RecordingSender:
         return True
 
     def copy_confirmed(self, dataset, destination):
+        self.confirm_calls.append((dataset, destination))
         return (dataset, destination) in self.confirmed
 
     def _acknowledged(self, dataset, destination):
@@ -510,6 +521,7 @@ class TestDescendantsOfARecursiveDataset:
     def one_cycle(cfg, mocker, world=None):
         worker = RemoteBackupWorker(cfg, StopFlag())
         sender = RecordingSender(world)
+        worker._memory = sender.memory                      # one memory for the worker and its sender
         mocker.patch.object(worker, '_before_loop',
                             side_effect=lambda *a: setattr(worker, '_remote_manager', sender))
         mocker.patch.object(worker, '_wait', return_value=ExitReason.STOP)   # exactly one cycle
@@ -1601,7 +1613,6 @@ class ScriptedSender(RecordingSender):
         #: `ChainSender.copy_confirmed`)
         #: pairs whose True does NOT confirm (nothing to send, a copy that is not there ...)
         self.unconfirmed_success: Set[Tuple[str, str]] = set()
-        self.confirm_calls: List[Tuple[str, str]] = []
         self.confirm_raises = False
 
     def backup_dataset(self, dsi, remote_cfg, should_stop=None):
@@ -1617,10 +1628,10 @@ class ScriptedSender(RecordingSender):
         return done
 
     def copy_confirmed(self, dataset, destination):
-        self.confirm_calls.append((dataset, destination))
         if self.confirm_raises:
+            self.confirm_calls.append((dataset, destination))
             raise RuntimeError('boom')
-        return (dataset, destination) in self.confirmed
+        return super().copy_confirmed(dataset, destination)
 
 
 @pytest.fixture
@@ -1637,6 +1648,13 @@ def make_worker(cfg, sender=None, status_dir=None, local=None):
     worker = RemoteBackupWorker(cfg, StopFlag(), status_dir=status_dir)
     worker._remote_manager = sender if sender is not None else ScriptedSender()
     worker._local_manager = local
+    # ONE memory for the worker and its senders, as `_before_loop` makes it (`adopt_memory`).
+    worker._memory = getattr(worker._remote_manager, 'memory', None) or worker._remote_manager._memory
+    if local is not None:
+        if hasattr(local, 'memory'):
+            local.memory = worker._memory
+        else:
+            local.adopt_memory(worker._memory)
     worker._status = worker._open_status(cfg, logging.getLogger('test'))
     return worker
 
@@ -1954,13 +1972,16 @@ class TestA2ParentFirst:
 
     # -- how the confirmation is asked --------------------------------------------------------------
 
-    def test_an_exception_from_the_sender_means_not_confirmed(self, rig):
+    def test_the_sender_is_never_asked_whether_a_copy_is_confirmed(self, rig):
+        """R-2 reads `COPY_CONFIRMED` from the memory (B1 fix 1c): a sender whose `copy_confirmed`
+        raises changes nothing, and is not even called."""
         rig.sender.confirm_raises = True
         cycle(rig.worker, rig.manager)
-        assert rig.sender.attempts == [(PARENT, DEST)]
+        assert rig.sender.confirm_calls == []
 
-    def test_a_non_true_answer_means_not_confirmed(self, rig, mocker):
-        mocker.patch.object(rig.sender, 'copy_confirmed', return_value=mocker.MagicMock())    # truthy, not True
+    def test_only_the_memory_confirms_a_copy_a_senders_claim_does_not(self, rig, mocker):
+        mocker.patch.object(rig.sender, 'copy_confirmed', return_value=True)       # the sender claims it
+        rig.sender.unconfirmed_success.add((PARENT, DEST))                          # the memory has nothing
         cycle(rig.worker, rig.manager)
         assert rig.sender.attempts == [(PARENT, DEST)]
 
@@ -1976,14 +1997,27 @@ class TestA2ParentFirst:
         worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
         assert worker._remote_manager.attempts == []
 
-    def test_the_confirmation_is_read_from_the_manager_that_serves_the_destination(self, zfs_world):
+    def test_the_confirmation_is_read_from_the_memory_per_destination_not_from_a_manager(self, zfs_world):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, ['off', 'vault'], recursive=True),
                      destinations={'off': Destination(url='https://h:8443'), 'vault': Destination(url='zfs:bk/vault')})
         remote, local = ScriptedSender(zfs_world), ScriptedSender(zfs_world)
         worker = make_worker(cfg, remote, local=local)
         cycle(worker, DatasetManager(cfg))
-        assert {c[1] for c in remote.confirm_calls} == {'off'} and {c[1] for c in local.confirm_calls} == {'vault'}
+        assert remote.confirm_calls == [] and local.confirm_calls == [], 'no manager is asked'
+        assert (A, 'off') in remote.attempts and (A, 'vault') in local.attempts
+        assert worker._mem().noted(COPY_CONFIRMED, (PARENT, 'off'))
+        assert worker._mem().noted(COPY_CONFIRMED, (PARENT, 'vault'))
+
+    def test_a_confirmation_at_one_destination_does_not_release_the_other(self, zfs_world):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
+                     destinations={'off': Destination(url='https://h:8443'),
+                                   'second': Destination(url='https://s:8443')})
+        sender = ScriptedSender(zfs_world)
+        sender.unconfirmed_success.add((PARENT, 'second'))
+        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        assert (A, 'off') in sender.attempts and (A, 'second') not in sender.attempts
 
     # -- dry run -----------------------------------------------------------------------------------
 
@@ -2507,6 +2541,19 @@ class TestBareWorkerHelper:
         a._waiting_noted.add(('x', 'y'))
         a._pairs['p'] = object()
         assert b._waiting_noted == set() and b._pairs == {}
+
+    def test_the_waiting_and_dry_run_names_are_the_memorys_latches(self):
+        """B1 fix 13: read-only views over the worker's `SendMemory`, made on first use (`_mem()`)."""
+        from _remote_worker_support import bare_remote_worker
+        bare = bare_remote_worker()
+        assert bare._waiting_noted is bare._mem().latch_view(WAITING)
+        assert bare._dry_run_sent is bare._mem().latch_view(DRY_RUN_SENT)
+        real = RemoteBackupWorker(config(dataset(PARENT)), StopFlag())
+        assert real._waiting_noted is real._mem().latch_view(WAITING)
+        assert real._dry_run_sent is real._mem().latch_view(DRY_RUN_SENT)
+        for name in ('_waiting_noted', '_dry_run_sent'):
+            with pytest.raises(AttributeError):
+                setattr(real, name, set())
 
 
 @pytest.mark.unit

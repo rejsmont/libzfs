@@ -21,6 +21,9 @@ from zfsbackup.config import (
     BackupConfig, DatasetConfig, _collapse_retention_rules, client_id_problem,
     wire_config_problem,
 )
+from zfsbackup.sendmemory import (
+    CLOCK, EXPAND_COPY, EXPAND_ERROR, EXPAND_TARGET, NO_TXG, SendMemory,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -667,10 +670,20 @@ class _InsideReceiveTarget(RuntimeError):
 
 
 class DatasetManager:
-    """Manages datasets based on configuration."""
+    """Manages datasets based on configuration.
 
-    def __init__(self, config: BackupConfig):
+    `memory` is the worker's shared `SendMemory`: the once-per-episode log
+    latches that the REMOTE SENDER's path uses (`clock_behind`'s future-dated
+    names, the listing's snapshots without a `createtxg`, `expand_recursive`'s
+    failing parents, receive targets and copy roots) live there, so that the
+    managers built per send (Track B) neither repeat an ERROR nor miss the end
+    of an episode. A manager built without one has a private memory. The
+    pruner's and the snapshot worker's own latches (`_*_noted` below) stay on
+    the instance: nothing else shares those."""
+
+    def __init__(self, config: BackupConfig, memory: Optional[SendMemory] = None):
         self.config = config
+        self._memory: SendMemory = memory if memory is not None else SendMemory()
         self._datasets = None
         # (dataset name, ruleset) pairs whose retention-rule collisions have
         # already been warned about, so `needs_prunning` (called every pruning
@@ -721,12 +734,6 @@ class DatasetManager:
         # problem persists (the per-cycle repeat is DEBUG); forgotten once the
         # dataset is accepted again or disappears, so a later problem warns.
         self._received_skip_noted: Dict[str, str] = {}
-        # (dataset name, snapshot name) pairs dropped from the managed list
-        # for having no `createtxg`, announced at WARNING once each.
-        self._no_txg_noted: Set[Tuple[str, str]] = set()
-        # (dataset name, what, snapshot name) of future-dated snapshots/anchors
-        # announced at ERROR once each (`clock_behind`).
-        self._clock_noted: Set[Tuple[str, str, str]] = set()
         # (dataset name, snapshot name) of generated names that already
         # exist (a clock that went backwards), announced at WARNING once.
         self._name_taken_noted: Set[Tuple[str, str]] = set()
@@ -788,14 +795,38 @@ class DatasetManager:
         # (dataset, snapshot name or None for the read failure) already logged
         # at the normal level in the current pruning pass (`_pass_logged_once`).
         self._reread_logged: Set[Tuple[str, Optional[str]]] = set()
-        # `expand_recursive`: the parents whose discovery is failing (ERROR
-        # once per episode, INFO when it works again) and the (parent, target)
-        # pairs whose descendants under a receive target were announced.
-        self._expand_error_noted: Set[str] = set()
-        self._expand_target_noted: Set[Tuple[str, str]] = set()
-        # ... and the (parent, copy root) pairs skipped for a local
-        # `client_id`/`source_dataset`.
-        self._expand_copy_noted: Set[Tuple[str, str]] = set()
+
+    # In the shared `SendMemory` (the live containers, under the names they
+    # always had, for tests and diagnostics; the code uses the memory's atomic
+    # operations):
+    # `_no_txg_noted`: (dataset name, snapshot name) pairs dropped from the
+    # managed list for having no `createtxg`, announced at WARNING once each.
+    # `_clock_noted`: (dataset name, what, snapshot name) of future-dated
+    # snapshots/anchors announced at ERROR once each (`clock_behind`).
+    # `_expand_error_noted`, `_expand_target_noted`, `_expand_copy_noted`: the
+    # parents whose `expand_recursive` discovery is failing (ERROR once per
+    # episode, INFO when it works again), the (parent, target) pairs whose
+    # descendants under a receive target were announced, and the (parent, copy
+    # root) pairs skipped for a local `client_id`/`source_dataset`.
+    @property
+    def _no_txg_noted(self) -> Set[Tuple[str, str]]:
+        return self._memory.latch_view(NO_TXG)
+
+    @property
+    def _clock_noted(self) -> Set[Tuple[str, str, str]]:
+        return self._memory.latch_view(CLOCK)
+
+    @property
+    def _expand_error_noted(self) -> Set[str]:
+        return self._memory.latch_view(EXPAND_ERROR)
+
+    @property
+    def _expand_target_noted(self) -> Set[Tuple[str, str]]:
+        return self._memory.latch_view(EXPAND_TARGET)
+
+    @property
+    def _expand_copy_noted(self) -> Set[Tuple[str, str]]:
+        return self._memory.latch_view(EXPAND_COPY)
 
     @property
     def datasets(self) -> List[DatasetInfo]:
@@ -909,9 +940,8 @@ class DatasetManager:
         configured = {c.name: c for c in self.config.datasets}
         roots = [c for c in self.config.enabled_datasets if c.recursive and c.remote]
         if not roots:
-            self._expand_error_noted.clear()
-            self._expand_target_noted.clear()
-            self._expand_copy_noted.clear()
+            for table in (EXPAND_ERROR, EXPAND_TARGET, EXPAND_COPY):
+                self._memory.reset_latches(table)
             return Expansion(children, failed, {})
         scope = scope or _no_scope
         targets = self._receive_targets()
@@ -935,8 +965,7 @@ class DatasetManager:
                 copy_roots = self._copy_roots(root.name, scope=scope)
             except Exception as e:
                 failed[root.name] = f"{type(e).__name__}: {e}"
-                if root.name not in self._expand_error_noted:
-                    self._expand_error_noted.add(root.name)
+                if self._memory.note(EXPAND_ERROR, root.name):
                     logger.error(
                         "Cannot list the descendants of %s, so they are not sent until this "
                         "passes (%s: %s); %s itself is unaffected",
@@ -946,8 +975,7 @@ class DatasetManager:
                     logger.debug("Still cannot list the descendants of %s: %r", root.name, e)
                 continue
             listed_ok.add(root.name)
-            if root.name in self._expand_error_noted:
-                self._expand_error_noted.discard(root.name)
+            if self._memory.clear(EXPAND_ERROR, root.name):
                 logger.info("The descendants of %s can be listed again", root.name)
             prefix = root.name + '/'
             for name in listing:
@@ -965,8 +993,7 @@ class DatasetManager:
                     skipped.setdefault(root.name, {}).setdefault(hit, 'a receive target, which holds copies')
                     if quiet:
                         logger.debug("%s is at or below the receive target %s: not sent", name, hit)
-                    elif key not in self._expand_target_noted:
-                        self._expand_target_noted.add(key)
+                    elif self._memory.note(EXPAND_TARGET, key):
                         logger.error(
                             "%s is at or below %s, which receives copies: it and its descendants "
                             "are not sent (a recursive dataset must not contain a receive target; "
@@ -981,8 +1008,7 @@ class DatasetManager:
                         copy_root, self._copy_why(copy_roots[copy_root]))
                     if quiet:
                         logger.debug("%s is a backup copy: not sent", copy_root)
-                    elif key not in self._expand_copy_noted:
-                        self._expand_copy_noted.add(key)
+                    elif self._memory.note(EXPAND_COPY, key):
                         logger.error(self._copy_root_message(
                             root.name, copy_root, copy_roots[copy_root],
                         ))
@@ -1006,15 +1032,14 @@ class DatasetManager:
         if not stopped:
             # Forget an episode that is over (the recovery INFO above covers
             # the parents that were listed; a parent no longer configured just goes).
-            self._expand_error_noted &= {r.name for r in roots}
-            self._expand_target_noted = {
-                k for k in self._expand_target_noted
-                if k in blocked_now or k[0] not in listed_ok
-            }
-            self._expand_copy_noted = {
-                k for k in self._expand_copy_noted
-                if k in copies_now or k[0] not in listed_ok
-            }
+            root_names = {r.name for r in roots}
+            self._memory.retain(EXPAND_ERROR, lambda k: k in root_names)
+            self._memory.retain(
+                EXPAND_TARGET, lambda k: k in blocked_now or k[0] not in listed_ok
+            )
+            self._memory.retain(
+                EXPAND_COPY, lambda k: k in copies_now or k[0] not in listed_ok
+            )
         return Expansion(
             children, failed,
             {parent: list(names.items()) for parent, names in skipped.items()},
@@ -1981,13 +2006,10 @@ class DatasetManager:
             return False
         ahead = snap.timestamp - datetime.now(timezone.utc)
         if ahead <= self.clock_tolerance():
-            self._clock_noted = {
-                k for k in self._clock_noted if k[0] != dsi.name or k[1] != what
-            }
+            self._memory.forget_where(CLOCK, lambda k: k[0] == dsi.name and k[1] == what)
             return False
         key = (dsi.name, what, snap.name)
-        if key not in self._clock_noted:
-            self._clock_noted.add(key)
+        if self._memory.note(CLOCK, key):
             logger.error(
                 f"Dataset {dsi.name}: {what} {snap.full_name} is dated {ahead} in the future: "
                 "system clock is behind the newest snapshot; check NTP"
@@ -2193,19 +2215,24 @@ class DatasetManager:
                     no_txg.append(info)
                 else:
                     result.append(info)
-        fresh = [i for i in no_txg if (dsi.name, i.full_name) not in self._no_txg_noted]
+        # One atomic step: this dataset's remembered names become exactly the
+        # ones listed now, and `fresh_keys` are those not remembered before.
+        fresh_keys = set(self._memory.replace_group(
+            NO_TXG, lambda k: k[0] == dsi.name, [(dsi.name, i.full_name) for i in no_txg],
+        ))
+        fresh = [i for i in no_txg if (dsi.name, i.full_name) in fresh_keys]
         if fresh:
             logger.warning(
                 f"Dataset {dsi.name}: {len(fresh)} managed snapshot(s) have no createtxg and are "
                 f"ignored (never sent, pruned or treated as newest): "
                 f"{', '.join(i.full_name for i in fresh[:5])}{' ...' if len(fresh) > 5 else ''}"
             )
-        self._no_txg_noted = {k for k in self._no_txg_noted if k[0] != dsi.name}
-        self._no_txg_noted.update((dsi.name, i.full_name) for i in no_txg)
         result.sort(key=snapshot_order_key, reverse=True)
         dsi.snapshots = result
         dsi.listed_names = names
-        return dsi.snapshots
+        # The listing this call built, not `dsi.snapshots`: another thread's
+        # listing may have replaced that attribute since the assignment.
+        return result
 
     def _list_snapshot_tree_strict(
         self, ds: Dataset,

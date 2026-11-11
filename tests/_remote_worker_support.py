@@ -3,7 +3,8 @@
 `RemoteBackupWorker.__init__` sets the state of the recursive-dataset (A2) rules: the pairs of the
 cycle, the waiting-children bookkeeping, the dry-run set, the expansion flags. A test that builds the
 worker with `RemoteBackupWorker.__new__(RemoteBackupWorker)` (to skip the process machinery) must set
-the same state: `bare_remote_worker()` does, and `test_zfsbackup_recursive_sends.py::TestBareWorkerHelper`
+the same state: `bare_remote_worker()` does (`_waiting_noted` and `_dry_run_sent` are read-only views of the
+worker's `SendMemory`, made on first use by `_mem()`, so they are not set here), and `test_zfsbackup_recursive_sends.py::TestBareWorkerHelper`
 pins that it matches `__init__`. A `DatasetInfo` double handed to `_process_dataset` also needs
 `expanded_from` (`None` for a configured pair): `configured_dsi()`.
 """
@@ -16,8 +17,6 @@ from zfsbackup.workers import RemoteBackupWorker
 REMOTE_RECURSIVE_STATE = {
     '_pairs': dict,
     '_dependents': dict,
-    '_waiting_noted': set,
-    '_dry_run_sent': set,
     '_expansion_failed': dict,
     '_expansion_crashed': lambda: False,
     '_pairs_over_cap_noted': lambda: False,

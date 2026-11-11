@@ -28,6 +28,19 @@ in this incarnation (a negotiate that found one, or an acknowledged stream);
 the remote worker's parent-first rule for the descendants of a recursive
 dataset reads it, and it is never persisted.
 
+`last_problem(dataset, destination)` says why the last `backup_dataset` did not
+complete and `last_retryable(dataset, destination)` whether that is worth
+retrying soon (busy, reloading, an unsettled ancestor, a connect failure before
+a stream byte, a stop between steps; never a refusal, a `zfs` timeout or a
+resume-token skip): a per-call flag set where the chain, a subclass or the
+receiver already classifies the case, never read back from a message.
+
+What outlives a send (the once-per-episode latches, the skip counters, the
+confirmed copies) is kept in a `sendmemory.SendMemory`: one per worker, passed
+to every manager as `memory=` (or `adopt_memory()`), a private one otherwise.
+The per-call state (`_server_info`, `_server_newer`, `_server_newer_status`,
+`_call_note`, `_call_retryable`, `_call_refusals`) stays on the instance.
+
 Every subclass `_negotiate` must fill `_server_info`, `_server_newer` and
 `_server_newer_status` on success: a missing value fails OPEN (`absent` reads
 as a server that predates B-2b in `_settle_up_to_date`, a missing
@@ -48,6 +61,9 @@ from zfsbackup.backup_manager import (
 )
 from zfsbackup.config import (
     BackupConfig, Destination, RemoteDatasetConfig, _collapse_retention_rules,
+)
+from zfsbackup.sendmemory import (
+    COPY_CONFIRMED, REFUSALS, RETENTION_WARNED, TOKEN_ERROR, TOKEN_SKIPS, SendMemory,
 )
 
 
@@ -177,7 +193,9 @@ class ChainSender:
 
     `client_id` is this host's id from the supervisor's config snapshot
     (`daemon.Handoff.client_id`; `None` until `zfsbackup-config enroll`
-    generates one). All state is per manager and in memory."""
+    generates one). Per-call state is per manager; what outlives a send is in
+    the `SendMemory` (shared by the managers of one worker), and none of it is
+    persisted."""
 
     #: The logger the chain's messages go to; a subclass sets its own, so the
     #: messages appear under the transport's logger name.
@@ -222,25 +240,18 @@ class ChainSender:
         local_manager: DatasetManager,
         *,
         client_id: Optional[str],
+        memory: Optional[SendMemory] = None,
     ):
         self.config = config
         self.local_manager = local_manager
         self.client_id = client_id
-        # (dataset name, destination) pairs whose effective per-destination
-        # retention-rule collisions have already been warned about, for this
-        # manager's lifetime. `to_property(destination)` ships the resolved
-        # ruleset unresolved (correct -- resolution is a read-path concern),
-        # and the ONLY collision warning used to appear in the *receiving*
-        # admin's journal, naming a server-side path the client operator does
-        # not administer. The client must warn about its own collisions too.
-        self._retention_warned: Set[Tuple[str, str]] = set()
-        # Key -> the last refusal logged for it, so a standing refusal is an
-        # ERROR once and a DEBUG line afterwards. `(dataset, destination)`:
-        # a dataset-level refusal (D7: the server holds this dataset for
-        # another source). `(None, destination)`: a destination-level one
-        # (not enrolled, client not trusted, client id mismatch, pin
-        # mismatch, reset after the handshake), cleared by a good `/whoami`.
-        self._refusal_logged: Dict[Tuple[Optional[str], str], str] = {}
+        #: What outlives a send or is shared between sends: the once-per-episode
+        #: latches (the standing refusals, the retention-collision warnings, the
+        #: resume-token ERROR), the consecutive-skip counters and the confirmed
+        #: copies. ONE `SendMemory` per worker, handed to every manager it builds
+        #: (`adopt_memory` for one that is already built); a manager built without
+        #: one has a private instance, as it always had its own state.
+        self._memory: SendMemory = memory if memory is not None else SendMemory()
         # `(dataset, destination) -> (server_copy, server_dataset)` from the
         # last successful negotiate (`server_copy` is `None` for a server that
         # does not report it).
@@ -256,22 +267,76 @@ class ChainSender:
         # snapshot whose newer snapshots the server could not tell) or
         # reported neither (`absent`: a server that predates B-2b).
         self._server_newer_status: Dict[Tuple[str, str], str] = {}
-        # S-7a. `(dataset, destination) -> consecutive cycles skipped by the
-        # resume-token check`, and the pairs whose ERROR was already logged.
-        # In memory: a new worker (reload, crash) counts again from 0.
-        self._token_skips: Dict[Tuple[str, str], int] = {}
-        self._token_error_logged: Set[Tuple[str, str]] = set()
         # `(dataset, destination) -> why the last `backup_dataset` call did
         # not complete`, where this class knows (the token check); read by
-        # `last_problem`, reset at the start of every call.
+        # `last_problem`, reset at the start of every call. Per call, so it
+        # stays on the instance.
         self._call_note: Dict[Tuple[str, str], str] = {}
-        # `(dataset, destination)` pairs whose copy at the destination was
-        # CONFIRMED in this incarnation: a negotiate reported an existing copy
-        # (`server_copy` plain or raw, or a common snapshot) and the call then
-        # returned True, or a stream to it committed (`_record_step`). Only
-        # ever read through `copy_confirmed`; never persisted (a new worker
-        # confirms again), and removed when a later negotiate finds no copy.
-        self._copy_confirmed: Set[Tuple[str, str]] = set()
+        # `(dataset, destination)` -> whether the last `backup_dataset` call
+        # ended in a way that is worth retrying soon (`last_retryable`); reset
+        # at the start of every call, like `_call_note`.
+        self._call_retryable: Dict[Tuple[str, str], bool] = {}
+        # The `REFUSALS` keys THIS call logged (`_log_refusal_once` /
+        # `_log_warning_once`, whether newly or as a repeat) and, as
+        # `(None, destination)`, a destination this call's `_ready_transport`
+        # refused: the only refusals `last_problem` may report for the call.
+        # The memory's table outlives the call and is shared with other pairs,
+        # so reading all of it would blame this pair for another's refusal.
+        # Reset at the start of every call, like `_call_note`.
+        self._call_refusals: Set[Tuple[Optional[str], str]] = set()
+
+    # What the memory holds, under the names the manager's state always had
+    # (the LIVE containers, for tests and diagnostics; the chain itself only
+    # uses `SendMemory`'s atomic operations).
+    #
+    # `(dataset name, destination) pairs whose effective per-destination
+    # retention-rule collisions have already been warned about, for the
+    # memory's lifetime. `to_property(destination)` ships the resolved
+    # ruleset unresolved (correct -- resolution is a read-path concern), and
+    # the ONLY collision warning used to appear in the *receiving* admin's
+    # journal, naming a server-side path the client operator does not
+    # administer. The client must warn about its own collisions too.
+    @property
+    def _retention_warned(self) -> Set[Tuple[str, str]]:
+        return self._memory.latch_view(RETENTION_WARNED)
+
+    # Key -> the last refusal logged for it, so a standing refusal is an
+    # ERROR once and a DEBUG line afterwards. `(dataset, destination)`:
+    # a dataset-level refusal (D7: the server holds this dataset for
+    # another source). `(None, destination)`: a destination-level one
+    # (not enrolled, client not trusted, client id mismatch, pin
+    # mismatch, reset after the handshake), cleared by a good `/whoami`.
+    @property
+    def _refusal_logged(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self._memory.value_view(REFUSALS)
+
+    # S-7a. `(dataset, destination) -> consecutive cycles skipped by the
+    # resume-token check`, and the pairs whose ERROR was already logged.
+    # In memory: a new worker (reload, crash) counts again from 0.
+    @property
+    def _token_skips(self) -> Dict[Tuple[str, str], int]:
+        return self._memory.counter_view(TOKEN_SKIPS)
+
+    @property
+    def _token_error_logged(self) -> Set[Tuple[str, str]]:
+        return self._memory.latch_view(TOKEN_ERROR)
+
+    # `(dataset, destination)` pairs whose copy at the destination was
+    # CONFIRMED in this incarnation: a negotiate reported an existing copy
+    # (`server_copy` plain or raw, or a common snapshot) and the call then
+    # returned True, or a stream to it committed (`_record_step`). Only
+    # ever read through `copy_confirmed`; never persisted (a new worker
+    # confirms again), and removed when a later negotiate finds no copy.
+    @property
+    def _copy_confirmed(self) -> Set[Tuple[str, str]]:
+        return self._memory.latch_view(COPY_CONFIRMED)
+
+    def adopt_memory(self, memory: SendMemory) -> None:
+        """Use `memory` (the worker's shared one) instead of the private
+        instance made at construction. Call it right after building the
+        manager, before anything is sent: what the private memory held is
+        dropped."""
+        self._memory = memory
 
     def _token_skipped(self, dsi: DatasetInfo, destination: str, reason: str) -> None:
         """The resume-token check skipped this cycle for `dsi` -> `destination`
@@ -280,9 +345,9 @@ class ChainSender:
         until `_token_ok`."""
         key = (dsi.name, destination)
         self._call_note[key] = f"{TOKEN_SKIP_NOTE}: {reason}"
-        count = self._token_skips[key] = self._token_skips.get(key, 0) + 1
-        if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and key not in self._token_error_logged:
-            self._token_error_logged.add(key)
+        # Decided under the memory's lock, logged outside it.
+        count = self._memory.incr(TOKEN_SKIPS, key)
+        if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and self._memory.note(TOKEN_ERROR, key):
             server_ds = self._server_info.get(key, (None, None))[1] or self._copy_placeholder
             self._logger.error(
                 f"{dsi.name} -> {destination}: the resume-token check has skipped the last "
@@ -301,16 +366,15 @@ class ChainSender:
         incarnation, at the next skip once the count reaches the threshold."""
         for key, count in counts.items():
             if count > 0:
-                self._token_skips[key] = max(self._token_skips.get(key, 0), int(count))
+                self._memory.seed_max(TOKEN_SKIPS, key, count)
 
     def _token_ok(self, dsi: DatasetInfo, destination: str) -> None:
         """The resume-token check passed (or was not needed because the
         server is up to date): the skip count restarts, and the ERROR may be
         logged again for a later episode."""
         key = (dsi.name, destination)
-        self._token_skips.pop(key, None)
-        if key in self._token_error_logged:
-            self._token_error_logged.discard(key)
+        self._memory.reset(TOKEN_SKIPS, key)
+        if self._memory.clear(TOKEN_ERROR, key):
             self._logger.info(f"{dsi.name} -> {destination}: the resume-token check passes again")
 
     def copy_confirmed(self, dataset: str, destination: str) -> bool:
@@ -323,22 +387,49 @@ class ChainSender:
         changed URL or target, another client id, a lost copy). A dry run
         confirms nothing (no stream is sent, and a missing copy is not
         created). The worker's parent-first rule is the one reader."""
-        return (dataset, destination) in self._copy_confirmed
+        return self._memory.noted(COPY_CONFIRMED, (dataset, destination))
+
+    def last_retryable(self, dataset: str, destination: str) -> bool:
+        """Whether the last `backup_dataset(dataset, destination)` ended in
+        something worth retrying soon, as this manager knows (a per-call flag,
+        reset at the start of every call; nothing is parsed from a message).
+        True for: the receiver busy or reloading or draining (the retryable
+        503, from a negotiate, a resume-token request, `/whoami` or a stream),
+        an ancestor that is not settled yet, a connect failure before a stream
+        byte, and a stop between steps (a stop before the first stream
+        included). False for everything else: a `zfs` timeout (here or at the
+        receiver), the resume-token skips, every refusal (authentication, the
+        server holding the dataset for another source, a stream it will not
+        accept, rollback and mode-mismatch ERRORs), a missing client id,
+        enrollment or target. For a call that returned True it is True only
+        when the chain stopped between steps with work left."""
+        return self._call_retryable.get((dataset, destination), False)
+
+    def _mark_retryable(self, dataset: str, destination: str) -> None:
+        """This call's outcome is worth retrying soon (`last_retryable`)."""
+        self._call_retryable[(dataset, destination)] = True
 
     def last_problem(self, dataset: str, destination: str) -> Optional[str]:
         """Why the last `backup_dataset(dataset, destination)` did not
         complete, as far as this manager knows (the resume-token check, else a
-        standing refusal logged for the pair or for the whole destination);
+        refusal THIS call logged for the pair or for the whole destination;
+        a refusal another call left in the memory is not this call's problem);
         `None` when it does not know. For the worker's status file."""
         note = self._call_note.get((dataset, destination))
         if note:
             return note
-        for key in sorted(self._refusal_logged, key=lambda k: (k[0] or '', k[1])):
+        mine = set(self._call_refusals)
+        # Iterates a copy: other threads write the table while this reads it.
+        for key, message in sorted(
+            self._memory.items(REFUSALS), key=lambda item: (item[0][0] or '', item[0][1])
+        ):
+            if key not in mine:
+                continue
             label, dest = key
             if dest == destination and (
                 label is None or label == dataset or label.startswith(dataset + ' [')
             ):
-                return self._refusal_logged[key]
+                return message
         return None
 
     def backup_dataset(
@@ -359,6 +450,8 @@ class ChainSender:
         one), so a stop or reload never begins another stream."""
         destination = remote_cfg.destination
         self._call_note.pop((dsi.name, destination), None)
+        self._call_retryable.pop((dsi.name, destination), None)
+        self._call_refusals = set()
         dest = self.config.destinations.get(destination)
         if dest is None:
             self._logger.error(f"Unknown destination '{destination}' for {dsi.name}")
@@ -370,6 +463,11 @@ class ChainSender:
         self._before_destination_check()
         transport = self._ready_transport(destination, dest)
         if transport is None:
+            # Whatever standing refusal the destination carries is this call's
+            # reason (`last_problem`), logged or not by this very call.
+            self._call_refusals.add((None, destination))
+            if self._transport_retryable(destination):
+                self._mark_retryable(dsi.name, destination)
             return False
         client_id = self.client_id
 
@@ -401,6 +499,7 @@ class ChainSender:
             # Never fall through to a send: with no answer we would treat
             # "unknown" as "no common snapshot" and start a full send.
             if e.reloading and not e.zfs_timeout:  # a zfs timeout was logged by `_negotiate`
+                self._mark_retryable(dsi.name, destination)
                 self._logger.info(
                     f"{self._peer(transport)} is {_retry_word(e, self._busy_prefix)}; "
                     f"skipping {dsi.name} this cycle"
@@ -414,7 +513,7 @@ class ChainSender:
         if not existing:
             # The destination holds no copy now: whatever was confirmed
             # earlier is gone (a stream of this call confirms it again).
-            self._copy_confirmed.discard(key)
+            self._memory.clear(COPY_CONFIRMED, key)
         if not self._server_copy_matches(dsi, destination, mode):
             return False
 
@@ -446,7 +545,7 @@ class ChainSender:
             snapshots=snapshots, should_stop=should_stop, mode=mode, discard=discard,
         )
         if done and existing and not self.config.dry_run:
-            self._copy_confirmed.add(key)
+            self._memory.note(COPY_CONFIRMED, key)
         return done
 
     def _send_mode(self, dsi: DatasetInfo, remote_cfg: RemoteDatasetConfig, newest) -> Optional[str]:
@@ -477,7 +576,7 @@ class ChainSender:
         if problem is not None:
             self._log_refusal_once(key, problem)
             return None
-        self._refusal_logged.pop(key, None)
+        self._memory.pop(REFUSALS, key)
         return mode
 
     def _server_copy_matches(self, dsi: DatasetInfo, destination: str, mode: str) -> bool:
@@ -490,7 +589,7 @@ class ChainSender:
         key = (f"{dsi.name} [server copy]", destination)
         copy, server_ds = self._server_info.get((dsi.name, destination), (None, None))
         if copy not in ('plain', 'raw') or copy == mode:
-            self._refusal_logged.pop(key, None)
+            self._memory.pop(REFUSALS, key)
             return True
         name = server_ds or dsi.name
         self._log_refusal_once(key, (
@@ -555,10 +654,10 @@ class ChainSender:
         copy, server_ds = self._server_info.get((dsi.name, destination), (None, None))
         server_ds = server_ds or dsi.name
         if common_snap is None:
-            self._refusal_logged.pop(key, None)
-            self._refusal_logged.pop(unknown_key, None)
+            self._memory.pop(REFUSALS, key)
+            self._memory.pop(REFUSALS, unknown_key)
             if copy not in ('plain', 'raw'):
-                self._refusal_logged.pop(none_key, None)
+                self._memory.pop(REFUSALS, none_key)
                 return ()
             self._log_refusal_once(none_key, (
                 f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} holds snapshots "
@@ -569,23 +668,23 @@ class ChainSender:
                 + self._rejoin_pointer()
             ))
             return None
-        self._refusal_logged.pop(none_key, None)
+        self._memory.pop(REFUSALS, none_key)
         if self._server_newer_status.get((dsi.name, destination)) == 'unknown':
             # The server has a common snapshot but could not tell what is newer
             # than it. That is not "nothing newer": writing an anchor now
             # could launder a rollback into the backstop later. Nothing is
             # written or sent (the stream would be refused with `listing`).
-            self._refusal_logged.pop(key, None)
+            self._memory.pop(REFUSALS, key)
             self._log_warning_once(unknown_key, (
                 f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} could not list "
                 f"which of its snapshots are newer than {common_snap.name}, so nothing is sent "
                 "and no anchor is written this cycle; the next cycle retries"
             ))
             return None
-        self._refusal_logged.pop(unknown_key, None)
+        self._memory.pop(REFUSALS, unknown_key)
         count, entries = self._server_newer.get((dsi.name, destination), (0, []))
         if not entries:
-            self._refusal_logged.pop(key, None)
+            self._memory.pop(REFUSALS, key)
             return ()
         guid = None
         unreadable_key = (f"{dsi.name} [local anchor]", destination)
@@ -610,9 +709,9 @@ class ChainSender:
                     f"{self._receiver} may discard its newer snapshot; nothing is sent this cycle"
                 ))
                 return None
-        self._refusal_logged.pop(unreadable_key, None)
+        self._memory.pop(REFUSALS, unreadable_key)
         if guid is not None:
-            self._refusal_logged.pop(key, None)
+            self._memory.pop(REFUSALS, key)
             return (guid,)
         names = [str(e.get('name')) for e in entries if isinstance(e, dict)] or ['?']
         first, last = names[0], names[-1]
@@ -658,15 +757,15 @@ class ChainSender:
 
     def _log_warning_once(self, key, message: str) -> None:
         """`_log_refusal_once` at WARNING (a condition that heals by itself)."""
-        if self._refusal_logged.get(key) != message:
-            self._refusal_logged[key] = message
+        self._call_refusals.add(key)
+        if self._memory.note_value(REFUSALS, key, message):
             self._logger.warning(message)
         else:
             self._logger.debug(message)
 
     def _log_refusal_once(self, key, message: str) -> None:
-        if self._refusal_logged.get(key) != message:
-            self._refusal_logged[key] = message
+        self._call_refusals.add(key)
+        if self._memory.note_value(REFUSALS, key, message):
             self._logger.error(message)
         else:
             self._logger.debug(message)
@@ -685,18 +784,17 @@ class ChainSender:
         will actually be sent for `destination` (dataset-level, or the
         destination's own override if it declared one -- see
         `DatasetConfig.effective_retention_rules`). Once per (dataset,
-        destination) for this manager's lifetime; the client's own config is
+        destination) for the `SendMemory`'s lifetime; the client's own config is
         loaded once at process start, so unlike the received-side warning in
         `DatasetManager._retention_plan`, the ruleset here cannot change
-        without a restart (which creates a new manager and resets this set).
+        without a restart (which creates a new memory and resets this set).
         """
         key = (dsi.name, destination)
-        if key in self._retention_warned:
+        if self._memory.noted(RETENTION_WARNED, key):
             return
         rules = dsi.config.effective_retention_rules(destination)
         _, collisions = _collapse_retention_rules(rules)
-        if collisions:
-            self._retention_warned.add(key)
+        if collisions and self._memory.note(RETENTION_WARNED, key):
             for msg in collisions:
                 self._logger.warning(f"Dataset {dsi.name} -> {destination}: {msg}")
 
@@ -763,6 +861,7 @@ class ChainSender:
             return True
 
         if should_stop is not None and should_stop():
+            self._mark_retryable(dsi.name, destination)
             self._logger.info(f"stop requested; not starting a send of {dsi.name}")
             return False
 
@@ -783,6 +882,7 @@ class ChainSender:
             if finished:
                 return True
             if should_stop is not None and should_stop():
+                self._mark_retryable(dsi.name, destination)
                 self._logger.info(
                     f"stop requested; {dsi.name} -> {destination} continues to "
                     f"{latest.name} next cycle"
@@ -797,6 +897,7 @@ class ChainSender:
                 common_name = self._negotiate(transport, client_id, dsi, snapshots, destination)
             except NegotiationFailed as e:
                 if e.reloading and not e.zfs_timeout:
+                    self._mark_retryable(dsi.name, destination)
                     self._logger.info(
                         f"{self._peer(transport)} is {_retry_word(e, self._busy_prefix)}; "
                         f"{dsi.name} continues next cycle"
@@ -841,6 +942,7 @@ class ChainSender:
                 # (never during a stream). After at least one stream a stop is
                 # a clean pause; before the first send nothing was done.
                 if should_stop is not None and should_stop():
+                    self._mark_retryable(dsi.name, destination)
                     if sent_any:
                         self._logger.info(
                             f"stop requested; {dsi.name} -> {destination} continues to "
@@ -881,6 +983,11 @@ class ChainSender:
                         common_snap = (
                             next(s for s in fresh if s.name == prev.name) if prev else None
                         )
+                        # The failed step may have flagged the call retryable;
+                        # the rebuilt chain is a new attempt, and what ends it
+                        # sets its own flag (a later non-retryable failure
+                        # must not inherit this one).
+                        self._call_retryable.pop((dsi.name, destination), None)
                         rebuilt = True
                         break
                 return False
@@ -935,6 +1042,12 @@ class ChainSender:
         """Called by `backup_dataset` right before `_ready_transport`: a
         subclass that caches a per-cycle readiness check drops it here when it
         is not running inside a worker cycle. Default: nothing."""
+
+    def _transport_retryable(self, destination: str) -> bool:
+        """Whether `_ready_transport` returned `None` for `destination` for a
+        reason worth retrying soon (the receiver reloading, unreachable): the
+        subclass's answer, read right after the `None`. Default: no."""
+        return False
 
     def _where(self, transport) -> str:
         """Where the transport leads, for log lines (``-> <where>``). Default:
@@ -1044,8 +1157,8 @@ class ChainSender:
 
         # The receiver acknowledged `sent`: the copy exists, whatever happens
         # to the bookkeeping below.
-        self._copy_confirmed.add((dsi.name, destination))
-        self._refusal_logged.pop((f"{dsi.name} [{self._refusal_label}]", destination), None)
+        self._memory.note(COPY_CONFIRMED, (dsi.name, destination))
+        self._memory.pop(REFUSALS, (f"{dsi.name} [{self._refusal_label}]", destination))
         # The RAISING read: "unset" and "could not read" differ here. An
         # unreadable anchor must neither skip the never-backwards rule below
         # nor, with no `base`, let the sent-snapshot backstop `clear_anchor` a
@@ -1063,7 +1176,7 @@ class ChainSender:
                 f"negotiates again"
             ))
             return _ANCHOR_FAILED
-        self._refusal_logged.pop(read_key, None)
+        self._memory.pop(REFUSALS, read_key)
         keep_anchor = False
         if old_anchor and old_anchor != sent.name:
             # Never move an anchor backwards (by createtxg): a snapshot older
@@ -1181,7 +1294,7 @@ class ChainSender:
                 "the next cycle retries"
             ))
             return False
-        self._refusal_logged.pop(read_key, None)
+        self._memory.pop(REFUSALS, read_key)
         anchored = anchor == latest.name
         wrote = False
         if not anchored:
@@ -1339,6 +1452,7 @@ class ChainSender:
             return 'fresh', None
         to_snap, from_snap = target
         if should_stop is not None and should_stop():
+            self._mark_retryable(dsi.name, destination)
             self._logger.info(f"stop requested; not resuming {dsi.name}")
             return 'skip', None
         pinned = self.local_manager.set_inflight(
