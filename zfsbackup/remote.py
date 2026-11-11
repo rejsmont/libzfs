@@ -47,7 +47,8 @@ from zfsbackup.protocol import (
     NAME_TOO_LONG_REASON, PROTOCOL_VERSION, SUPPORTED_PROTOCOLS, protocol_headers,
 )
 from zfsbackup.sendmemory import (
-    IDENTITY_ERROR, NEGOTIATE_ZFS_ERROR, NEGOTIATE_ZFS_SKIPS, NO_CLIENT_ID, REFUSALS, SendMemory,
+    IDENTITY_ERROR, IDENTITY_LOADED, NEGOTIATE_ZFS_ERROR, NEGOTIATE_ZFS_SKIPS, NO_CLIENT_ID,
+    REFUSALS, UNREACHABLE, WHOAMI_UNEXPECTED, SendMemory,
 )
 
 
@@ -399,10 +400,15 @@ class RemoteBackupManager(ChainSender):
     identity `client.{crt,key}` lives unless `client_cert_file` /
     `client_key_file` name other files.
 
-    A worker calls `begin_cycle()` once per pass over its datasets: each
-    destination's `/whoami` check then runs once per cycle (not per
-    dataset), and an identity that failed to load is retried. A manager
-    used without `begin_cycle()` checks on every `backup_dataset` call."""
+    The parallel remote worker builds a FRESH manager for every send (one
+    pair, one thread; `sendloop.SenderKit`) and never calls `begin_cycle()`:
+    the manager checks the destination's `/whoami` on every `backup_dataset`
+    call, and everything that must outlive a send (log latches, the
+    skip counters, the "copy confirmed" set) lives in the shared `memory`.
+    `begin_cycle()` remains for a manager used over a pass of several
+    datasets (it caches each destination's `/whoami` result for the pass and
+    retries an identity that failed to load); a manager used without it
+    checks on every `backup_dataset` call."""
 
     _logger = logger
 
@@ -486,6 +492,14 @@ class RemoteBackupManager(ChainSender):
         self._identity_failed_sig = None
         self._check_client_cert_expiry()
 
+    def _has_https_destination(self) -> bool:
+        """Whether the configuration has a destination a client certificate
+        is used for (a leftover certificate means nothing without one)."""
+        return not all(
+            getattr(d, 'is_local', False) is True
+            for d in self.config.destinations.values()
+        )
+
     def _check_client_cert_expiry(self) -> None:
         """S-12: a WARNING within `CLIENT_CERT_EXPIRY_WARN_DAYS` of the client
         certificate's expiry, an ERROR once it has expired (the identity load
@@ -495,14 +509,20 @@ class RemoteBackupManager(ChainSender):
         several managers exactly one claims it); later ones at most once per
         `CLIENT_CERT_EXPIRY_CHECK_EVERY` seconds, whether or not it found
         anything. Not run at all when the configuration has no https
-        destination (a leftover certificate means nothing then)."""
-        if all(
-            getattr(d, 'is_local', False) is True
-            for d in self.config.destinations.values()
-        ):
+        destination (a leftover certificate means nothing then).
+
+        The parallel remote worker's scheduler does not come through here
+        (it never calls `begin_cycle`): it claims the memory's check itself
+        and calls `report_client_cert_expiry` on a throwaway manager."""
+        if not self._has_https_destination():
             return
         if not self._memory.claim_expiry_check(CLIENT_CERT_EXPIRY_CHECK_EVERY, time.monotonic()):
             return
+        self.report_client_cert_expiry()
+
+    def report_client_cert_expiry(self) -> None:
+        """The expiry reminder itself, with no claim (the caller decided it is
+        due): see `_check_client_cert_expiry`. Never raises."""
         try:
             cert_path, _ = self._identity_paths()
             if not os.path.lexists(cert_path):
@@ -542,7 +562,7 @@ class RemoteBackupManager(ChainSender):
     def _negotiate_zfs_ok(self, dsi: DatasetInfo, destination: str) -> None:
         key = (dsi.name, destination)
         self._memory.reset(NEGOTIATE_ZFS_SKIPS, key)
-        self._memory.pop(REFUSALS, (f"{dsi.name} [negotiate zfs_timeout]", destination))
+        self._forget_refusal((f"{dsi.name} [negotiate zfs_timeout]", destination))
         if self._memory.clear(NEGOTIATE_ZFS_ERROR, key):
             logger.info(f"{dsi.name} -> {destination}: the server answers negotiations again")
 
@@ -681,9 +701,11 @@ class RemoteBackupManager(ChainSender):
         self._identity, self._identity_sig = loaded, sig
         self._identity_failed_sig = None
         self._memory.pop(IDENTITY_ERROR, 'remote')
-        if previous is None or previous.fingerprint != loaded.fingerprint:
-            if previous is not None:
-                self.close()
+        if previous is not None and previous.fingerprint != loaded.fingerprint:
+            self.close()
+        # Announced once per fingerprint in the shared memory, not once per
+        # manager: a manager built per send loads its own identity every time.
+        if self._memory.note_value(IDENTITY_LOADED, 'remote', loaded.fingerprint):
             logger.info(
                 f"client TLS identity {loaded.cert_path} loaded (fingerprint "
                 f"{loaded.fingerprint})"
@@ -695,6 +717,8 @@ class RemoteBackupManager(ChainSender):
         self._identity_sig = None
         self._identity_failed_sig = sig
         self.close()
+        # The next successful load is news again (the same fingerprint included).
+        self._memory.pop(IDENTITY_LOADED, 'remote')
         message = f"remote backup skipped: cannot use the client TLS identity: {e}"
         if self._memory.note_value(IDENTITY_ERROR, 'remote', message):
             logger.error(message)
@@ -840,7 +864,10 @@ class RemoteBackupManager(ChainSender):
         the destination may be used this cycle. Every "no" is logged: auth
         refusals, a pin mismatch and a protocol mismatch (a 426, or an answer
         without a supported `protocol`) once (ERROR, deduplicated), a transient
-        failure at ERROR each cycle, the server's retryable 503 at INFO. A
+        failure (cannot reach the server) at ERROR once per episode (`UNREACHABLE`
+        in the shared memory, INFO when it answers again), an unexpected
+        answer likewise (`WHOAMI_UNEXPECTED`), the server's
+        retryable 503 at INFO. A
         reset or broken pipe is retried once: under TLS 1.3 it can be the
         server rejecting our certificate after the handshake."""
         url = f"{transport.base_url}/whoami"
@@ -868,13 +895,22 @@ class RemoteBackupManager(ChainSender):
                         f"rejected this client's certificate {transport.identity_fp}",
                     )
                     return False
-                logger.error(
+                message = (
                     f"cannot reach {transport.base_url} (destination {destination}): {e}; "
-                    "skipping it this cycle"
+                    "not sending to it for now"
                 )
+                # ERROR once per episode in the shared memory (a manager built
+                # per send would otherwise log it for every pair), DEBUG while
+                # it lasts; the next answer from the server ends the episode.
+                if self._memory.note(UNREACHABLE, destination):
+                    logger.error(message)
+                else:
+                    logger.debug(message)
                 # Nothing was sent, and the server may simply be down for a while.
                 self._whoami_retryable = True
                 return False
+        if self._memory.clear(UNREACHABLE, destination):
+            logger.info(f"{transport.base_url} (destination {destination}) is reachable again")
         if _is_reloading(resp):
             self._whoami_retryable = True
             logger.info(
@@ -888,11 +924,22 @@ class RemoteBackupManager(ChainSender):
             return False
         body = _json_body(resp)
         if not resp.ok or not isinstance(body.get('client_id'), str):
-            logger.error(
+            message = (
                 f"unexpected /whoami answer from {transport.base_url} (destination "
-                f"{destination}): HTTP {resp.status_code}; skipping it this cycle"
+                f"{destination}): HTTP {resp.status_code}; not sending to it for now"
             )
+            # ERROR once per episode in the shared memory (every send builds its
+            # own manager, so the old once-per-cycle dedup is gone), DEBUG while
+            # it lasts; the next well-formed answer ends the episode.
+            if self._memory.note(WHOAMI_UNEXPECTED, destination):
+                logger.error(message)
+            else:
+                logger.debug(message)
             return False
+        if self._memory.clear(WHOAMI_UNEXPECTED, destination):
+            logger.info(
+                f"{transport.base_url} (destination {destination}) answers /whoami normally again"
+            )
         problem = _whoami_protocol_problem(
             f"server {transport.base_url} (destination {destination})", body
         )
@@ -908,7 +955,7 @@ class RemoteBackupManager(ChainSender):
                 ),
             )
             return False
-        if self._memory.pop(REFUSALS, (None, destination)) is not None:
+        if self._forget_refusal((None, destination)) is not None:
             logger.info(
                 f"server {transport.base_url} (destination {destination}) accepts this "
                 f"client again as {bound!r}"
@@ -1021,8 +1068,8 @@ class RemoteBackupManager(ChainSender):
                 raise NegotiationFailed(too_long)
             # Only now is the episode over (the check above keeps its entry, so
             # a standing refusal is logged once, not every cycle).
-            self._memory.pop(REFUSALS, (dsi.name, destination))
-            self._memory.pop(REFUSALS, (f"{dsi.name} [unsettled]", destination))
+            self._forget_refusal((dsi.name, destination))
+            self._forget_refusal((f"{dsi.name} [unsettled]", destination))
             self._server_info[(dsi.name, destination)] = (
                 body.get('server_copy'), body.get('server_dataset')
             )
@@ -1359,7 +1406,7 @@ class RemoteBackupManager(ChainSender):
                     (body.get('error') if isinstance(body, dict) else None)
                     or "unexpected reply"
                 )
-            self._memory.pop(REFUSALS, (f"{dsi.name} [zfs_timeout]", destination))
+            self._forget_refusal((f"{dsi.name} [zfs_timeout]", destination))
             token = body.get('resume_token')
             return ('token', token) if token else ('none', None)
         except Exception as e:

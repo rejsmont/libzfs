@@ -41,6 +41,7 @@ import pytest
 
 import libzfseasy as libzfseasy_module
 from _get_support import copy_read_argv
+from _sendloop_support import LoopRig, age_status
 from _snapshot_support import list_row
 from libzfseasy.zfs import ZFSTimeoutError
 from zfsbackup.backup_manager import (
@@ -62,7 +63,9 @@ from zfsbackup.health import STATE_CRIT, STATE_OK, STATE_WARN, evaluate
 from zfsbackup.health_collect import collect
 from _remote_support import snapshot_presence  # noqa: F401  (fixture)
 from test_zfsbackup_chain import DEST as CHAIN_DEST, DS as CHAIN_DS, S1, S2, S3, Rig as ChainRig, listing, sinfo
-from zfsbackup.sendmemory import COPY_CONFIRMED, DRY_RUN_SENT, WAITING, SendMemory
+from zfsbackup.sendmemory import (
+    COPY_CONFIRMED, DRY_RUN_SENT, EXPAND_ERROR, EXPAND_TARGET, WAITING, SendMemory,
+)
 from zfsbackup.stopflag import StopFlag
 from zfsbackup.workers import BaseWorker, ExitReason, RemoteBackupWorker
 
@@ -378,17 +381,31 @@ class RecordingSender:
         #: What a real sender's memory is: ONE `SendMemory` per worker (`make_worker` hands this one to
         #: the worker). R-2 reads the confirmed copies from it, never from the sender (B1 fix 1c).
         self.memory = SendMemory()
+        #: `expanded_from` of every dataset attempted (`None` for a configured pair).
+        self.expanded: Dict[str, object] = {}
 
     @property
     def confirmed(self) -> Set[Tuple[str, str]]:
         """The pairs this sender confirmed: the memory's live `COPY_CONFIRMED` latch."""
         return self.memory.latch_view(COPY_CONFIRMED)
 
+    @property
+    def _memory(self):
+        """What `RemoteBackupWorker._shares_memory` reads: the sender uses the worker's one memory."""
+        return self.memory
+
     def begin_cycle(self):
+        pass
+
+    def report_client_cert_expiry(self):
+        pass
+
+    def close(self):
         pass
 
     def backup_dataset(self, dsi, remote_cfg, should_stop=None):
         self.attempts.append((dsi.name, remote_cfg.destination))
+        self.expanded[dsi.name] = dsi.expanded_from
         self._acknowledged(dsi.name, remote_cfg.destination)
         self.confirmed.add((dsi.name, remote_cfg.destination))
         return True
@@ -438,34 +455,19 @@ class TestInheritedAnchorInTheDueCheck:
     `anchor.age < freq` said "not due yet". It now reads `get_own_anchor` (`-s local`).
     Desired: the child has no anchor of its own, so it is due and `backup_dataset` runs."""
 
-    def test_a_child_without_a_local_anchor_is_due(self, zfs_world, mocker):
+    def test_a_child_without_a_local_anchor_is_due(self, zfs_world, monkeypatch):
         anchored_pair(zfs_world, stamp(timedelta(minutes=10)))
         cfg = config(dataset(PARENT, recursive=True), dataset(CHILD))
-        manager = DatasetManager(cfg)
-        child = next(d for d in manager.datasets if d.name == CHILD)
-
-        worker = RemoteBackupWorker(cfg, StopFlag())
         sender = RecordingSender()
-        worker._remote_manager = sender
+        make_rig(monkeypatch, cfg, sender).run()
+        # the parent goes first (R-2); the child, released by its confirmation, has no anchor of its own
+        assert (CHILD, DEST) in sender.attempts, 'the child has no anchor of its own: it is due'
 
-        worker._send_to_destination(manager, child, child.config.remote[0], mocker.MagicMock())
-
-        assert sender.attempts == [(CHILD, DEST)], 'the child has no anchor of its own: it is due'
-
-    def test_a_parent_with_a_fresh_local_anchor_is_not_due(self, zfs_world, mocker):
-        # The control: the same worker, the same fake, a LOCAL fresh anchor -> not due. Passes now
-        # and after A1; it proves the fake and the setup, so the xfail above fails for its reason.
+    def test_a_parent_with_a_fresh_local_anchor_is_not_due(self, zfs_world, monkeypatch):
+        # The control: the same fake, a LOCAL fresh anchor, nothing waiting on it -> not due.
         anchored_pair(zfs_world, stamp(timedelta(minutes=10)))
-        cfg = config(dataset(PARENT, recursive=True), dataset(CHILD))
-        manager = DatasetManager(cfg)
-        parent = next(d for d in manager.datasets if d.name == PARENT)
-
-        worker = RemoteBackupWorker(cfg, StopFlag())
         sender = RecordingSender()
-        worker._remote_manager = sender
-
-        worker._send_to_destination(manager, parent, parent.config.remote[0], mocker.MagicMock())
-
+        make_rig(monkeypatch, config(dataset(PARENT)), sender).run()
         assert sender.attempts == []
 
 
@@ -513,19 +515,15 @@ class TestDescendantsOfARecursiveDataset:
     It has a child filesystem and a child zvol, neither configured. The snapshot worker already
     snapshots them (`zfs snapshot -r`, backup_manager.py:1547).
 
-    Path: `RemoteBackupWorker.run` -> `_get_datasets` -> `DatasetManager.expand_recursive`.
+    Path: `RemoteBackupWorker.run` -> the scheduler's discovery thread -> `DatasetManager.expand_recursive(parent=)`.
     Before A2 only the configured parent was attempted. Now: one `backup_dataset` attempt per
     child x destination, after the parent."""
 
     @staticmethod
-    def one_cycle(cfg, mocker, world=None):
-        worker = RemoteBackupWorker(cfg, StopFlag())
+    def one_cycle(cfg, monkeypatch, world=None):
+        """The real remote worker's scheduler, until it is quiet: every pair attempted once."""
         sender = RecordingSender(world)
-        worker._memory = sender.memory                      # one memory for the worker and its sender
-        mocker.patch.object(worker, '_before_loop',
-                            side_effect=lambda *a: setattr(worker, '_remote_manager', sender))
-        mocker.patch.object(worker, '_wait', return_value=ExitReason.STOP)   # exactly one cycle
-        worker.run()
+        make_rig(monkeypatch, cfg, sender).run()
         return sender
 
     def tree(self, world):
@@ -534,9 +532,9 @@ class TestDescendantsOfARecursiveDataset:
         world.add(f'{PARENT}/fs', 'filesystem', snaps=[snap])
         world.add(f'{PARENT}/vol', 'volume', snaps=[snap])
 
-    def test_each_descendant_is_sent_to_each_destination_after_its_parent(self, zfs_world, mocker):
+    def test_each_descendant_is_sent_to_each_destination_after_its_parent(self, zfs_world, monkeypatch):
         self.tree(zfs_world)
-        sender = self.one_cycle(config(dataset(PARENT, recursive=True)), mocker, zfs_world)
+        sender = self.one_cycle(config(dataset(PARENT, recursive=True)), monkeypatch, zfs_world)
 
         assert sender.attempts[:1] == [(PARENT, DEST)], 'the parent goes first'
         assert sorted(sender.attempts[1:]) == [(f'{PARENT}/fs', DEST), (f'{PARENT}/vol', DEST)]
@@ -592,33 +590,24 @@ class TestA1MatrixDueCheck:
     """`RemoteBackupWorker._send_to_destination` (the due check) reads `get_own_anchor`."""
 
     @pytest.mark.parametrize('source', SOURCES)
-    def test_only_a_local_fresh_anchor_makes_the_child_not_due(self, zfs_world, mocker, caplog, source):
+    def test_only_a_local_fresh_anchor_makes_the_child_not_due(self, zfs_world, monkeypatch, caplog, source):
         old, new = two_snapshot_pair(zfs_world)
         give(zfs_world, source, ANCHOR, new)
-        cfg = config(dataset(PARENT, recursive=True), dataset(CHILD))
-        manager = DatasetManager(cfg)
-        child = next(d for d in manager.datasets if d.name == CHILD)
-        worker = RemoteBackupWorker(cfg, StopFlag())
         sender = RecordingSender()
-        worker._remote_manager = sender
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
-            worker._send_to_destination(manager, child, child.config.remote[0], mocker.MagicMock())
+            make_rig(monkeypatch, config(dataset(CHILD)), sender).run()
 
         assert sender.attempts == ([] if source == 'local' else [(CHILD, DEST)])
         # one `-s local` read of the child's own anchor, and no effective read of it
         assert [a for a in zfs_world.value_reads(CHILD) if a[-2] == ANCHOR] == [
             ['get', '-H', '-o', 'value', '-s', 'local', ANCHOR, CHILD]]
 
-    def test_an_unreadable_anchor_is_due_with_a_debug_line_and_no_warning(self, zfs_world, mocker, caplog):
+    def test_an_unreadable_anchor_is_due_with_a_debug_line_and_no_warning(self, zfs_world, monkeypatch, caplog):
         old, new = two_snapshot_pair(zfs_world)
         give(zfs_world, 'unreadable', ANCHOR, new)
-        cfg = config(dataset(CHILD))
-        manager = DatasetManager(cfg)
-        worker = RemoteBackupWorker(cfg, StopFlag())
-        worker._remote_manager = sender = RecordingSender()
+        sender = RecordingSender()
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
-            worker._send_to_destination(manager, manager.datasets[0], manager.datasets[0].config.remote[0],
-                                        mocker.MagicMock())
+            make_rig(monkeypatch, config(dataset(CHILD)), sender).run()
         assert sender.attempts == [(CHILD, DEST)]
         assert len(debug_reads(caplog)) == 1 and 'pool I/O is currently suspended' in debug_reads(caplog)[0].getMessage()
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1502,6 +1491,113 @@ class TestExpandDiscoveryFailure:
 
 
 @pytest.mark.unit
+class TestExpandOneParent:
+    """`expand_recursive(parent=)`: what the remote worker's discovery threads call (one per recursive
+    parent). It expands only that parent and forgets only ITS episodes: the `EXPAND_*` latches of the other
+    parents belong to other threads' episodes and must survive (mutation-checked: an unscoped `retain` fails
+    the three latch tests)."""
+
+    OTHER = 'pool/other'
+
+    def two(self, world):
+        add_tree(world, PARENT, f'{PARENT}/a', self.OTHER, f'{self.OTHER}/b')
+        return config(dataset(PARENT, recursive=True), dataset(self.OTHER, recursive=True))
+
+    def test_only_the_named_parent_is_listed_and_expanded(self, zfs_world):
+        manager = DatasetManager(self.two(zfs_world))
+        exp = manager.expand_recursive(parent=self.OTHER)
+        assert child_names(exp) == [f'{self.OTHER}/b'] and exp.failed == {}
+        assert [c[-1] for c in zfs_world.name_lists()] == [self.OTHER], 'the other parent is not even listed'
+
+    def test_the_children_are_stamped_like_the_unscoped_expansion(self, zfs_world):
+        cfg = self.two(zfs_world)
+        full = {c.name: c for c in DatasetManager(cfg).expand_recursive().children}
+        one = {c.name: c for c in DatasetManager(cfg).expand_recursive(parent=PARENT).children}
+        assert set(one) == {f'{PARENT}/a'}
+        assert one[f'{PARENT}/a'].expanded_from == PARENT
+        assert one[f'{PARENT}/a'].config == full[f'{PARENT}/a'].config
+
+    @pytest.mark.parametrize('name', ['pool/nowhere', 'pool/plain', ''], ids=['unknown', 'not-recursive', 'empty'])
+    def test_a_name_that_is_not_an_enabled_recursive_parent_expands_nothing_and_lists_nothing(self, zfs_world, name):
+        add_tree(zfs_world, PARENT, 'pool/plain')
+        cfg = config(dataset(PARENT, recursive=True), dataset('pool/plain'))
+        exp = DatasetManager(cfg).expand_recursive(parent=name)
+        assert exp.children == [] and exp.failed == {} and zfs_world.name_lists() == []
+
+    def test_a_disabled_parent_expands_nothing(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        cfg = config(dataclasses.replace(dataset(PARENT, recursive=True), enabled=False))
+        exp = DatasetManager(cfg).expand_recursive(parent=PARENT)
+        assert exp.children == [] and zfs_world.name_lists() == []
+
+    def test_a_failing_parent_reports_itself_in_failed_and_its_error_is_once_per_episode(self, zfs_world, caplog):
+        cfg = self.two(zfs_world)
+        zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
+        manager = DatasetManager(cfg)
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            for _ in range(3):
+                assert list(manager.expand_recursive(parent=PARENT).failed) == [PARENT]
+        assert len(records_at(caplog, logging.ERROR)) == 1
+
+    def test_one_parents_recovery_does_not_end_another_parents_episode(self, zfs_world, caplog):
+        cfg = self.two(zfs_world)
+        zfs_world.list_failures[PARENT] = 'boom'
+        zfs_world.list_failures[self.OTHER] = 'boom'
+        manager = DatasetManager(cfg)
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            manager.expand_recursive(parent=PARENT)
+            manager.expand_recursive(parent=self.OTHER)
+            assert len(records_at(caplog, logging.ERROR)) == 2
+            del zfs_world.list_failures[PARENT]
+            assert child_names(manager.expand_recursive(parent=PARENT)) == [f'{PARENT}/a']
+            assert manager._memory.noted(EXPAND_ERROR, self.OTHER), 'the other parent is still in its episode'
+            manager.expand_recursive(parent=self.OTHER)
+            assert len(records_at(caplog, logging.ERROR)) == 2, 'its episode is not announced again'
+
+    def test_an_unrelated_parents_call_never_clears_a_latch(self, zfs_world):
+        cfg = self.two(zfs_world)
+        zfs_world.list_failures[PARENT] = 'boom'
+        manager = DatasetManager(cfg)
+        manager.expand_recursive(parent=PARENT)
+        assert manager._memory.noted(EXPAND_ERROR, PARENT)
+        manager.expand_recursive(parent=self.OTHER)               # a healthy parent, a different thread
+        assert manager._memory.noted(EXPAND_ERROR, PARENT)
+        manager.expand_recursive(parent='pool/nowhere')           # not a parent at all
+        assert manager._memory.noted(EXPAND_ERROR, PARENT)
+
+    def test_a_target_episode_is_scoped_to_its_parent(self, zfs_world, caplog):
+        target = f'{PARENT}/bk'
+        add_tree(zfs_world, PARENT, f'{PARENT}/ok', target, self.OTHER, f'{self.OTHER}/b')
+        cfg = config(
+            dataset(PARENT, recursive=True), dataset(self.OTHER, recursive=True),
+            destinations={DEST: Destination(url='https://h:8443'), 'vault': Destination(url=f'zfs:{target}')},
+        )
+        manager = DatasetManager(cfg)
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            manager.expand_recursive(parent=PARENT)
+            assert len(records_at(caplog, logging.ERROR)) == 1
+            assert manager._memory.noted(EXPAND_TARGET, (PARENT, target))
+            manager.expand_recursive(parent=self.OTHER)               # a clean parent: PARENT's latch stays
+            assert manager._memory.noted(EXPAND_TARGET, (PARENT, target))
+            manager.expand_recursive(parent=PARENT)
+            assert len(records_at(caplog, logging.ERROR)) == 1, 'still the same episode'
+
+    def test_without_parent_the_whole_set_is_still_forgotten_as_before(self, zfs_world, caplog):
+        cfg = self.two(zfs_world)
+        zfs_world.list_failures[PARENT] = 'boom'
+        manager = DatasetManager(cfg)
+        manager.expand_recursive()
+        del zfs_world.list_failures[PARENT]
+        manager.expand_recursive()
+        assert not manager._memory.noted(EXPAND_ERROR, PARENT)
+
+    def test_should_stop_true_lists_nothing(self, zfs_world):
+        cfg = self.two(zfs_world)
+        exp = DatasetManager(cfg).expand_recursive(should_stop=lambda: True, parent=PARENT)
+        assert exp == Expansion([], {}) and zfs_world.calls == []
+
+
+@pytest.mark.unit
 class TestExpandStampedConfig:
     """`dataclasses.replace(parent_cfg, name=child, recursive=False)`, per destination."""
 
@@ -1618,6 +1714,7 @@ class ScriptedSender(RecordingSender):
     def backup_dataset(self, dsi, remote_cfg, should_stop=None):
         key = (dsi.name, remote_cfg.destination)
         self.attempts.append(key)
+        self.expanded[dsi.name] = dsi.expanded_from
         if key in self.raises:
             raise RuntimeError('boom')
         done = self.outcomes.get(key, True)
@@ -1642,38 +1739,19 @@ def sdir(tmp_path):
     return directory
 
 
-def make_worker(cfg, sender=None, status_dir=None, local=None):
-    """A `RemoteBackupWorker` over `sender` (and `local` for `zfs:` destinations), its status
-    writer open when `status_dir` is given -- everything `run()` sets up before the first cycle."""
-    worker = RemoteBackupWorker(cfg, StopFlag(), status_dir=status_dir)
-    worker._remote_manager = sender if sender is not None else ScriptedSender()
-    worker._local_manager = local
-    # ONE memory for the worker and its senders, as `_before_loop` makes it (`adopt_memory`).
-    worker._memory = getattr(worker._remote_manager, 'memory', None) or worker._remote_manager._memory
-    if local is not None:
-        if hasattr(local, 'memory'):
-            local.memory = worker._memory
-        else:
-            local.adopt_memory(worker._memory)
-    worker._status = worker._open_status(cfg, logging.getLogger('test'))
-    return worker
+def make_rig(monkeypatch, cfg, sender=None, status_dir=None, local=None, **kw):
+    """The REAL remote worker (`_sendloop_support.LoopRig`: its scheduler, discovery and sender threads)
+    over `sender` (and `local` for `zfs:` destinations) and the fake zfs world patched below libzfseasy;
+    `run()` runs it until it is quiet: every due pair attempted once, every child its discovery found."""
+    return LoopRig(
+        cfg, monkeypatch, remote=sender if sender is not None else ScriptedSender(), local=local,
+        world=True, status_dir=status_dir, **kw,
+    )
 
 
-def cycle(worker, manager):
-    """One pass of `BaseWorker.run`'s loop (list, retain, process every dataset), -> the list."""
-    datasets = worker._get_datasets(manager)
-    if worker._status is not None:
-        keep = worker._status_keys(datasets)
-        if keep is not None:
-            worker._status.retain(keep)
-    for dsi in datasets:
-        worker._process_dataset(manager, dsi)
-    return datasets
-
-
-def status_record(worker, dataset, destination, kind=health.KIND_SEND):
+def status_record(rig, dataset, destination, kind=health.KIND_SEND):
     """The record the worker's status writer holds for the pair (a lookup over `records`), or None."""
-    return next((r for r in worker._status.records
+    return next((r for r in rig.worker._status.records
                  if (r.kind, r.dataset, r.destination) == (kind, dataset, destination)), None)
 
 
@@ -1686,43 +1764,45 @@ A, AB = f'{PARENT}/a', f'{PARENT}/a/b'
 
 @pytest.mark.unit
 class TestA2ListAndOrder:
-    def test_children_join_the_list_after_their_parent_by_depth_then_config_order(self, zfs_world):
+    """The pairs the remote worker sends: the configured ones, then the descendants of every enabled
+    recursive dataset (its discovery thread: `DatasetManager.expand_recursive(parent=)`), each an
+    ordinary pair of the schedule, an ancestor always before its descendants."""
+
+    def test_children_follow_their_parent(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A, AB, f'{PARENT}/c', 'pool/other', 'pool/other/z')
         cfg = config(rdataset(PARENT, recursive=True), rdataset('pool/other'))
-        manager = DatasetManager(cfg)
-        datasets = make_worker(cfg)._get_datasets(manager)
-        depths = [d.name.count('/') for d in datasets]
-        assert depths == sorted(depths)
-        assert [d.name for d in datasets][:2] == [PARENT, 'pool/other'], 'config order within a depth'
-        assert [d.name for d in datasets if d.name.count('/') == 2] == [A, f'{PARENT}/c'], 'listing order'
-        assert datasets[-1].name == AB
-        names = [d.name for d in datasets]
+        sender = ScriptedSender(zfs_world)
+        make_rig(monkeypatch, cfg, sender, caps=(1, 1)).run()
+        names = [d for d, _ in sender.attempts]
+        assert names[0] == PARENT, 'the first configured pair goes first'
+        assert sorted(names) == sorted([PARENT, 'pool/other', A, AB, f'{PARENT}/c'])
         for name in names:
             for other in names:
                 if name.startswith(other + '/'):
                     assert names.index(other) < names.index(name), 'an ancestor is always before its descendant'
-        by_name = {d.name: d for d in datasets}
-        assert by_name[PARENT].expanded_from is None and by_name[AB].expanded_from == PARENT
-        assert by_name['pool/other'].expanded_from is None
+        assert sender.expanded[PARENT] is None and sender.expanded[AB] == PARENT
+        assert sender.expanded['pool/other'] is None
         assert 'pool/other/z' not in names, 'pool/other is not recursive'
 
-    def test_a_cycle_attempts_every_pair_parents_first(self, zfs_world):
+    def test_a_run_attempts_every_pair_parents_first(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A, AB, f'{PARENT}/c')
         sender = ScriptedSender(zfs_world)
         cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
                      destinations={'off': Destination(url='https://h:8443'),
                                    'second': Destination(url='https://s:8443')})
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
-        assert sender.attempts == [
-            (PARENT, 'off'), (PARENT, 'second'), (A, 'off'), (A, 'second'),
-            (f'{PARENT}/c', 'off'), (f'{PARENT}/c', 'second'), (AB, 'off'), (AB, 'second')]
+        make_rig(monkeypatch, cfg, sender).run()
+        assert sorted(sender.attempts) == sorted(
+            (d, dest) for d in (PARENT, A, AB, f'{PARENT}/c') for dest in ('off', 'second'))
+        for dest in ('off', 'second'):
+            on = [d for d, x in sender.attempts if x == dest]
+            assert on[0] == PARENT and on.index(A) < on.index(AB)
 
-    def test_through_run_one_cycle_attempts_the_children(self, zfs_world, mocker):
-        # The same through `BaseWorker.run` (the A0 scenario) with a two-level tree.
+    def test_through_run_the_children_are_attempted(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A, AB)
         sender = TestDescendantsOfARecursiveDataset.one_cycle(
-            config(dataset(PARENT, recursive=True)), mocker, zfs_world)
-        assert sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)]
+            config(dataset(PARENT, recursive=True)), monkeypatch, zfs_world)
+        assert sender.attempts[0] == (PARENT, DEST) and sorted(sender.attempts) == sorted(
+            [(PARENT, DEST), (A, DEST), (AB, DEST)])
 
     def test_the_snapshot_and_pruning_workers_never_see_a_child(self, zfs_world, mocker):
         add_tree(zfs_world, PARENT, A, AB, 'pool/other')
@@ -1738,61 +1818,80 @@ class TestA2ListAndOrder:
             assert all(getattr(d, 'expanded_from', None) is None for d in worker._get_datasets(DatasetManager(cfg)))
         assert zfs_world.name_lists() == [], 'only the remote worker enumerates descendants'
 
-    def test_the_manager_itself_never_holds_a_child(self, zfs_world):
+    def test_the_schedulers_own_manager_never_holds_a_child(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, recursive=True))
-        manager = DatasetManager(cfg)
-        cycle(make_worker(cfg), manager)
-        assert [d.name for d in manager.datasets] == [PARENT]
+        rig = make_rig(monkeypatch, cfg).run()
+        assert [d.name for d in rig.loop._configured] == [PARENT]
+        assert [d.name for d in DatasetManager(cfg).datasets] == [PARENT]
+        assert sorted(k.dataset for k in rig.loop.schedule.keys()) == [PARENT, A], 'the schedule has the child'
 
-    def test_a_failed_discovery_still_sends_the_parent(self, zfs_world, caplog):
+    def test_a_failed_discovery_still_sends_the_parent(self, zfs_world, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A)
         zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
         sender = ScriptedSender(zfs_world)
         cfg = config(rdataset(PARENT, recursive=True))
-        worker = make_worker(cfg, sender)
+        rig = make_rig(monkeypatch, cfg, sender)
         with caplog.at_level(logging.INFO, logger=BACKUP_LOGGER):
-            cycle(worker, DatasetManager(cfg))
+            rig.run()
         assert sender.attempts == [(PARENT, DEST)]
-        assert list(worker._expansion_failed) == [PARENT]
+        assert list(rig.loop._failed) == [PARENT]
         assert len(records_at(caplog, logging.ERROR)) == 1
 
-    def test_an_expansion_that_raises_is_logged_and_the_parent_is_still_sent(self, zfs_world, mocker, caplog):
+    def test_an_expansion_that_raises_is_logged_and_the_parent_is_still_sent(self, zfs_world, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A)
         sender = ScriptedSender(zfs_world)
         cfg = config(rdataset(PARENT, recursive=True))
-        manager = DatasetManager(cfg)
-        mocker.patch.object(manager, 'expand_recursive', side_effect=RuntimeError('boom'))
+
+        def boom(self_, *a, **k):
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(DatasetManager, 'expand_recursive', boom)
         with caplog.at_level(logging.ERROR, logger=WORKER_LOGGER):
-            cycle(make_worker(cfg, sender), manager)
+            rig = make_rig(monkeypatch, cfg, sender).run()
         assert sender.attempts == [(PARENT, DEST)]
         assert any('could not expand' in r.getMessage() for r in caplog.records)
+        assert list(rig.loop._failed) == [PARENT]
 
-    def test_a_pending_stop_lists_no_descendants(self, zfs_world):
+    def test_a_pending_stop_lists_no_descendants(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, recursive=True))
-        worker = make_worker(cfg)
-        worker.stop_event.set()
-        assert [d.name for d in worker._get_datasets(DatasetManager(cfg))] == [PARENT]
-        assert zfs_world.name_lists() == [] and worker._expansion_failed == {}
+        sender = ScriptedSender(zfs_world)
+        rig = make_rig(monkeypatch, cfg, sender)
+        rig.stop.set()
+        rig.run()
+        assert zfs_world.name_lists() == [] and sender.attempts == [] and rig.loop is None
 
 
 @pytest.mark.unit
 class TestA2ParentFirst:
-    """R-2 on the serial worker: an EXPANDED pair waits until the nearest ancestor pair on the same
-    destination has been CONFIRMED in this incarnation (`ChainSender.copy_confirmed`: a negotiate found
-    the copy and the call returned True, or a stream committed). No anchor and no status record is
-    evidence; an unconfirmed ancestor with waiting dependents is DUE whatever its anchor says. WARNING
-    once per (ancestor, destination) with the number of waiting children, per-child lines at DEBUG,
-    INFO when released; nothing recorded for a held pair."""
+    """R-2 in the scheduler: EVERY child pair (an expanded one or a configured one) waits until the nearest
+    ancestor pair on the same destination has been CONFIRMED in this incarnation (`PairOutcome.confirmed`
+    from the senders' `SendMemory`: a negotiate found the copy and the call returned True, or a stream
+    committed). No anchor and no status record is evidence; an unconfirmed ancestor with waiting
+    dependents is DUE whatever its anchor says. One WARNING per (ancestor, destination) EPISODE with the
+    number of waiting children once the hold has lasted `WAITING_NOTICE` (these tests set it to 0 where
+    they look at it), INFO when released; nothing recorded for a held pair. (The senders' own
+    `AncestorRule` is a backstop for expanded children: `test_zfsbackup_sendpair.py::TestHold`.)"""
 
     @pytest.fixture
-    def rig(self, zfs_world, sdir):
+    def rig(self, zfs_world, sdir, monkeypatch):
         add_tree(zfs_world, PARENT, A, AB)
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
-        return SimpleNamespace(world=zfs_world, cfg=cfg, sender=sender, manager=DatasetManager(cfg),
-                               worker=make_worker(cfg, sender, sdir), sdir=sdir)
+        loop_rig = make_rig(monkeypatch, cfg, sender, sdir)
+        return SimpleNamespace(world=zfs_world, cfg=cfg, sender=sender, rig=loop_rig, sdir=sdir,
+                               worker=loop_rig.worker, run=loop_rig.run)
+
+    @pytest.fixture
+    def rig0(self, zfs_world, sdir, monkeypatch):
+        """As `rig`, but a held child is announced at once (`WAITING_NOTICE` 0)."""
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender(zfs_world)
+        loop_rig = make_rig(monkeypatch, cfg, sender, sdir, notice=0.0)
+        return SimpleNamespace(world=zfs_world, cfg=cfg, sender=sender, rig=loop_rig, sdir=sdir,
+                               worker=loop_rig.worker, run=loop_rig.run)
 
     @staticmethod
     def newest(world, name):
@@ -1810,69 +1909,78 @@ class TestA2ParentFirst:
 
     # -- waiting, and what is logged / recorded --------------------------------------------------
 
-    def test_children_wait_for_a_parent_that_is_not_confirmed(self, rig, caplog):
+    def test_children_wait_for_a_parent_that_is_not_confirmed(self, rig0, caplog):
+        rig0.sender.outcomes[(PARENT, DEST)] = False
+        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
+            rig0.run()
+        assert rig0.sender.attempts == [(PARENT, DEST)]
+        # `a` waits for the parent and `a/b` for its nearest, `a`: only the topmost holder, the parent (the
+        # pair that is not confirmed and not itself held), is announced; `a` is held, so it never is
+        assert self.aggregated(caplog) == [(1, PARENT, DEST)]
+        assert not rig0.worker._mem().noted(WAITING, (A, DEST))
+
+    def test_the_warning_waits_for_the_notice_a_normal_start_logs_nothing(self, rig, caplog):
+        """A child held behind an ancestor that negotiates first is normal at every start: no WARNING
+        until the hold has lasted `WAITING_NOTICE` (60 s)."""
         rig.sender.outcomes[(PARENT, DEST)] = False
         with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            for _ in range(3):
-                cycle(rig.worker, rig.manager)
-        assert rig.sender.attempts == [(PARENT, DEST)] * 3
-        # one WARNING per (ancestor, destination): `a` waits for the parent, `a/b` for its nearest, `a`
-        assert self.aggregated(caplog) == [(1, PARENT, DEST), (1, A, DEST)]
-        debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG and r.name == WORKER_LOGGER
-                 and 'waiting for' in r.getMessage()]
-        assert f'{A} -> {DEST}: waiting for {PARENT}' in debug and f'{AB} -> {DEST}: waiting for {A}' in debug
+            rig.run()
+        assert rig.sender.attempts == [(PARENT, DEST)] and worker_warnings(caplog) == []
 
-    def test_the_warning_counts_the_waiting_descendants_once(self, zfs_world, caplog):
+    def test_the_warning_counts_the_waiting_descendants_once(self, zfs_world, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, *[f'{PARENT}/c{i}' for i in range(3)])
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
         sender.outcomes[(PARENT, DEST)] = False
-        worker = make_worker(cfg, sender)
         with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            for _ in range(2):
-                cycle(worker, DatasetManager(cfg))
+            make_rig(monkeypatch, cfg, sender, notice=0.0).run()
         assert self.aggregated(caplog) == [(3, PARENT, DEST)]
         assert f'3 descendants of {PARENT} wait' in worker_warnings(caplog)[0]
 
     def test_nothing_is_recorded_for_a_waiting_pair(self, rig):
         rig.sender.outcomes[(PARENT, DEST)] = False
-        cycle(rig.worker, rig.manager)
-        rig.worker._flush_status(force=True)
+        rig.run()
         keys = {r.key for r in health.read_worker_status(rig.sdir, rig.worker.name).records}
         assert keys == {(health.KIND_SEND, PARENT, DEST)}
-        assert status_record(rig.worker, A, DEST) is None
-        assert status_record(rig.worker, PARENT, DEST).consecutive_failures == 1
+        assert status_record(rig, A, DEST) is None
+        assert status_record(rig, PARENT, DEST).consecutive_failures == 1
 
-    def test_the_parents_confirmation_releases_the_children_in_the_same_cycle(self, rig, caplog):
-        rig.sender.outcomes[(PARENT, DEST)] = False
-        cycle(rig.worker, rig.manager)
-        rig.sender.attempts.clear()
-        rig.sender.outcomes[(PARENT, DEST)] = True
+    def test_the_parents_confirmation_releases_the_children_in_the_same_run(self, rig0, caplog, monkeypatch):
+        rig0.sender.outcomes[(PARENT, DEST)] = False
+        rig0.run()                                                 # the wait was announced
+        assert rig0.worker._mem().noted(WAITING, (PARENT, DEST))
+        rig0.sender.attempts.clear()
+        rig0.sender.outcomes[(PARENT, DEST)] = True
+        monkeypatch.setattr('zfsbackup.sendloop.WAITING_NOTICE', 60.0)     # a normal start: no notice
+        age_status(rig0.worker)
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            cycle(rig.worker, rig.manager)
-        assert rig.sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)]
+            rig0.run()                                             # a new incarnation of the loop
+        assert rig0.sender.attempts[0] == (PARENT, DEST)
+        assert sorted(rig0.sender.attempts) == sorted([(PARENT, DEST), (A, DEST), (AB, DEST)])
         assert worker_warnings(caplog) == []
-        infos = [r.getMessage() for r in caplog.records if r.name == WORKER_LOGGER and r.levelno == logging.INFO
-                 and 'is confirmed at' in r.getMessage()]
-        assert infos == [f'{PARENT} is confirmed at {DEST}: its descendants follow',
-                         f'{A} is confirmed at {DEST}: its descendants follow']
+        # a new loop starts with no announced episode: the old one's latch is dropped quietly
+        assert rig0.worker._mem().latch_view(WAITING) == set()
 
-    def test_the_wait_is_announced_again_after_it_ended(self, rig, caplog):
-        rig.sender.outcomes[(PARENT, DEST)] = False
+    def test_the_wait_is_announced_again_after_it_ended(self, rig0, caplog, monkeypatch):
+        rig0.sender.outcomes[(PARENT, DEST)] = False
         with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            cycle(rig.worker, rig.manager)
-            rig.sender.outcomes[(PARENT, DEST)] = True
-            cycle(rig.worker, rig.manager)
+            rig0.run()
             n = len(self.aggregated(caplog))
-            rig.sender.confirmed.clear()                       # a new incarnation of the sender
-            rig.sender.outcomes[(PARENT, DEST)] = False
-            cycle(rig.worker, rig.manager)
-        assert len(self.aggregated(caplog)) == 2 * n, 'both episodes announced again'
+            assert n == 1, 'only the topmost holder is announced'
+            monkeypatch.setattr('zfsbackup.sendloop.WAITING_NOTICE', 60.0)
+            rig0.sender.outcomes[(PARENT, DEST)] = True
+            rig0.run()                                          # ended: nothing announced
+            assert len(self.aggregated(caplog)) == n
+            monkeypatch.setattr('zfsbackup.sendloop.WAITING_NOTICE', 0.0)
+            rig0.sender.confirmed.clear()                       # a new incarnation of the sender
+            rig0.sender.outcomes[(PARENT, DEST)] = False
+            rig0.run()
+        assert len(self.aggregated(caplog)) == 2 * n, 'the episode is announced again'
 
     # -- the evidence: only this incarnation's confirmation -----------------------------------------
 
-    def test_a_status_success_alone_releases_nothing(self, zfs_world, sdir):
+    def test_a_status_success_alone_releases_nothing(self, zfs_world, sdir, monkeypatch):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, recursive=True))
         earlier = StatusWriter(sdir, 'remote-backup-worker')
@@ -1880,15 +1988,13 @@ class TestA2ParentFirst:
         earlier.flush(force=True)
         sender = ScriptedSender()
         sender.outcomes[(PARENT, DEST)] = False
-        worker = make_worker(cfg, sender, sdir)
-        for _ in range(2):
-            cycle(worker, DatasetManager(cfg))
-        assert sender.attempts == [(PARENT, DEST)] * 2
+        make_rig(monkeypatch, cfg, sender, sdir).run()
+        assert sender.attempts == [(PARENT, DEST)]
 
     def test_a_true_return_that_confirmed_nothing_releases_nothing(self, rig):
-        # `backup_dataset` is True for "nothing to send" too; only `copy_confirmed` counts
+        # `backup_dataset` is True for "nothing to send" too; only the confirmation in the memory counts
         rig.sender.unconfirmed_success.add((PARENT, DEST))
-        cycle(rig.worker, rig.manager)
+        rig.run()
         assert rig.sender.attempts == [(PARENT, DEST)]
 
     @pytest.mark.parametrize('age', [timedelta(minutes=10), timedelta(hours=5)], ids=['fresh', 'stale'])
@@ -1899,241 +2005,266 @@ class TestA2ParentFirst:
         rig.world.snaps[PARENT].insert(0, old)
         rig.world.set_prop(PARENT, ANCHOR, old)
         rig.sender.outcomes[(PARENT, DEST)] = False
-        cycle(rig.worker, rig.manager)
+        rig.run()
         assert rig.sender.attempts == [(PARENT, DEST)], 'no child follows a parent that failed to confirm'
 
     def test_a_fresh_anchor_does_not_stop_an_unconfirmed_parent_with_dependents_being_negotiated(self, rig):
         rig.world.set_prop(PARENT, ANCHOR, self.newest(rig.world, PARENT))      # not due by its anchor
-        cycle(rig.worker, rig.manager)
-        assert rig.sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)], \
-            'forced due, confirmed, and its children follow in the same cycle'
+        rig.run()
+        assert rig.sender.attempts[0] == (PARENT, DEST) and len(rig.sender.attempts) == 3, \
+            'forced due, confirmed, and its children follow in the same run'
 
-    def test_the_forced_negotiate_happens_once_per_incarnation(self, rig):
+    def test_the_forced_negotiate_ends_with_the_confirmation(self, rig):
         rig.world.set_prop(PARENT, ANCHOR, self.newest(rig.world, PARENT))
-        for _ in range(3):
-            cycle(rig.worker, rig.manager)
-        assert rig.sender.attempts.count((PARENT, DEST)) == 1, 'confirmed: the anchor decides again'
+        rig.run()
+        assert rig.sender.attempts.count((PARENT, DEST)) == 1
+        assert rig.rig.loop.schedule.wants_confirmation((PARENT, DEST)) is False, 'confirmed: the anchor decides again'
 
     def test_the_forced_negotiate_records_an_ok_when_the_copy_was_up_to_date(self, rig):
         rig.world.set_prop(PARENT, ANCHOR, self.newest(rig.world, PARENT))
-        cycle(rig.worker, rig.manager)
-        record = status_record(rig.worker, PARENT, DEST)
+        rig.run()
+        record = status_record(rig, PARENT, DEST)
         assert record.result == health.RESULT_OK and record.consecutive_failures == 0
 
-    def test_a_parent_without_dependents_is_not_forced(self, zfs_world):
+    def test_a_parent_without_dependents_is_not_forced(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT)                                            # recursive, but no child
         zfs_world.set_prop(PARENT, ANCHOR, zfs_world.snaps[PARENT][-1])
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        make_rig(monkeypatch, cfg, sender).run()
         assert sender.attempts == [], 'fresh anchor, nothing waiting on it: not due'
 
-    def test_a_configured_pair_without_expanded_children_is_not_forced(self, zfs_world):
+    def test_a_configured_parent_of_a_configured_child_is_forced_too(self, zfs_world, monkeypatch):
+        """Changed by B: the schedule applies R-2 to EVERY child pair, so a configured parent with a
+        configured child waiting is negotiated once per incarnation like any other (before B only an
+        EXPANDED child waited, and this was never forced). The child, fresh by its own anchor, is not due."""
         add_tree(zfs_world, PARENT, A)
         zfs_world.set_prop(A, ANCHOR, zfs_world.snaps[A][-1])
+        zfs_world.set_prop(PARENT, ANCHOR, zfs_world.snaps[PARENT][-1])
         cfg = config(dataset(PARENT), dataset(A))
         sender = ScriptedSender(zfs_world)
-        zfs_world.set_prop(PARENT, ANCHOR, zfs_world.snaps[PARENT][-1])
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        make_rig(monkeypatch, cfg, sender).run()
+        assert sender.attempts == [(PARENT, DEST)]
+
+    def test_a_configured_pair_without_a_child_pair_is_not_forced(self, zfs_world, monkeypatch):
+        add_tree(zfs_world, PARENT, 'pool/other')
+        for name in (PARENT, 'pool/other'):
+            zfs_world.set_prop(name, ANCHOR, zfs_world.snaps[name][-1])
+        sender = ScriptedSender(zfs_world)
+        make_rig(monkeypatch, config(dataset(PARENT), dataset('pool/other')), sender).run()
         assert sender.attempts == []
 
     def test_an_anchor_naming_a_vanished_snapshot_or_unreadable_changes_nothing(self, rig):
         rig.world.set_prop(PARENT, ANCHOR, stamp(timedelta(minutes=5)))
         rig.world.unreadable.add((A, ANCHOR))
         rig.sender.outcomes[(PARENT, DEST)] = False
-        cycle(rig.worker, rig.manager)
+        rig.run()
         assert rig.sender.attempts == [(PARENT, DEST)]
 
-    def test_a_parent_with_no_snapshots_never_confirms_so_its_children_wait(self, zfs_world):
+    def test_a_parent_with_no_snapshots_never_confirms_so_its_children_wait(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, snaps=False)
         add_tree(zfs_world, A)
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
         sender.unconfirmed_success.add((PARENT, DEST))        # backup_dataset says True, nothing is confirmed
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        make_rig(monkeypatch, cfg, sender).run()
         assert sender.attempts == [(PARENT, DEST)]
 
     def test_a_parent_whose_send_raises_does_not_release_them(self, rig):
         rig.sender.raises.add((PARENT, DEST))
-        cycle(rig.worker, rig.manager)
+        rig.run()
         assert rig.sender.attempts == [(PARENT, DEST)]
-        assert status_record(rig.worker, PARENT, DEST).result == health.RESULT_ERROR
+        assert status_record(rig, PARENT, DEST).result == health.RESULT_ERROR
 
-    def test_without_a_status_directory_the_confirmation_is_the_evidence(self, zfs_world):
+    def test_without_a_status_directory_the_confirmation_is_the_evidence(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
-        worker = make_worker(cfg, sender)                                   # no status writer
+        rig = make_rig(monkeypatch, cfg, sender)                           # no status writer
         sender.outcomes[(PARENT, DEST)] = False
-        cycle(worker, DatasetManager(cfg))
+        rig.run()
         sender.outcomes[(PARENT, DEST)] = True
-        cycle(worker, DatasetManager(cfg))
+        rig.run()
         assert sender.attempts == [(PARENT, DEST), (PARENT, DEST), (A, DEST)]
 
-    # -- how the confirmation is asked --------------------------------------------------------------
+    # -- how the confirmation is learned ------------------------------------------------------------
 
     def test_the_sender_is_never_asked_whether_a_copy_is_confirmed(self, rig):
         """R-2 reads `COPY_CONFIRMED` from the memory (B1 fix 1c): a sender whose `copy_confirmed`
         raises changes nothing, and is not even called."""
         rig.sender.confirm_raises = True
-        cycle(rig.worker, rig.manager)
+        rig.run()
         assert rig.sender.confirm_calls == []
-        # The memory, not the sender, confirms: the parent's acknowledged send confirmed it, so the
-        # tree is sent in one cycle exactly as with a sender whose `copy_confirmed` does not raise
-        # (before B1 fix 1c a raising sender meant "not confirmed" and only the parent went).
-        assert rig.sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)]
+        assert rig.sender.attempts[0] == (PARENT, DEST) and len(rig.sender.attempts) == 3
 
     def test_only_the_memory_confirms_a_copy_a_senders_claim_does_not(self, rig, mocker):
         mocker.patch.object(rig.sender, 'copy_confirmed', return_value=True)       # the sender claims it
         rig.sender.unconfirmed_success.add((PARENT, DEST))                          # the memory has nothing
-        cycle(rig.worker, rig.manager)
+        rig.run()
         assert rig.sender.attempts == [(PARENT, DEST)]
 
-    def test_a_sender_that_was_not_built_means_not_confirmed(self, zfs_world):
+    def test_a_local_sender_that_was_not_imported_means_not_confirmed(self, zfs_world, monkeypatch, sdir):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, ['vault'], recursive=True), destinations={'vault': Destination(url='zfs:bk/vault')})
-        worker = make_worker(cfg, None, local=None)                         # `_local_manager` is None
-        worker._remote_manager = ScriptedSender(zfs_world)
-        manager = DatasetManager(cfg)
-        datasets = worker._get_datasets(manager)
-        child = next(d for d in datasets if d.name == A)
-        assert worker._ancestor_confirmed(manager, datasets[0], 'vault') is False
-        worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
-        assert worker._remote_manager.attempts == []
+        remote = ScriptedSender(zfs_world)
+        rig = make_rig(monkeypatch, cfg, remote, sdir)
+        worker = rig.worker
+        real = worker._before_loop
 
-    def test_the_confirmation_is_read_from_the_memory_per_destination_not_from_a_manager(self, zfs_world):
+        def before(config_, manager):
+            real(config_, manager)
+            worker._local_cls = None                                 # the local class was never imported
+
+        monkeypatch.setattr(worker, '_before_loop', before)
+        rig.run()
+        assert remote.attempts == []
+        record = status_record(rig, PARENT, 'vault')
+        assert record.result == health.RESULT_ERROR and 'not imported at start-up' in record.last_error
+        assert status_record(rig, A, 'vault') is None, 'the child never left R-2'
+
+    def test_the_confirmation_is_per_destination_and_each_kind_of_sender_confirms_its_own(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, ['off', 'vault'], recursive=True),
                      destinations={'off': Destination(url='https://h:8443'), 'vault': Destination(url='zfs:bk/vault')})
         remote, local = ScriptedSender(zfs_world), ScriptedSender(zfs_world)
-        worker = make_worker(cfg, remote, local=local)
-        cycle(worker, DatasetManager(cfg))
+        rig = make_rig(monkeypatch, cfg, remote, local=local).run()
         assert remote.confirm_calls == [] and local.confirm_calls == [], 'no manager is asked'
         assert (A, 'off') in remote.attempts and (A, 'vault') in local.attempts
-        assert worker._mem().noted(COPY_CONFIRMED, (PARENT, 'off'))
-        assert worker._mem().noted(COPY_CONFIRMED, (PARENT, 'vault'))
+        assert rig.memory.noted(COPY_CONFIRMED, (PARENT, 'off'))
+        assert rig.memory.noted(COPY_CONFIRMED, (PARENT, 'vault'))
 
-    def test_a_confirmation_at_one_destination_does_not_release_the_other(self, zfs_world):
+    def test_a_confirmation_at_one_destination_does_not_release_the_other(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
                      destinations={'off': Destination(url='https://h:8443'),
                                    'second': Destination(url='https://s:8443')})
         sender = ScriptedSender(zfs_world)
         sender.unconfirmed_success.add((PARENT, 'second'))
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        make_rig(monkeypatch, cfg, sender).run()
         assert (A, 'off') in sender.attempts and (A, 'second') not in sender.attempts
 
     # -- dry run -----------------------------------------------------------------------------------
 
-    def dry(self, world):
+    def dry(self, world, monkeypatch):
         add_tree(world, PARENT, A)
         cfg = config(rdataset(PARENT, recursive=True), dry_run=True)
         sender = ScriptedSender()                    # a dry run sends nothing and confirms nothing
         sender.unconfirmed_success.add((PARENT, DEST))
-        return cfg, sender, make_worker(cfg, sender)
+        return cfg, sender, make_rig(monkeypatch, cfg, sender)
 
-    def test_in_a_dry_run_the_parents_true_return_passes(self, zfs_world):
-        cfg, sender, worker = self.dry(zfs_world)
-        cycle(worker, DatasetManager(cfg))
+    def test_in_a_dry_run_the_parents_true_return_passes(self, zfs_world, monkeypatch):
+        cfg, sender, rig = self.dry(zfs_world, monkeypatch)
+        rig.run()
         assert sender.attempts == [(PARENT, DEST), (A, DEST)]
 
-    def test_in_a_dry_run_a_failed_parent_still_holds_its_children(self, zfs_world):
-        cfg, sender, worker = self.dry(zfs_world)
+    def test_in_a_dry_run_a_failed_parent_still_holds_its_children(self, zfs_world, monkeypatch):
+        cfg, sender, rig = self.dry(zfs_world, monkeypatch)
         sender.outcomes[(PARENT, DEST)] = False
-        cycle(worker, DatasetManager(cfg))
+        rig.run()
         assert sender.attempts == [(PARENT, DEST)]
 
-    def test_outside_a_dry_run_a_true_return_is_never_evidence(self, zfs_world):
-        cfg, sender, worker = self.dry(zfs_world)
-        cfg = dataclasses.replace(cfg, dry_run=False)
-        cycle(worker, DatasetManager(cfg))
+    def test_outside_a_dry_run_a_true_return_is_never_evidence(self, zfs_world, monkeypatch):
+        add_tree(zfs_world, PARENT, A)
+        cfg = config(rdataset(PARENT, recursive=True))
+        sender = ScriptedSender()
+        sender.unconfirmed_success.add((PARENT, DEST))
+        make_rig(monkeypatch, cfg, sender).run()
         assert sender.attempts == [(PARENT, DEST)]
 
     # -- a child with nothing to send, a child whose listing fails ---------------------------------------
 
-    def test_a_child_without_snapshots_is_not_held_negotiated_or_warned_about(self, zfs_world, sdir, caplog):
+    def test_a_held_child_without_snapshots_is_not_negotiated_warned_about_or_recorded(self, zfs_world, sdir, monkeypatch, caplog):
+        """Held by the schedule, so it never reaches its sender (before B the sender's R-2 answered "nothing
+        to send" and the pair was recorded as done): no `backup_dataset`, no WARNING, no record."""
         add_tree(zfs_world, PARENT)
         add_tree(zfs_world, A, snaps=False)
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
         sender.outcomes[(PARENT, DEST)] = False
-        worker = make_worker(cfg, sender, sdir)
+        rig = make_rig(monkeypatch, cfg, sender, sdir)
         with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            cycle(worker, DatasetManager(cfg))
-        assert sender.attempts == [(PARENT, DEST)], 'no backup_dataset (so no negotiate) for the child'
-        assert worker_warnings(caplog) == []
-        record = status_record(worker, A, DEST)
-        assert record is not None and record.result == health.RESULT_OK
+            rig.run()
+        assert sender.attempts == [(PARENT, DEST)]
+        assert worker_warnings(caplog) == [] and status_record(rig, A, DEST) is None
 
-    def test_a_child_whose_listing_fails_is_held_silently_and_not_recorded(self, zfs_world, sdir, caplog):
+    def test_a_child_whose_listing_fails_is_held_silently_and_not_recorded(self, zfs_world, sdir, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A)
         zfs_world.snapshot_list_failures.add(A)
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
         sender.outcomes[(PARENT, DEST)] = False
-        worker = make_worker(cfg, sender, sdir)
+        rig = make_rig(monkeypatch, cfg, sender, sdir)
         with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            cycle(worker, DatasetManager(cfg))
+            rig.run()
         assert sender.attempts == [(PARENT, DEST)]
-        assert worker_warnings(caplog) == [] and status_record(worker, A, DEST) is None
+        assert worker_warnings(caplog) == [] and status_record(rig, A, DEST) is None
 
-    def test_a_confirmed_parent_releases_a_child_without_snapshots_to_the_sender(self, zfs_world):
+    def test_a_confirmed_parent_releases_a_child_without_snapshots_to_the_sender(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT)
         add_tree(zfs_world, A, snaps=False)
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        make_rig(monkeypatch, cfg, sender).run()
         assert sender.attempts == [(PARENT, DEST), (A, DEST)]
 
     # -- per destination, local destinations, configured pairs -------------------------------------
 
-    def test_the_wait_is_per_destination(self, zfs_world):
+    def test_the_wait_is_per_destination(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
                      destinations={'off': Destination(url='https://h:8443'),
                                    'second': Destination(url='https://s:8443')})
         sender = ScriptedSender(zfs_world)
         sender.outcomes[(PARENT, 'second')] = False
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
-        assert sender.attempts == [(PARENT, 'off'), (PARENT, 'second'), (A, 'off')]
+        make_rig(monkeypatch, cfg, sender).run()
+        assert sorted(sender.attempts) == sorted([(PARENT, 'off'), (PARENT, 'second'), (A, 'off')])
 
-    def test_a_local_destination_waits_the_same_way(self, zfs_world, caplog):
+    def test_a_local_destination_waits_the_same_way(self, zfs_world, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A)
         cfg = config(rdataset(PARENT, ['vault'], recursive=True),
                      destinations={'vault': Destination(url='zfs:bk/vault')})
         local = ScriptedSender(zfs_world)
         local.outcomes[(PARENT, 'vault')] = False
-        worker = make_worker(cfg, None, local=local)
+        rig = make_rig(monkeypatch, cfg, None, local=local, notice=0.0)
         with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            cycle(worker, DatasetManager(cfg))
-        assert local.attempts == [(PARENT, 'vault')] and worker._remote_manager.attempts == []
+            rig.run()
+        assert local.attempts == [(PARENT, 'vault')] and rig.remote.attempts == []
         assert self.aggregated(caplog) == [(1, PARENT, 'vault')]
         local.outcomes[(PARENT, 'vault')] = True
-        cycle(worker, DatasetManager(cfg))
+        rig.run()
         assert local.attempts[-2:] == [(PARENT, 'vault'), (A, 'vault')]
 
-    def test_configured_child_pairs_are_not_held(self, zfs_world, caplog):
+    def test_configured_child_pairs_are_held_too(self, zfs_world, monkeypatch, caplog):
+        """Changed by B: the schedule holds EVERY child pair behind its unconfirmed ancestor (before B a
+        configured pair was never held)."""
         add_tree(zfs_world, PARENT, A, AB)
         cfg = config(rdataset(PARENT, recursive=True), dataset(A))      # `a` is configured, not expanded
         sender = ScriptedSender(zfs_world)
         sender.outcomes[(PARENT, DEST)] = False
+        make_rig(monkeypatch, cfg, sender).run()
+        assert sender.attempts == [(PARENT, DEST)]
+
+    def test_a_confirmed_parent_releases_a_configured_child_and_the_expanded_one_below_it(self, zfs_world, monkeypatch, caplog):
+        add_tree(zfs_world, PARENT, A, AB)
+        cfg = config(rdataset(PARENT, recursive=True), dataset(A))
+        sender = ScriptedSender(zfs_world)
         with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            cycle(make_worker(cfg, sender), DatasetManager(cfg))
-        assert (A, DEST) in sender.attempts, 'a configured pair keeps its pre-recursive behaviour'
-        assert (AB, DEST) in sender.attempts, 'the expanded pair below it waits for a (which confirmed)'
+            make_rig(monkeypatch, cfg, sender).run()
+        assert sender.attempts == [(PARENT, DEST), (A, DEST), (AB, DEST)]
+        assert sender.expanded[A] is None and sender.expanded[AB] == PARENT
         assert worker_warnings(caplog) == []
 
-    def test_an_expanded_pair_waits_for_the_nearest_ancestor_pair_even_if_configured(self, zfs_world, caplog):
+    def test_an_expanded_pair_waits_for_the_nearest_ancestor_pair_even_if_configured(self, zfs_world, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A, AB)
         cfg = config(rdataset(PARENT, recursive=True), dataset(A))
         sender = ScriptedSender(zfs_world)
         sender.outcomes[(A, DEST)] = False
         with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            cycle(make_worker(cfg, sender), DatasetManager(cfg))
+            make_rig(monkeypatch, cfg, sender, notice=0.0).run()
         assert sender.attempts == [(PARENT, DEST), (A, DEST)]
         assert self.aggregated(caplog) == [(1, A, DEST)]
 
-    def test_the_nearest_ancestor_is_the_nearest_with_a_pair_on_that_destination(self, zfs_world, caplog):
+    def test_the_nearest_ancestor_is_the_nearest_with_a_pair_on_that_destination(self, zfs_world, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A, AB)
         cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
                      rdataset(A, ['second']),                           # `a` sends to `second` only
@@ -2142,255 +2273,187 @@ class TestA2ParentFirst:
         sender = ScriptedSender(zfs_world)
         sender.outcomes[(A, 'second')] = False
         with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            cycle(make_worker(cfg, sender), DatasetManager(cfg))
+            make_rig(monkeypatch, cfg, sender, notice=0.0).run()
         assert (AB, 'off') in sender.attempts, 'on `off` the nearest ancestor pair is the parent (confirmed)'
         assert (AB, 'second') not in sender.attempts, 'on `second` it is `a`, which failed'
         assert self.aggregated(caplog) == [(1, A, 'second')]
 
-    # -- the fail-closed fallback -------------------------------------------------------------------
-
-    def fallback_rig(self, world, pairs):
-        add_tree(world, PARENT, A)
-        cfg = config(rdataset(PARENT, recursive=True))
-        manager = DatasetManager(cfg)
-        sender = ScriptedSender(world)
-        worker = make_worker(cfg, sender)
-        child = manager.expand_recursive().children[0]
-        worker._pairs = pairs(manager, child)
-        worker._dependents = {}
-        return manager, worker, sender, child
-
-    @staticmethod
-    def other_destination_parent(manager, child):
-        parent = manager.datasets[0]
-        return {PARENT: DatasetInfo(parent.dataset, dataclasses.replace(
-            parent.config, remote=[RemoteDatasetConfig(destination='other')]))}   # a pair, but not on DEST
-
-    def test_without_a_nearest_pair_it_falls_back_to_the_parent_it_was_expanded_from(self, zfs_world):
-        manager, worker, sender, child = self.fallback_rig(zfs_world, self.other_destination_parent)
-        assert worker._nearest_pair(child.name, DEST) is None
-        sender.confirmed.add((PARENT, DEST))
-        worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
-        assert sender.attempts == [(A, DEST)], 'the parent proved confirmed through the fallback'
-
-    def test_the_fallback_waits_without_confirmation(self, zfs_world, caplog):
-        manager, worker, sender, child = self.fallback_rig(zfs_world, self.other_destination_parent)
-        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
-        assert sender.attempts == []
-        assert self.aggregated(caplog) == [(1, PARENT, DEST)]
-
-    def test_with_no_parent_at_all_the_child_is_not_sent_and_one_warning_says_so(self, zfs_world, caplog):
-        manager, worker, sender, child = self.fallback_rig(zfs_world, lambda m, c: {})
-        sender.confirmed.add((PARENT, DEST))                                  # even a confirmed parent
-        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            worker._send_to_destination(manager, child, child.config.remote[0], logging.getLogger(WORKER_LOGGER))
-        assert sender.attempts == []
-        (warning,) = worker_warnings(caplog)
-        assert f'cannot find {PARENT}, which it was expanded from; not sent' in warning
-
-    def test_the_orphan_warning_is_once_per_cycle_in_the_serial_worker(self, zfs_world, caplog, mocker):
-        """The ORPHAN_HOLD latch is once per episode in the memory (a scheduler asks every minute);
-        the serial worker's episode is one cycle, so `_get_datasets` resets it: the "cannot find ...
-        expanded from" WARNING is logged once in every cycle, twice over two cycles."""
-        add_tree(zfs_world, PARENT, A)
-        cfg = config(rdataset(PARENT, recursive=True))
-        manager = DatasetManager(cfg)
-        sender = ScriptedSender(zfs_world)
-        worker = make_worker(cfg, sender)
-        # the configured parent is not among this cycle's pairs: the expanded child is an orphan
-        mocker.patch.object(BaseWorker, '_get_datasets', return_value=[])
-        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            for _ in range(2):
-                datasets = cycle(worker, manager)
-                assert [d.name for d in datasets] == [A] and PARENT not in worker._pairs
-        orphan = [w for w in worker_warnings(caplog)
-                  if f'cannot find {PARENT}, which it was expanded from; not sent' in w]
-        assert len(orphan) == 2, orphan
-        assert all(w.startswith(f'{A} -> {DEST}: ') for w in orphan)
-        assert sender.attempts == [], 'an orphan is never sent'
-
-    def test_within_one_cycle_the_orphan_warning_is_not_repeated(self, zfs_world, caplog, mocker):
-        """Contrast: without a new `_get_datasets` between them, the second ask is DEBUG only."""
-        add_tree(zfs_world, PARENT, A)
-        cfg = config(rdataset(PARENT, recursive=True))
-        manager = DatasetManager(cfg)
-        worker = make_worker(cfg, ScriptedSender(zfs_world))
-        mocker.patch.object(BaseWorker, '_get_datasets', return_value=[])
-        with caplog.at_level(logging.DEBUG, logger=WORKER_LOGGER):
-            datasets = worker._get_datasets(manager)
-            for _ in range(3):
-                worker._process_dataset(manager, datasets[0])
-        assert len([w for w in worker_warnings(caplog) if 'which it was expanded from' in w]) == 1
-
-    def test_a_configured_pair_is_never_held_whatever_the_lookup_says(self, zfs_world):
-        add_tree(zfs_world, PARENT, A)
-        cfg = config(rdataset(PARENT, recursive=True))
-        manager = DatasetManager(cfg)
-        sender = ScriptedSender(zfs_world)
-        worker = make_worker(cfg, sender)
-        worker._pairs = {}
-        assert manager.datasets[0].expanded_from is None
-        worker._send_to_destination(manager, manager.datasets[0], manager.datasets[0].config.remote[0],
-                                    logging.getLogger(WORKER_LOGGER))
-        assert sender.attempts == [(PARENT, DEST)]
+    # -- the fail-closed fallbacks of the senders' rule are `test_zfsbackup_sendpair.py::TestHold`: a
+    # -- discovery builds a child's pair from its parent's own `remote:` entries, so an expanded pair
+    # -- without its ancestor pair cannot arise from `expand_recursive`; the per-episode orphan latch is
+    # -- `test_zfsbackup_sendloop.py::TestRuleWiring`.
 
 
 @pytest.mark.unit
 class TestA2StatusKeys:
-    def test_keys_cover_every_pair_incl_expanded_children_per_destination(self, zfs_world):
+    """The status records the scheduler keeps: one per (dataset, destination) pair incl. the discovered
+    children; `retain` drops the records of pairs that are gone, except under a parent whose children are
+    UNKNOWN (never discovered in this incarnation, or its last discovery failed)."""
+
+    def test_the_schedule_covers_every_pair_incl_expanded_children_per_destination(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, A, AB)
         cfg = config(rdataset(PARENT, ['off', 'second'], recursive=True),
                      destinations={'off': Destination(url='https://h:8443'),
                                    'second': Destination(url='https://s:8443')})
-        worker = make_worker(cfg)
-        datasets = worker._get_datasets(DatasetManager(cfg))
-        assert worker._status_keys(datasets) == {
+        rig = make_rig(monkeypatch, cfg).run()
+        assert set(rig.loop.schedule.keys()) == {
             (d, dest) for d in (PARENT, A, AB) for dest in ('off', 'second')}
 
-    def seeded(self, zfs_world, sdir):
+    def seeded(self, zfs_world, sdir, monkeypatch):
         add_tree(zfs_world, PARENT, A, AB, 'pool/data2', 'pool/data2/x')
         cfg = config(rdataset(PARENT, recursive=True))
-        worker = make_worker(cfg, ScriptedSender(zfs_world), sdir)
-        manager = DatasetManager(cfg)
-        cycle(worker, manager)
-        worker._status.record(health.KIND_SEND, 'pool/data2/x', DEST, ok=True)     # a lookalike prefix
-        worker._status.record(health.KIND_PRUNE, AB, ok=True)                        # not a send record
-        return cfg, worker, manager
+        rig = make_rig(monkeypatch, cfg, ScriptedSender(zfs_world), sdir).run()
+        rig.worker._status.record(health.KIND_SEND, 'pool/data2/x', DEST, ok=True)     # a lookalike prefix
+        rig.worker._status.record(health.KIND_PRUNE, AB, ok=True)                        # not a send record
+        rig.worker._flush_status(force=True)
+        return cfg
 
-    def held(self, worker):
-        return {r.key for r in worker._status.records}
+    def again(self, monkeypatch, cfg, sdir, zfs_world):
+        return make_rig(monkeypatch, cfg, ScriptedSender(zfs_world), sdir).run()
 
-    def test_records_of_a_failing_parents_children_survive_the_retain(self, zfs_world, sdir):
-        cfg, worker, manager = self.seeded(zfs_world, sdir)
+    @staticmethod
+    def held(rig):
+        return {r.key for r in rig.worker._status.records}
+
+    def test_records_of_a_failing_parents_children_survive_the_retain(self, zfs_world, sdir, monkeypatch):
+        cfg = self.seeded(zfs_world, sdir, monkeypatch)
         zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
-        datasets = cycle(worker, manager)
-        assert [d.name for d in datasets] == [PARENT]
-        held = self.held(worker)
-        assert {(health.KIND_SEND, A, DEST), (health.KIND_SEND, AB, DEST)} <= held
+        rig = self.again(monkeypatch, cfg, sdir, zfs_world)
+        assert sorted(k.dataset for k in rig.loop.schedule.keys()) == [PARENT]
+        held = self.held(rig)
+        assert {(health.KIND_SEND, A, DEST), (health.KIND_SEND, AB, DEST)} <= held, 'unknown, not gone'
         assert (health.KIND_SEND, 'pool/data2/x', DEST) not in held, 'the sibling with a common prefix goes'
         assert (health.KIND_PRUNE, AB, None) not in held, 'only send records are kept'
 
-    def test_the_keys_of_a_failing_parent_name_its_children(self, zfs_world, sdir):
-        cfg, worker, manager = self.seeded(zfs_world, sdir)
-        zfs_world.list_failures[PARENT] = 'boom'
-        datasets = worker._get_datasets(manager)
-        assert worker._status_keys(datasets) == {(PARENT, DEST), (A, DEST), (AB, DEST)}
-
-    def test_a_vanished_childs_record_goes_when_discovery_works(self, zfs_world, sdir):
-        cfg, worker, manager = self.seeded(zfs_world, sdir)
+    def test_a_vanished_childs_record_goes_when_discovery_works(self, zfs_world, sdir, monkeypatch):
+        cfg = self.seeded(zfs_world, sdir, monkeypatch)
         del zfs_world.datasets[AB]
-        cycle(worker, manager)
-        held = self.held(worker)
+        held = self.held(self.again(monkeypatch, cfg, sdir, zfs_world))
         assert (health.KIND_SEND, AB, DEST) not in held and (health.KIND_SEND, A, DEST) in held
 
-    def test_records_are_dropped_once_discovery_recovers_and_the_child_is_gone(self, zfs_world, sdir):
-        cfg, worker, manager = self.seeded(zfs_world, sdir)
+    def test_records_are_dropped_once_discovery_recovers_and_the_child_is_gone(self, zfs_world, sdir, monkeypatch):
+        cfg = self.seeded(zfs_world, sdir, monkeypatch)
         zfs_world.list_failures[PARENT] = 'boom'
-        cycle(worker, manager)
-        assert (health.KIND_SEND, AB, DEST) in self.held(worker)
+        assert (health.KIND_SEND, AB, DEST) in self.held(self.again(monkeypatch, cfg, sdir, zfs_world))
         del zfs_world.list_failures[PARENT]
         del zfs_world.datasets[AB]
-        cycle(worker, manager)
-        assert (health.KIND_SEND, AB, DEST) not in self.held(worker)
+        assert (health.KIND_SEND, AB, DEST) not in self.held(self.again(monkeypatch, cfg, sdir, zfs_world))
 
-    def test_a_renamed_childs_old_record_goes_and_the_new_one_starts_empty(self, zfs_world, sdir):
-        cfg, worker, manager = self.seeded(zfs_world, sdir)
+    def test_a_renamed_childs_old_record_goes_and_the_new_one_starts(self, zfs_world, sdir, monkeypatch):
+        cfg = self.seeded(zfs_world, sdir, monkeypatch)
         zfs_world.datasets[f'{PARENT}/a2'] = zfs_world.datasets.pop(AB)
         zfs_world.snaps[f'{PARENT}/a2'] = zfs_world.snaps.pop(AB)
-        cycle(worker, manager)
-        held = self.held(worker)
+        held = self.held(self.again(monkeypatch, cfg, sdir, zfs_world))
         assert (health.KIND_SEND, AB, DEST) not in held
         assert (health.KIND_SEND, f'{PARENT}/a2', DEST) in held        # the new name was attempted
 
-    def test_a_renamed_child_with_a_stale_anchor_is_due_under_its_new_name(self, zfs_world):
+    def test_a_renamed_child_with_a_stale_anchor_is_due_under_its_new_name(self, zfs_world, monkeypatch):
         old = stamp(timedelta(hours=3))
         zfs_world.add(PARENT, snaps=[stamp(timedelta(minutes=10))])
         zfs_world.add(f'{PARENT}/a2', snaps=[old])
         zfs_world.set_prop(f'{PARENT}/a2', ANCHOR, old)              # travelled with the rename
         sender = ScriptedSender(zfs_world)
-        cfg = config(rdataset(PARENT, recursive=True))
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        make_rig(monkeypatch, config(rdataset(PARENT, recursive=True)), sender).run()
         assert (f'{PARENT}/a2', DEST) in sender.attempts
 
-    def test_a_child_with_no_snapshots_is_attempted_and_the_sender_decides(self, zfs_world):
+    def test_a_child_with_no_snapshots_is_attempted_and_the_sender_decides(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT)
         add_tree(zfs_world, f'{PARENT}/new', snaps=False)
         sender = ScriptedSender(zfs_world)
-        cfg = config(rdataset(PARENT, recursive=True))
-        cycle(make_worker(cfg, sender), DatasetManager(cfg))
+        make_rig(monkeypatch, config(rdataset(PARENT, recursive=True)), sender).run()
         assert (f'{PARENT}/new', DEST) in sender.attempts
 
-    def test_the_over_cap_warning_is_given_once_per_episode(self, mocker, caplog):
-        mocker.patch.object(health, 'STATUS_MAX_RECORDS', 3)
+    def test_the_over_cap_warning_is_given_once_per_episode(self, monkeypatch, caplog, sdir):
+        monkeypatch.setattr(health, 'STATUS_MAX_RECORDS', 3)
         cfg = config(*[dataset(f'pool/d{i}') for i in range(4)])
-        worker = make_worker(cfg)
-        datasets = DatasetManager(cfg).datasets
+        rig = make_rig(monkeypatch, cfg, None, sdir)
         with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            for _ in range(3):
-                assert len(worker._status_keys(datasets)) == 4
+            rig.run()
+            loop = rig.loop
+            loop.leave.clear()                       # `run()` set it on the way out: `retain` is skipped while leaving
+            loop._retain_status()
+            loop._retain_status()
         (warning,) = worker_warnings(caplog)
         assert '4 dataset x destination pairs' in warning and 'more than the 3' in warning
-        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            assert len(worker._status_keys(datasets[:3])) == 3        # at the cap: fine, episode over
-            assert len(worker_warnings(caplog)) == 1
-            worker._status_keys(datasets)
-        assert len(worker_warnings(caplog)) == 2
 
-    def test_expanded_children_count_towards_the_cap(self, zfs_world, mocker, caplog):
-        mocker.patch.object(health, 'STATUS_MAX_RECORDS', 3)
-        add_tree(zfs_world, PARENT, A, f'{PARENT}/b', f'{PARENT}/c')
-        cfg = config(rdataset(PARENT, recursive=True))
-        worker = make_worker(cfg)
-        datasets = worker._get_datasets(DatasetManager(cfg))
+    def test_the_over_cap_episode_ends_when_the_count_falls_back_and_can_start_again(self, monkeypatch, caplog, sdir):
+        monkeypatch.setattr(health, 'STATUS_MAX_RECORDS', 3)
+        cfg = config(*[dataset(f'pool/d{i}') for i in range(4)])
+        rig = make_rig(monkeypatch, cfg, None, sdir).run()
+        loop = rig.loop
+        loop.leave.clear()
+        full = dict(loop._pairs)
+        caplog.clear()
         with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            assert len(worker._status_keys(datasets)) == 4
+            loop._pairs = dict(list(full.items())[:3])                 # at the cap: fine, episode over
+            loop._retain_status()
+            assert worker_warnings(caplog) == []
+            loop._pairs = full
+            loop._retain_status()
         assert len(worker_warnings(caplog)) == 1
 
-    def test_the_default_cap_is_not_reached_by_a_small_tree(self, zfs_world, caplog):
+    def test_nothing_is_dropped_while_the_worker_is_leaving(self, monkeypatch, sdir):
+        """A list cut short by a stop or reload is not the truth about what is configured."""
+        cfg = config(dataset('pool/d0'))
+        rig = make_rig(monkeypatch, cfg, None, sdir).run()
+        rig.worker._status.record(health.KIND_SEND, 'pool/gone', DEST, ok=True)
+        assert rig.loop.leave.is_set()
+        rig.loop._retain_status()
+        assert (health.KIND_SEND, 'pool/gone', DEST) in {r.key for r in rig.worker._status.records}
+
+    def test_expanded_children_count_towards_the_cap(self, zfs_world, monkeypatch, caplog, sdir):
+        monkeypatch.setattr(health, 'STATUS_MAX_RECORDS', 3)
+        add_tree(zfs_world, PARENT, A, f'{PARENT}/b', f'{PARENT}/c')
+        cfg = config(rdataset(PARENT, recursive=True))
+        with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
+            make_rig(monkeypatch, cfg, ScriptedSender(zfs_world), sdir).run()
+        assert len(worker_warnings(caplog)) == 1
+
+    def test_the_default_cap_is_not_reached_by_a_small_tree(self, zfs_world, monkeypatch, caplog, sdir):
         add_tree(zfs_world, PARENT, A, AB)
         cfg = config(rdataset(PARENT, recursive=True))
-        worker = make_worker(cfg)
         with caplog.at_level(logging.WARNING, logger=WORKER_LOGGER):
-            worker._status_keys(worker._get_datasets(DatasetManager(cfg)))
+            make_rig(monkeypatch, cfg, ScriptedSender(zfs_world), sdir).run()
         assert worker_warnings(caplog) == []
 
 
 @pytest.mark.unit
 class TestA2ExpansionCrash:
-    """`expand_recursive` is documented never to raise; if it does, the children missing from the
-    list are unknown, not gone: `_status_keys` returns None (the loop then retains nothing)."""
+    """`expand_recursive` is documented never to raise; if it does, on the parent's discovery thread, the
+    children missing from the schedule are unknown, not gone: their records are kept (a crash is a failed
+    discovery of that parent only)."""
 
-    def test_a_crash_keeps_every_record_that_cycle_and_recovers_the_next(self, zfs_world, sdir, mocker, caplog):
+    def test_a_crash_keeps_the_childrens_records_and_recovers_the_next_run(self, zfs_world, sdir, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A, AB)
         cfg = config(rdataset(PARENT, recursive=True))
-        manager = DatasetManager(cfg)
-        sender = ScriptedSender(zfs_world)
-        worker = make_worker(cfg, sender, sdir)
-        cycle(worker, manager)
-        assert {r.dataset for r in worker._status.records} == {PARENT, A, AB}
-        worker._status.record(health.KIND_SEND, 'pool/gone', DEST, ok=True)       # dropped when retain runs
-        real = manager.expand_recursive
-        mocker.patch.object(manager, 'expand_recursive', side_effect=RuntimeError('boom'))
-        with caplog.at_level(logging.ERROR, logger=WORKER_LOGGER):
-            datasets = worker._get_datasets(manager)
-        assert [d.name for d in datasets] == [PARENT]
-        assert worker._expansion_crashed is True and worker._status_keys(datasets) is None
-        assert any('could not expand' in r.getMessage() for r in caplog.records)
-        cycle(worker, manager)                                       # a whole cycle through the loop's rule
-        assert {r.dataset for r in worker._status.records} == {PARENT, A, AB, 'pool/gone'}
-        manager.expand_recursive.side_effect = real
-        cycle(worker, manager)
-        assert worker._expansion_crashed is False
-        assert {r.dataset for r in worker._status.records} == {PARENT, A, AB}
+        rig = make_rig(monkeypatch, cfg, ScriptedSender(zfs_world), sdir).run()
+        assert {r.dataset for r in rig.worker._status.records} == {PARENT, A, AB}
+        rig.worker._status.record(health.KIND_SEND, 'pool/gone', DEST, ok=True)
+        rig.worker._flush_status(force=True)
+        real = DatasetManager.expand_recursive
 
-    def test_a_failed_discovery_is_not_a_crash(self, zfs_world):
+        def boom(self_, *a, **k):
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(DatasetManager, 'expand_recursive', boom)
+        with caplog.at_level(logging.ERROR, logger=WORKER_LOGGER):
+            rig2 = make_rig(monkeypatch, cfg, ScriptedSender(zfs_world), sdir).run()
+        assert any('could not expand' in r.getMessage() for r in caplog.records)
+        # the parent's children are UNKNOWN (kept); a record that belongs to no parent is gone (the
+        # serial worker kept it for that cycle: it dropped nothing at all after a crash)
+        assert {r.dataset for r in rig2.worker._status.records} == {PARENT, A, AB}
+        monkeypatch.setattr(DatasetManager, 'expand_recursive', real)
+        rig3 = make_rig(monkeypatch, cfg, ScriptedSender(zfs_world), sdir).run()
+        assert {r.dataset for r in rig3.worker._status.records} == {PARENT, A, AB}
+
+    def test_a_failed_discovery_is_not_a_crash(self, zfs_world, monkeypatch, caplog):
         add_tree(zfs_world, PARENT, A)
         zfs_world.list_failures[PARENT] = 'boom'
         cfg = config(rdataset(PARENT, recursive=True))
-        worker = make_worker(cfg)
-        datasets = worker._get_datasets(DatasetManager(cfg))
-        assert worker._expansion_crashed is False and worker._status_keys(datasets) == {(PARENT, DEST)}
+        with caplog.at_level(logging.ERROR, logger=WORKER_LOGGER):
+            rig = make_rig(monkeypatch, cfg).run()
+        assert not any('could not expand' in r.getMessage() for r in caplog.records)
+        assert list(rig.loop.schedule.keys()) == [(PARENT, DEST)]
 
 
 @pytest.mark.unit
@@ -2441,19 +2504,22 @@ class TestA2FailedListingIsAFailure:
         assert sender.backup_dataset(dsi, dsi.config.remote[0]) is True
         assert sender.last_problem(PARENT, DEST) is None
 
-    def test_the_worker_records_it_as_a_failure_and_the_count_rises(self, zfs_world, sdir):
+    def test_the_worker_records_it_as_a_failure_and_the_count_rises(self, zfs_world, sdir, monkeypatch):
         cfg, manager, sender, dsi = self.rig(zfs_world)
-        worker = make_worker(cfg, sender, sdir)
         zfs_world.snapshot_list_failures.add(PARENT)
-        for expected in (1, 2, 3):
-            cycle(worker, manager)
-            record = status_record(worker, PARENT, DEST)
+        rig = make_rig(monkeypatch, cfg, sender, sdir).run()
+        for expected in (1, 2, 3):                        # one failure per incarnation, each due again (aged)
+            record = status_record(rig, PARENT, DEST)
             assert record.result == health.RESULT_ERROR and record.consecutive_failures == expected
-            assert record.last_error.startswith('cannot list snapshots: ')
+            age_status(rig.worker)
+            if expected < 3:
+                rig = make_rig(monkeypatch, cfg, self.Ready(cfg, manager, client_id='client1'), sdir).run()
+        assert record.last_error.startswith('cannot list snapshots: ')
         zfs_world.snapshot_list_failures.clear()
         zfs_world.snaps[PARENT] = []                      # listing works again and finds nothing to send
-        cycle(worker, manager)
-        assert status_record(worker, PARENT, DEST).consecutive_failures == 0
+        age_status(rig.worker)
+        rig = make_rig(monkeypatch, cfg, self.Ready(cfg, manager, client_id='client1'), sdir).run()
+        assert status_record(rig, PARENT, DEST).consecutive_failures == 0
 
 
 @pytest.mark.unit
@@ -2559,26 +2625,15 @@ class TestCopyConfirmedInTheChain:
 
 @pytest.mark.unit
 class TestBareWorkerHelper:
-    """`tests/_remote_worker_support.py` sets exactly what `RemoteBackupWorker.__init__` sets for A2."""
+    """`tests/_remote_worker_support.py`: a worker without `__init__`. The pair state of the serial loop is
+    gone (the scheduler owns it); what remains is the memory, made on first use."""
 
-    def test_it_matches_init(self):
-        from _remote_worker_support import REMOTE_RECURSIVE_STATE, bare_remote_worker
-        real = RemoteBackupWorker(config(dataset(PARENT)), StopFlag())
-        bare = bare_remote_worker()
-        for name in REMOTE_RECURSIVE_STATE:
-            assert type(getattr(bare, name)) is type(getattr(real, name)), name
-            assert getattr(bare, name) == getattr(real, name), name
-        new_in_init = {n for n in vars(real) if n.startswith('_') and n not in vars(RemoteBackupWorker.__new__(RemoteBackupWorker))}
-        recursive_in_init = new_in_init & {'_pairs', '_dependents', '_waiting_noted', '_dry_run_sent',
-                                           '_expansion_failed', '_expansion_crashed', '_pairs_over_cap_noted'}
-        assert recursive_in_init == set(REMOTE_RECURSIVE_STATE), 'the helper misses (or invents) state'
-
-    def test_the_state_is_per_instance(self):
+    def test_it_has_no_pair_state_left(self):
         from _remote_worker_support import bare_remote_worker
-        a, b = bare_remote_worker(), bare_remote_worker()
-        a._waiting_noted.add(('x', 'y'))
-        a._pairs['p'] = object()
-        assert b._waiting_noted == set() and b._pairs == {}
+        bare = bare_remote_worker()
+        real = RemoteBackupWorker(config(dataset(PARENT)), StopFlag())
+        for name in ('_pairs', '_dependents', '_expansion_failed', '_expansion_crashed', '_pairs_over_cap_noted'):
+            assert not hasattr(bare, name) and not hasattr(real, name), name
 
     def test_the_waiting_and_dry_run_names_are_the_memorys_latches(self):
         """B1 fix 13: read-only views over the worker's `SendMemory`, made on first use (`_mem()`)."""

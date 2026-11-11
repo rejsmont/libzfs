@@ -28,6 +28,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import _reload_workers
+from _sendloop_support import LoopRig, bound, wait_for
 from _reload_workers import (
     FdProbeWorker, GatedSnapshotWorker, SlowEnumerationPruningWorker, descriptors_on,
 )
@@ -588,90 +589,106 @@ class TestRunLeaving:
         assert info.value.code == 3
 
 
-class TestRemoteWorkerBetweenDestinations:
-    @pytest.fixture
-    def remote(self, mocker):
+class TestRemoteWorkerLeavesAtSafePoints:
+    """The remote worker's scheduler leaves for a stop or a reload at its next tick: it starts no new
+    sender, every running sender is told to stop (`should_stop`, at its next chain step), the loop joins
+    them all and the worker exits 3 (reload) or returns (stop). With the caps at one sender, "the second
+    destination" is a pair that never starts; with the defaults the two destinations of a dataset run at
+    once and are both told to stop."""
+
+    @staticmethod
+    def rig(monkeypatch, caps=None, destinations=("one", "two")):
         stop, rel = StopFlag(), ReloadEpoch()
         config = BackupConfig(
-            datasets=[
-                DatasetConfig(
-                    name="pool/data",
-                    remote=[RemoteDatasetConfig(destination="one"), RemoteDatasetConfig(destination="two")],
-                )
-            ],
-            destinations={"one": Destination(url="https://one"), "two": Destination(url="https://two")},
+            datasets=[DatasetConfig(
+                name="pool/data", remote=[RemoteDatasetConfig(destination=d) for d in destinations],
+            )],
+            destinations={d: Destination(url=f"https://{d}") for d in destinations},
         )
-        worker = RemoteBackupWorker(config, stop, reload_epoch=rel, born_epoch=0)
-        rbm = MagicMock()
-        worker._remote_manager = rbm
-        manager = DatasetManager(config)
-        mocker.patch.object(DatasetManager, "get_own_anchor", return_value=None)
-        return worker, rbm, manager, manager.datasets[0], stop, rel
+        return LoopRig(config, monkeypatch, stop=stop, epoch=rel, born_epoch=0, caps=caps), stop, rel
 
     @staticmethod
-    def destinations(rbm):
-        return [c.args[1].destination for c in rbm.backup_dataset.call_args_list]
+    def destinations(rig):
+        return sorted(d for _, d in rig.sent())
 
     @staticmethod
-    def raising(action, seen):
-        """A `backup_dataset` stub that performs `action()` (the stop or the
-        reload arriving mid-transfer) and records what the `should_stop`
-        keyword the worker passed answers right afterwards."""
+    def raising(action, seen, wait):
+        """A `backup_dataset` stub that performs `action()` (the stop or the reload arriving
+        mid-transfer), waits until the sender is told to stop (`wait`) and records what the
+        `should_stop` keyword answers then."""
 
         def backup_dataset(dsi, remote_cfg, should_stop=None):
             action()
-            seen.append(should_stop() if should_stop is not None else "not passed")
+            seen.append(wait(should_stop) if should_stop is not None else "not passed")
+            return True
 
         return backup_dataset
 
-    def test_both_destinations_run_when_nothing_changes(self, remote):
-        worker, rbm, manager, dsi, _, _ = remote
-        worker._process_dataset(manager, dsi)
-        assert self.destinations(rbm) == ["one", "two"]
-        for call in rbm.backup_dataset.call_args_list:     # C3: always handed over
-            assert set(call.kwargs) == {"should_stop"}
-            assert call.kwargs["should_stop"]() is False
-
-    def test_a_reload_during_the_first_destination_skips_the_second(self, remote):
-        worker, rbm, manager, dsi, _, rel = remote
+    def test_both_destinations_run_when_nothing_changes(self, monkeypatch):
+        rig, _, _ = self.rig(monkeypatch)
         seen = []
-        rbm.backup_dataset.side_effect = self.raising(lambda: rel.set(1), seen)
-        worker._process_dataset(manager, dsi)
-        assert self.destinations(rbm) == ["one"]
+        rig.remote.backup_dataset.side_effect = (
+            lambda dsi, cfg, should_stop=None: seen.append(should_stop()) or True
+        )
+        rig.run()
+        assert self.destinations(rig) == ["one", "two"]
+        assert seen == [False, False]
+        for call in rig.remote.backup_dataset.call_args_list:     # C3: always handed over
+            assert set(call.kwargs) == {"should_stop"}
+
+    def test_a_reload_during_the_first_destination_starts_no_second_one(self, monkeypatch):
+        rig, _, rel = self.rig(monkeypatch, caps=(1, 1))
+        seen = []
+        rig.remote.backup_dataset.side_effect = self.raising(lambda: rel.set(1), seen, wait_for)
+        with pytest.raises(SystemExit) as info:
+            rig.run()
+        assert info.value.code == WORKER_EXIT_RELOAD
+        assert self.destinations(rig) == ["one"]
         assert seen == [True]                    # the callable reflects the reload
 
-    def test_there_is_no_check_before_the_first_destination(self, remote):
-        worker, rbm, manager, dsi, _, rel = remote
+    def test_a_reload_with_two_senders_running_tells_both_and_joins_both(self, monkeypatch):
+        rig, _, rel = self.rig(monkeypatch)
+        arrived = threading.Barrier(2, timeout=bound())
+        seen = []
+
+        def backup(dsi, cfg, should_stop=None):
+            arrived.wait()                               # both senders are in flight
+            if cfg.destination == "one":
+                rel.set(1)
+            seen.append((cfg.destination, wait_for(should_stop)))
+            return True
+
+        rig.remote.backup_dataset.side_effect = backup
+        rig.on_exit_release(arrived.abort)
+        with pytest.raises(SystemExit) as info:
+            rig.run()
+        assert info.value.code == WORKER_EXIT_RELOAD
+        assert sorted(seen) == [("one", True), ("two", True)]
+        assert rig.loop.sender_threads == {}, "the loop returned only after every sender ended"
+
+    def test_a_reload_already_pending_at_the_start_sends_nothing_and_exits_3(self, monkeypatch):
+        rig, _, rel = self.rig(monkeypatch)
         rel.set(1)                    # the reason to leave is already known
-        worker._process_dataset(manager, dsi)
-        assert self.destinations(rbm) == ["one"]
+        with pytest.raises(SystemExit) as info:
+            rig.run()
+        assert info.value.code == WORKER_EXIT_RELOAD
+        rig.remote.backup_dataset.assert_not_called()
 
-    def test_a_stop_also_skips_the_second_destination(self, remote):
-        worker, rbm, manager, dsi, stop, _ = remote
+    def test_a_stop_during_the_first_destination_starts_no_second_one(self, monkeypatch):
+        rig, stop, _ = self.rig(monkeypatch, caps=(1, 1))
         seen = []
-        rbm.backup_dataset.side_effect = self.raising(stop.set, seen)
-        worker._process_dataset(manager, dsi)
-        assert self.destinations(rbm) == ["one"]
-        assert seen == [True]                    # ...and the stop
+        rig.remote.backup_dataset.side_effect = self.raising(stop.set, seen, lambda should_stop: should_stop())
+        rig.run()
+        assert self.destinations(rig) == ["one"]
+        assert seen == [True]                    # ...and the stop is seen at once, through the flag
 
-    def test_the_run_exits_3_without_starting_the_second_destination(self, remote, mocker):
-        worker, rbm, manager, dsi, stop, rel = remote
-        seen = []
-        rbm.backup_dataset.side_effect = self.raising(lambda: rel.set(1), seen)
-        mocker.patch("zfsbackup.remote.RemoteBackupManager", return_value=rbm)
-        mocker.patch.object(worker, "_get_interval", return_value=30)
-        with watchdog(stop), pytest.raises(SystemExit) as info:
-            worker.run()
-        assert info.value.code == 3
-        assert self.destinations(rbm) == ["one"]
-        assert seen == [True]
-
-    def test_a_single_destination_dataset_is_unaffected(self, remote):
-        worker, rbm, manager, dsi, _, rel = remote
-        dsi.config.remote = dsi.config.remote[:1]
-        rel.set(1)
-        worker._process_dataset(manager, dsi)
-        assert self.destinations(rbm) == ["one"]
+    def test_a_single_destination_dataset_with_a_reload_during_the_send_exits_3_after_it(self, monkeypatch):
+        rig, _, rel = self.rig(monkeypatch, destinations=("one",))
+        rig.remote.backup_dataset.side_effect = self.raising(lambda: rel.set(1), [], wait_for)
+        with pytest.raises(SystemExit) as info:
+            rig.run()
+        assert info.value.code == WORKER_EXIT_RELOAD
+        assert self.destinations(rig) == ["one"]
 
 
 # ---------------------------------------------------------------------------

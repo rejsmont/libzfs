@@ -1459,6 +1459,36 @@ class TestUnconfirmedAndRearm:
         assert s.due_time(('p', 'A'), T0 + 100) == retry_at
         assert s.due(retry_at) == [key('p')]
 
+    # -- the first child appears while the parent is in a retry backoff (R 2) ---------------------
+
+    @pytest.mark.parametrize('kind, retryable, delay', [
+        ('failed', False, FAILURE_RETRY_CAP), ('failed', True, 60.0), ('retryable', False, 60.0),
+    ])
+    def test_a_confirmation_armed_by_a_new_child_waits_for_the_pending_retry(self, kind, retryable, delay):
+        """A parent sent (and failed) before its discovery returned: its first child appears while the retry
+        is pending. The once-per-incarnation confirmation must not be due `now` (a second send within seconds,
+        recorded as a second failure), the retry's backoff governs."""
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH)], now=T0)
+        cycle(s, ('p', 'A'), T0 + 10, kind, retryable=retryable)
+        retry_at = T0 + 10 + delay
+        assert s.due_time(('p', 'A'), T0 + 20) == retry_at
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0 + 20)
+        assert s.wants_confirmation(('p', 'A')) is True
+        assert s.due(T0 + 20) == [] and s.due(retry_at - 1) == []
+        assert s.dispatch(now=retry_at - 1) == []
+        assert s.due_time(('p', 'A'), T0 + 20) == retry_at
+        assert s.due(retry_at) == [key('p')]
+        assert s.held_by(('p/c', 'A')) == key('p'), 'the child waits for the parent all the same'
+
+    def test_a_confirmation_armed_by_a_new_child_is_due_at_once_without_a_pending_retry(self):
+        """The `max(now, retry_at)` only ever delays: with no retry pending, due `now` as before."""
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH)], now=T0)
+        cycle(s, ('p', 'A'), T0 + 10, 'not_due')
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0 + 20)
+        assert s.due(T0 + 20 + GAP) == [key('p')]
+
     def test_unconfirmed_without_children_arms_nothing(self):
         s = make()
         s.update_pairs([sp('a', last=FRESH)], now=T0)
@@ -1718,6 +1748,32 @@ class TestUnconfirmedAndRearm:
         s.update_pairs([sp('p/c', last=FRESH, order=1)], now=now)
         assert key('p/c') in s.due(now)
         assert s.due_time(('p/c', 'A'), now) <= now
+
+
+class TestConfirmationArmedWhileTheParentRuns:
+    """The ordering `_link` cannot see: the parent's send is RUNNING when its discovery returns (the children
+    appear, `confirm_at = now` is armed), then the parent fails. The failure's own backoff must govern: before
+    the fix the armed confirmation made the parent due again at once and the failure was recorded twice.
+    The same ordering end to end, over a real `SendLoop`:
+    `test_zfsbackup_sendloop.py::TestDiscovery::test_a_parent_whose_discovery_returned_while_it_ran_is_not_sent_again_at_once`."""
+
+    @pytest.mark.parametrize('outcome, retryable, delay', [
+        (Outcome.FAILED, False, FAILURE_RETRY_CAP),
+        (Outcome.FAILED, True, RETRY_DELAYS[0]),
+        (Outcome.RETRYABLE, False, RETRY_DELAYS[0]),
+    ], ids=['failed', 'failed-retryable', 'retryable'])
+    def test_a_failure_after_the_children_appeared_waits_for_its_own_retry(self, outcome, retryable, delay):
+        s = make()
+        s.update_pairs([sp('p', F=D, last=FRESH)], now=T0)
+        s.started(('p', 'A'), now=T0 + 10)
+        # the discovery returns while the parent's send is still running
+        s.update_pairs([sp('p', F=D, last=FRESH), sp('p/c', F=D, last=FRESH, order=1)], now=T0 + 15)
+        s.finished(('p', 'A'), outcome, retryable=retryable, now=T0 + 40)
+        retry = T0 + 40 + delay
+        assert s.due_time(('p', 'A'), T0 + 41) == retry
+        assert s.due(T0 + 41) == []
+        assert s.due(retry - 1) == []
+        assert key('p') in s.due(retry)
 
 
 class TestConfirmationRunThatFoundNothing:

@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import pickle
 import signal
+import threading
 import pytest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from unittest.mock import MagicMock
 
 import zfsbackup.workers as workers_module
 from _config_handoff import config_signature, literals_in
-from _remote_worker_support import bare_remote_worker, configured_dsi
+from _sendloop_support import LoopRig, seed_status, wait_for
 from zfsbackup.config import BackupConfig, DatasetConfig, Destination, Duration, RemoteDatasetConfig
 from zfsbackup.config.store import dispose_all
 from zfsbackup.runtime_config import load_runtime_config
@@ -437,183 +438,166 @@ class TestPruningWorker:
         worker.run()
 
 
+def remote_config(*destinations, local=(), names=('pool/data',), frequency=timedelta(hours=1),
+                  remote_frequency=None, **kw):
+    """A config whose datasets `names` send to every one of `destinations` (those in `local` are
+    `zfs:` ones)."""
+    urls = {d: Destination(url='zfs:bk' if d in local else 'https://h.example:8443') for d in destinations}
+    return BackupConfig(
+        datasets=[
+            DatasetConfig(
+                name=n, frequency=frequency,
+                remote=[RemoteDatasetConfig(destination=d, frequency=remote_frequency) for d in destinations],
+            )
+            for n in names
+        ],
+        destinations=urls, **kw,
+    )
+
+
 class TestRemoteBackupWorker:
+    """The remote worker's main thread is a scheduler (`sendloop.SendLoop`); `LoopRig` runs the real
+    `RemoteBackupWorker.run()` over fake transports (`tests/_sendloop_support.py`)."""
+
     def test_name_and_daemon(self, worker_config):
         stop_event = multiprocessing.Event()
         worker = RemoteBackupWorker(worker_config, stop_event)
         assert worker.name == 'remote-backup-worker'
         assert worker.daemon is True
 
-    def test_get_interval_uses_min_remote_frequency(self):
+    def test_each_pair_has_its_own_period_the_remote_frequency_else_the_datasets(self, monkeypatch):
+        """Replaces `_get_interval` (one interval for the whole dataset, the MINIMUM of its remote
+        frequencies): every (dataset, destination) pair is scheduled on its own period."""
         config = BackupConfig(
-            datasets=[
-                DatasetConfig(
-                    name='pool/data',
-                    frequency=timedelta(hours=1),
-                    remote=[
-                        RemoteDatasetConfig(destination='a', frequency=timedelta(minutes=30)),
-                        RemoteDatasetConfig(destination='b', frequency=timedelta(hours=2)),
-                    ],
-                ),
-            ],
+            datasets=[DatasetConfig(
+                name='pool/data', frequency=timedelta(hours=1),
+                remote=[
+                    RemoteDatasetConfig(destination='a', frequency=timedelta(minutes=30)),
+                    RemoteDatasetConfig(destination='b', frequency=timedelta(hours=2)),
+                    RemoteDatasetConfig(destination='c', frequency=None),
+                ],
+            )],
+            destinations={d: Destination(url='https://h.example:8443') for d in 'abc'},
         )
-        worker = bare_remote_worker()
-        interval = worker._get_interval(config)
-        assert interval == timedelta(minutes=30).total_seconds()
+        rig = LoopRig(config, monkeypatch).run()
+        spec = rig.loop.schedule.spec
+        assert [spec(('pool/data', d)).effective_period for d in 'abc'] == [1800.0, 7200.0, 3600.0]
 
-    def test_get_interval_falls_back_to_check_interval_when_no_remote(self, sample_backup_config):
-        worker = bare_remote_worker()
-        interval = worker._get_interval(sample_backup_config)
-        assert interval == sample_backup_config.check_interval.total_seconds()
+    def test_a_dataset_without_remote_entries_has_no_pair_and_nothing_is_sent(self, monkeypatch):
+        config = BackupConfig(datasets=[DatasetConfig(name='pool/data')])
+        rig = LoopRig(config, monkeypatch).run()
+        assert rig.loop.schedule.keys() == []
+        rig.remote.backup_dataset.assert_not_called()
+        assert rig.built == []
 
-    def test_get_interval_uses_dataset_frequency_when_remote_has_none(self):
-        config = BackupConfig(
-            datasets=[
-                DatasetConfig(
-                    name='pool/data',
-                    frequency=timedelta(hours=2),
-                    remote=[RemoteDatasetConfig(destination='a', frequency=None)],
-                ),
-            ],
-        )
-        worker = bare_remote_worker()
-        interval = worker._get_interval(config)
-        assert interval == timedelta(hours=2).total_seconds()
+    def test_a_fresh_anchor_is_not_sent(self, monkeypatch):
+        rig = LoopRig(remote_config('offsite'), monkeypatch)
+        anchor = MagicMock()
+        anchor.name = 'autosnap_20240101120000'
+        anchor.age = timedelta(minutes=30)
+        rig.manager.get_own_anchor.return_value = anchor.name
+        rig.manager.list_snapshots.return_value = [anchor]
+        rig.run()
+        rig.remote.backup_dataset.assert_not_called()
+        assert [(k, kind) for k, kind, _, _ in rig.finished] == [(('pool/data', 'offsite'), 'not_due')]
 
-    def test_process_dataset_skips_when_no_remote_config(self, mocker):
-        manager = MagicMock()
-        dsi = configured_dsi()
-        dsi.config.remote = []
-        worker = bare_remote_worker()
-        worker.name = 'remote-backup-worker'
-        worker._remote_manager = MagicMock()
-        worker._process_dataset(manager, dsi)
-        worker._remote_manager.backup_dataset.assert_not_called()
+    def test_a_pair_with_no_anchor_is_sent_with_its_dataset_info_remote_config_and_should_stop(self, monkeypatch):
+        config = remote_config('offsite')
+        rig = LoopRig(config, monkeypatch).run()
+        (call,) = rig.remote.backup_dataset.call_args_list
+        dsi, remote_cfg = call.args
+        assert dsi.name == 'pool/data' and dsi.config is config.datasets[0]
+        assert remote_cfg is config.datasets[0].remote[0]
+        assert set(call.kwargs) == {'should_stop'} and callable(call.kwargs['should_stop'])
 
-    def test_process_dataset_skips_when_anchor_fresh(self, mocker):
-        manager = MagicMock()
-        remote_cfg = MagicMock()
-        remote_cfg.destination = 'offsite'
-        remote_cfg.frequency = timedelta(hours=1)
-        dsi = configured_dsi()
-        dsi.config.remote = [remote_cfg]
-        dsi.config.frequency = timedelta(hours=1)
-
-        anchor_snap = MagicMock()
-        anchor_snap.name = 'autosnap_20240101120000'
-        anchor_snap.age = timedelta(minutes=30)
-        manager.get_own_anchor.return_value = 'autosnap_20240101120000'
-        manager.list_snapshots.return_value = [anchor_snap]
-        manager.clock_behind.return_value = False       # the anchor is not future-dated
-
-        worker = bare_remote_worker()
-        worker.name = 'remote-backup-worker'
-        worker._remote_manager = MagicMock()
-        worker._process_dataset(manager, dsi)
-        worker._remote_manager.backup_dataset.assert_not_called()
-
-    def test_process_dataset_runs_backup_when_no_anchor(self, mocker):
-        manager = MagicMock()
-        remote_cfg = MagicMock()
-        remote_cfg.destination = 'offsite'
-        remote_cfg.frequency = timedelta(hours=1)
-        dsi = configured_dsi()
-        dsi.config.remote = [remote_cfg]
-        dsi.config.frequency = timedelta(hours=1)
-        manager.get_own_anchor.return_value = None
-
-        worker = bare_remote_worker()
-        worker.name = 'remote-backup-worker'
-        worker._remote_manager = MagicMock()
-        worker._process_dataset(manager, dsi)
-        worker._remote_manager.backup_dataset.assert_called_once()
-        args, kwargs = worker._remote_manager.backup_dataset.call_args
-        assert args == (dsi, remote_cfg)
-        assert set(kwargs) == {'should_stop'} and callable(kwargs['should_stop'])
+    def test_a_sender_gets_its_own_dataset_info_never_the_schedulers(self, monkeypatch):
+        rig = LoopRig(remote_config('a', 'b'), monkeypatch).run()
+        seen = [c.args[0] for c in rig.remote.backup_dataset.call_args_list]
+        scheduler_side = {id(d) for d in rig.manager.datasets}
+        assert len(seen) == 2 and seen[0] is not seen[1]
+        assert not scheduler_side & {id(d) for d in seen}
 
 
 class TestRemoteWorkerPassesShouldStop:
-    """C3: `backup_dataset(dsi, remote_cfg, should_stop=...)` -- the callable is
-    "an exit reason is pending" (stop, supervisor gone, or reload), evaluated
-    when the remote manager calls it, not when the worker builds it."""
+    """C3, now over threads: `backup_dataset(dsi, remote_cfg, should_stop=...)` -- the callable is "the
+    stop flag, or the scheduler has set `leave`" (a reload, an upgrade drain, a supervisor that is gone),
+    evaluated when the sender's chain calls it, not when the sender is built. A sender never asks
+    `_exit_reason()` itself: only the scheduler thread does, once per slice."""
 
-    def _worker(self, epoch=None, born=0):
-        stop = StopFlag()
-        worker = RemoteBackupWorker(
-            BackupConfig(datasets=[DatasetConfig(name='pool/data')]), stop,
-            reload_epoch=epoch, born_epoch=born,
-        )
-        worker._remote_manager = MagicMock()
-        return worker, stop
+    def rig(self, monkeypatch, epoch=None, **kw):
+        return LoopRig(remote_config('offsite'), monkeypatch, epoch=epoch, born_epoch=0, **kw)
 
-    def _run(self, worker):
-        remote_cfg = MagicMock()
-        remote_cfg.destination = 'offsite'
-        remote_cfg.frequency = timedelta(hours=1)
-        dsi = configured_dsi()
-        dsi.config.remote = [remote_cfg]
-        dsi.config.frequency = timedelta(hours=1)
-        manager = MagicMock()
-        manager.get_own_anchor.return_value = None
-        worker._process_dataset(manager, dsi)
-        (args, kwargs), = worker._remote_manager.backup_dataset.call_args_list
-        return args, kwargs['should_stop']
+    def test_it_is_false_while_nothing_is_pending(self, monkeypatch):
+        rig = self.rig(monkeypatch)
+        seen = []
+        rig.remote.backup_dataset.side_effect = lambda dsi, cfg, should_stop=None: seen.append(should_stop()) or True
+        rig.run()
+        assert seen == [False]
 
-    def test_it_is_false_while_nothing_is_pending(self):
-        worker, _ = self._worker()
-        args, should_stop = self._run(worker)
-        assert should_stop() is False
+    def test_it_turns_true_when_the_stop_flag_is_raised_after_the_call_was_made(self, monkeypatch):
+        rig = self.rig(monkeypatch)
+        seen = []
 
-    def test_it_turns_true_when_the_stop_flag_is_raised_after_the_call_was_made(self):
-        worker, stop = self._worker()
-        _, should_stop = self._run(worker)
-        assert should_stop() is False
-        stop.set()
-        assert should_stop() is True
+        def backup(dsi, cfg, should_stop=None):
+            seen.append(should_stop())
+            rig.stop.set()
+            seen.append(should_stop())
+            return True
 
-    def test_it_turns_true_when_a_reload_epoch_moves(self):
+        rig.remote.backup_dataset.side_effect = backup
+        rig.run()
+        assert seen == [False, True]
+
+    def test_it_turns_true_once_the_scheduler_sees_a_reload_epoch_move(self, monkeypatch):
         epoch = ReloadEpoch()
-        worker, _ = self._worker(epoch=epoch, born=0)
-        _, should_stop = self._run(worker)
-        assert should_stop() is False
-        epoch.set(1)
-        assert should_stop() is True
+        rig = self.rig(monkeypatch, epoch)
+        seen = []
 
-    def test_it_follows_the_exit_reason_exactly(self, mocker):
-        worker, _ = self._worker()
-        _, should_stop = self._run(worker)
-        reason = mocker.patch.object(worker, '_exit_reason', return_value=None)
-        assert should_stop() is False
-        reason.return_value = workers_module.ExitReason.SUPERVISOR_GONE
-        assert should_stop() is True
-        assert reason.call_count == 2
+        def backup(dsi, cfg, should_stop=None):
+            seen.append(should_stop())
+            epoch.set(1)
+            # the sender itself never reads the epoch: the scheduler does, then sets `leave`
+            seen.append(wait_for(lambda: rig.loop.leave.is_set()) and should_stop())
+            return True
 
-    def test_a_stop_already_pending_is_true_at_once(self):
-        worker, stop = self._worker()
-        stop.set()
-        remote_cfg = MagicMock()
-        remote_cfg.destination = 'offsite'
-        remote_cfg.frequency = timedelta(hours=1)
-        dsi = configured_dsi()
-        dsi.config.remote = [remote_cfg]
-        manager = MagicMock()
-        manager.get_own_anchor.return_value = None
-        worker._process_dataset(manager, dsi)
-        _, kwargs = worker._remote_manager.backup_dataset.call_args
-        assert kwargs['should_stop']() is True
+        rig.remote.backup_dataset.side_effect = backup
+        with pytest.raises(SystemExit) as exc:
+            rig.run()
+        assert exc.value.code == WORKER_EXIT_RELOAD
+        assert seen == [False, True]
+
+    def test_a_sender_never_asks_the_exit_reason(self, monkeypatch):
+        rig = self.rig(monkeypatch)
+        callers = set()
+        inner = rig.worker._exit_reason
+
+        def counting():
+            callers.add(threading.current_thread())
+            return inner()
+
+        rig.worker._exit_reason = counting
+        rig.remote.backup_dataset.side_effect = lambda dsi, cfg, should_stop=None: [should_stop() for _ in range(5)] and True
+        rig.run()
+        assert callers == {threading.current_thread()}, 'only the scheduler thread polls it'
+
+    def test_a_stop_already_pending_starts_no_sender_at_all(self, monkeypatch):
+        rig = self.rig(monkeypatch)
+        rig.stop.set()
+        rig.run()
+        rig.remote.backup_dataset.assert_not_called()
+        assert rig.built == [] and rig.worker._remote_cls is None, 'not even the transport imports'
 
 
 class TestPerDestinationIsolation:
-    """Plan 3.2: one destination's failure is its own. `_send_to_destinations` catches an `Exception` from
-    one destination (the anchor read, the send, the record), logs ONE ERROR with the traceback, records a
-    failed `send` against THAT destination and flushes it, and the dataset's remaining destinations still get
-    their turn -- unless an exit reason is pending, which stops the chain at that safe point.
+    """Plan 3.2, now by construction: every (dataset, destination) pair is its own sender thread, so one
+    destination's failure (the anchor read, the send, an exception of any kind) is recorded against THAT
+    pair, logged ONCE with the traceback, and cannot reach the others -- the scheduler sees only the
+    outcome. An exit reason pending when it happened makes it neither a success nor a failure.
 
-    Mutation-checked (scratch copy; failing tests of this class): narrowing the `except Exception` in
-    `_send_to_destinations` so nothing is caught 13; dropping the failed `send` record 8; dropping the forced
-    flush after a failure 1; dropping the `index and self._exit_reason()` check between destinations 2;
-    `_record_send` ignoring the sender that ran (always asking the remote manager for `last_problem`) 1;
-    dropping `exc_info=True` 1."""
+    Mutation-checked (scratch copy; failing tests of this class): `_sender_main` not catching
+    `BaseException` 4; `send_pair` not catching exceptions 9; `_record_outcome` recording nothing for a
+    FAILED pair 8; `_record_outcome` not flushing after a record 1; `_new_sender` ignoring `is_local` (every
+    destination to the remote manager) 3; a STOPPED outcome recorded as a failure 3."""
 
     @pytest.fixture
     def sdir(self, tmp_path):
@@ -622,25 +606,8 @@ class TestPerDestinationIsolation:
         ensure_status_dir(directory)
         return directory
 
-    def rig(self, sdir, destinations=('d1', 'd2'), local=(), stop=None):
-        urls = {d: Destination(url='zfs:bk' if d in local else 'https://h.example:8443') for d in destinations}
-        config = BackupConfig(
-            datasets=[DatasetConfig(
-                name='pool/data', remote=[RemoteDatasetConfig(destination=d) for d in destinations])],
-            destinations=urls,
-        )
-        worker = RemoteBackupWorker(config, stop or StopFlag(), status_dir=sdir)
-        worker._status = StatusWriter(sdir, 'remote-backup-worker')
-        worker._remote_manager = MagicMock(name='RemoteBackupManager')
-        worker._local_manager = MagicMock(name='LocalBackupManager')
-        for sender in (worker._remote_manager, worker._local_manager):
-            sender.backup_dataset.return_value = True
-            sender.last_problem.return_value = None
-        manager = MagicMock(name='manager')
-        manager.config = config
-        manager.get_own_anchor.return_value = None
-        dsi = SimpleNamespace(name='pool/data', config=config.datasets[0], expanded_from=None)
-        return worker, manager, dsi
+    def rig(self, sdir, monkeypatch, destinations=('d1', 'd2'), local=(), **kw):
+        return LoopRig(remote_config(*destinations, local=local), monkeypatch, status_dir=sdir, **kw)
 
     @staticmethod
     def records(sdir):
@@ -649,7 +616,7 @@ class TestPerDestinationIsolation:
 
     @staticmethod
     def sent_to(sender):
-        return [call.args[1].destination for call in sender.backup_dataset.call_args_list]
+        return sorted(call.args[1].destination for call in sender.backup_dataset.call_args_list)
 
     @staticmethod
     def failing(destination, error=RuntimeError('boom')):
@@ -659,181 +626,177 @@ class TestPerDestinationIsolation:
             return True
         return backup
 
-    def test_the_destination_after_a_failed_one_is_still_sent(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
-        worker._process_dataset(manager, dsi)
-        assert self.sent_to(worker._remote_manager) == ['d1', 'd2']
+    def test_the_destination_after_a_failed_one_is_still_sent(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch)
+        rig.remote.backup_dataset.side_effect = self.failing('d1')
+        rig.run()
+        assert self.sent_to(rig.remote) == ['d1', 'd2']
 
-    def test_the_failure_is_recorded_against_its_own_destination_and_the_other_succeeds(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
+    def test_the_failure_is_recorded_against_its_own_destination_and_the_other_succeeds(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch)
+        rig.remote.backup_dataset.side_effect = self.failing('d1')
+        rig.run()
         recs = self.records(sdir)
         assert recs[('send', 'pool/data', 'd1')].result == 'error'
         assert recs[('send', 'pool/data', 'd1')].last_error == 'RuntimeError: boom'
         assert recs[('send', 'pool/data', 'd2')].result == 'ok'
 
-    def test_nothing_propagates_to_the_loop(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
-        assert worker._process_dataset(manager, dsi) is None
+    def test_nothing_propagates_to_the_loop(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch)
+        rig.remote.backup_dataset.side_effect = self.failing('d1')
+        assert rig.run() is rig                         # `run()` returned, did not raise
 
-    def test_consecutive_failures_accumulate_across_cycles(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
-        for _ in range(3):
-            worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
+    def test_consecutive_failures_accumulate_across_incarnations(self, sdir, monkeypatch):
+        seed_status(sdir, ('pool/data', 'd1', False, 'earlier'), ('pool/data', 'd1', False, 'earlier'))
+        rig = self.rig(sdir, monkeypatch)
+        rig.remote.backup_dataset.side_effect = self.failing('d1')
+        rig.run()
         recs = self.records(sdir)
         assert recs[('send', 'pool/data', 'd1')].consecutive_failures == 3
         assert recs[('send', 'pool/data', 'd2')].consecutive_failures == 0
 
-    def test_a_later_success_resets_the_count(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
-        worker._process_dataset(manager, dsi)
-        worker._remote_manager.backup_dataset.side_effect = None
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
+    def test_a_later_success_resets_the_count(self, sdir, monkeypatch):
+        seed_status(sdir, ('pool/data', 'd1', False, 'earlier'))
+        rig = self.rig(sdir, monkeypatch)
+        rig.run()
         assert self.records(sdir)[('send', 'pool/data', 'd1')].consecutive_failures == 0
 
-    def test_one_error_with_a_traceback_names_the_dataset_and_the_destination(self, sdir, caplog):
-        worker, manager, dsi = self.rig(sdir)
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d1')
+    def test_one_error_with_a_traceback_names_the_dataset_and_the_destination(self, sdir, monkeypatch, caplog):
+        rig = self.rig(sdir, monkeypatch)
+        rig.remote.backup_dataset.side_effect = self.failing('d1')
         with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
-            worker._process_dataset(manager, dsi)
+            rig.run()
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1
         assert 'error on pool/data -> d1: boom' in errors[0].getMessage()
         assert errors[0].exc_info is not None and errors[0].exc_info[0] is RuntimeError
 
-    def test_each_outcome_is_written_before_the_next_destination_begins(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
+    def test_an_outcome_is_on_disk_while_another_send_still_runs(self, sdir, monkeypatch):
+        """The other send may stream for hours: a recorded outcome is written at once."""
+        rig = self.rig(sdir, monkeypatch)
         seen = []
 
-        def backup(dsi_, remote_cfg, should_stop=None):
-            if remote_cfg.destination == 'd1':
+        def backup(dsi, cfg, should_stop=None):
+            if cfg.destination == 'd2':
+                seen.append(wait_for(lambda: ('send', 'pool/data', 'd1') in self.records(sdir)))
+            else:
                 raise RuntimeError('boom')
-            seen.append({k: r.result for k, r in self.records(sdir).items()})
             return True
 
-        worker._remote_manager.backup_dataset.side_effect = backup
-        worker._process_dataset(manager, dsi)
-        assert seen == [{('send', 'pool/data', 'd1'): 'error'}], 'the failure was on disk while d2 ran'
+        rig.remote.backup_dataset.side_effect = backup
+        rig.run()
+        assert seen == [True], 'the failure of d1 was on disk while d2 ran'
 
-    def test_a_pending_stop_after_the_failure_leaves_the_next_destination_unsent(self, sdir):
-        stop = StopFlag()
-        worker, manager, dsi = self.rig(sdir, stop=stop)
+    def test_a_pending_stop_makes_a_failure_neither_a_success_nor_a_failure(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch, destinations=('d1',))
 
         def backup(dsi_, remote_cfg, should_stop=None):
-            stop.set()
+            rig.stop.set()
             raise RuntimeError('boom')
 
-        worker._remote_manager.backup_dataset.side_effect = backup
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
-        assert self.sent_to(worker._remote_manager) == ['d1']
-        assert self.records(sdir) == {}      # ...and the stop that cut d1 short is no failure of d1 either
-
-    def test_an_exception_with_a_stop_pending_is_neither_a_success_nor_a_failure_but_is_still_logged(
-        self, sdir, caplog
-    ):
-        """As `_record_send` does for a `False`: a stop or reload cutting the work short (a killed child, a
-        closed stream) raises, and that says nothing about the destination."""
-        stop = StopFlag()
-        worker, manager, dsi = self.rig(sdir, stop=stop)
-
-        def backup(dsi_, remote_cfg, should_stop=None):
-            stop.set()
-            raise ConnectionError('stream closed')
-
-        worker._remote_manager.backup_dataset.side_effect = backup
-        with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
-            worker._process_dataset(manager, dsi)
-        assert [r for r in caplog.records if r.levelno == logging.ERROR and 'stream closed' in r.getMessage()]
-        worker._flush_status(force=True)
+        rig.remote.backup_dataset.side_effect = backup
+        rig.run()
         assert self.records(sdir) == {}
 
-    def test_a_pending_reload_after_the_failure_stops_the_chain_too(self, sdir):
+    def test_an_exception_with_a_stop_pending_is_neither_a_success_nor_a_failure_but_is_still_logged(
+        self, sdir, monkeypatch, caplog
+    ):
+        """A stop or reload cutting the work short (a killed child, a closed stream) raises, and that
+        says nothing about the destination."""
+        rig = self.rig(sdir, monkeypatch, destinations=('d1',))
+
+        def backup(dsi_, remote_cfg, should_stop=None):
+            rig.stop.set()
+            raise ConnectionError('stream closed')
+
+        rig.remote.backup_dataset.side_effect = backup
+        with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
+            rig.run()
+        assert [r for r in caplog.records if r.levelno == logging.ERROR and 'stream closed' in r.getMessage()]
+        assert self.records(sdir) == {}
+
+    def test_a_pending_reload_makes_a_failure_neither_a_success_nor_a_failure(self, sdir, monkeypatch):
         epoch = ReloadEpoch()
-        worker, manager, dsi = self.rig(sdir)
-        worker.reload_epoch, worker.born_epoch = epoch, 0
+        rig = self.rig(sdir, monkeypatch, destinations=('d1',), epoch=epoch, born_epoch=0)
 
         def backup(dsi_, remote_cfg, should_stop=None):
             epoch.set(1)
+            assert wait_for(lambda: should_stop())      # the scheduler saw the reload and set `leave`
             raise RuntimeError('boom')
 
-        worker._remote_manager.backup_dataset.side_effect = backup
-        worker._process_dataset(manager, dsi)
-        assert self.sent_to(worker._remote_manager) == ['d1']
+        rig.remote.backup_dataset.side_effect = backup
+        with pytest.raises(SystemExit) as exc:
+            rig.run()
+        assert exc.value.code == WORKER_EXIT_RELOAD
+        assert self.records(sdir) == {}
 
-    def test_three_destinations_the_middle_one_fails(self, sdir):
-        worker, manager, dsi = self.rig(sdir, destinations=('d1', 'd2', 'd3'))
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d2')
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
-        assert self.sent_to(worker._remote_manager) == ['d1', 'd2', 'd3']
+    def test_three_destinations_the_middle_one_fails(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch, destinations=('d1', 'd2', 'd3'))
+        rig.remote.backup_dataset.side_effect = self.failing('d2')
+        rig.run()
+        assert self.sent_to(rig.remote) == ['d1', 'd2', 'd3']
         recs = self.records(sdir)
         assert [recs[('send', 'pool/data', d)].result for d in ('d1', 'd2', 'd3')] == ['ok', 'error', 'ok']
 
-    def test_the_anchor_read_failing_for_one_destination_is_isolated_too(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
+    def test_the_anchor_read_failing_for_one_destination_is_isolated_too(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch)
 
         def get_own_anchor(dsi_, destination):
             if destination == 'd1':
                 raise OSError('cannot read the anchor')
             return None
 
-        manager.get_own_anchor.side_effect = get_own_anchor
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
-        assert self.sent_to(worker._remote_manager) == ['d2']
+        rig.manager.get_own_anchor.side_effect = get_own_anchor
+        rig.run()
+        assert self.sent_to(rig.remote) == ['d2']
         assert self.records(sdir)[('send', 'pool/data', 'd1')].last_error == 'OSError: cannot read the anchor'
 
-    def test_a_failing_local_destination_does_not_stop_the_remote_one(self, sdir):
-        worker, manager, dsi = self.rig(sdir, destinations=('usb', 'off'), local=('usb',))
-        worker._local_manager.backup_dataset.side_effect = RuntimeError('target is gone')
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
-        assert self.sent_to(worker._local_manager) == ['usb'] and self.sent_to(worker._remote_manager) == ['off']
+    def test_a_failing_local_destination_does_not_stop_the_remote_one(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch, destinations=('usb', 'off'), local=('usb',))
+        rig.local.backup_dataset.side_effect = RuntimeError('target is gone')
+        rig.run()
+        assert self.sent_to(rig.local) == ['usb'] and self.sent_to(rig.remote) == ['off']
         recs = self.records(sdir)
         assert recs[('send', 'pool/data', 'usb')].last_error == 'RuntimeError: target is gone'
         assert recs[('send', 'pool/data', 'off')].result == 'ok'
 
-    def test_a_failing_remote_destination_does_not_stop_the_local_one(self, sdir):
-        worker, manager, dsi = self.rig(sdir, destinations=('off', 'usb'), local=('usb',))
-        worker._remote_manager.backup_dataset.side_effect = ConnectionError('reset by peer')
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
-        assert self.sent_to(worker._local_manager) == ['usb']
+    def test_a_failing_remote_destination_does_not_stop_the_local_one(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch, destinations=('off', 'usb'), local=('usb',))
+        rig.remote.backup_dataset.side_effect = ConnectionError('reset by peer')
+        rig.run()
+        assert self.sent_to(rig.local) == ['usb']
         recs = self.records(sdir)
         assert recs[('send', 'pool/data', 'off')].last_error == 'ConnectionError: reset by peer'
         assert recs[('send', 'pool/data', 'usb')].result == 'ok'
 
-    def test_a_local_destination_goes_to_the_local_manager_only_and_a_remote_one_to_the_remote_only(self, sdir):
-        worker, manager, dsi = self.rig(sdir, destinations=('usb', 'off'), local=('usb',))
-        worker._process_dataset(manager, dsi)
-        assert self.sent_to(worker._local_manager) == ['usb']
-        assert self.sent_to(worker._remote_manager) == ['off']
+    def test_a_local_destination_goes_to_the_local_manager_only_and_a_remote_one_to_the_remote_only(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch, destinations=('usb', 'off'), local=('usb',))
+        rig.run()
+        assert self.sent_to(rig.local) == ['usb']
+        assert self.sent_to(rig.remote) == ['off']
 
-    def test_an_incomplete_local_send_is_charged_with_the_local_managers_account(self, sdir):
-        worker, manager, dsi = self.rig(sdir, destinations=('usb',), local=('usb',))
-        worker._local_manager.backup_dataset.return_value = False
-        worker._local_manager.last_problem.return_value = 'the target pool is full'
-        worker._process_dataset(manager, dsi)
-        worker._flush_status(force=True)
-        worker._local_manager.last_problem.assert_called_once_with('pool/data', 'usb')
-        worker._remote_manager.last_problem.assert_not_called()
+    def test_an_incomplete_local_send_is_charged_with_the_local_managers_account(self, sdir, monkeypatch):
+        rig = self.rig(sdir, monkeypatch, destinations=('usb',), local=('usb',))
+        rig.local.backup_dataset.side_effect = None
+        rig.local.backup_dataset.return_value = False
+        rig.local.last_problem.return_value = 'the target pool is full'
+        rig.run()
+        rig.local.last_problem.assert_called_once_with('pool/data', 'usb')
+        rig.remote.last_problem.assert_not_called()
         assert self.records(sdir)[('send', 'pool/data', 'usb')].last_error == 'the target pool is full'
 
-    def test_an_interrupt_is_not_swallowed(self, sdir):
-        worker, manager, dsi = self.rig(sdir)
-        worker._remote_manager.backup_dataset.side_effect = self.failing('d1', KeyboardInterrupt())
-        with pytest.raises(KeyboardInterrupt):
-            worker._process_dataset(manager, dsi)
-        assert self.sent_to(worker._remote_manager) == ['d1']
+    @pytest.mark.parametrize('error', [KeyboardInterrupt(), SystemExit(3), GeneratorExit()],
+                             ids=['KeyboardInterrupt', 'SystemExit', 'GeneratorExit'])
+    def test_a_baseexception_in_a_sender_is_a_failed_pair_not_a_dead_scheduler(self, sdir, monkeypatch, error):
+        """A signal never reaches a sender thread, so an interrupt-like exception out of one is the
+        sender's own: the pair fails, the outcome still reaches the scheduler, and the other pair is sent."""
+        rig = self.rig(sdir, monkeypatch)
+        rig.remote.backup_dataset.side_effect = self.failing('d1', error)
+        rig.run()
+        assert self.sent_to(rig.remote) == ['d1', 'd2']
+        recs = self.records(sdir)
+        assert recs[('send', 'pool/data', 'd1')].result == 'error'
+        assert recs[('send', 'pool/data', 'd2')].result == 'ok'
 
 
 class TestApiWorker:
@@ -893,25 +856,39 @@ class TestBaseWorkerLoop:
 
 
 class TestRemoteBackupWorkerBeforeLoop:
-    def test_before_loop_creates_remote_manager(self, tmp_path):
-        from zfsbackup.remote import RemoteBackupManager
-        from zfsbackup.config import Destination
-        config = BackupConfig(
-            datasets=[DatasetConfig(
-                name='pool/data',
-                remote=[RemoteDatasetConfig(destination='offsite')],
-            )],
+    """`_before_loop` imports the transport classes ONCE (after the version check, never mid-run);
+    the managers a sender uses are built per send from them (`_new_sender`)."""
+
+    def config(self):
+        return BackupConfig(
+            datasets=[DatasetConfig(name='pool/data', remote=[RemoteDatasetConfig(destination='offsite')])],
             destinations={'offsite': Destination(url='https://backup.example.com')},
         )
-        manager = MagicMock()
-        worker = bare_remote_worker()
-        worker._remote_manager = None
-        worker.client_id = 'host-1'                      # from the Handoff
-        worker.tls_dir = tmp_path / 'db.tls'
-        worker._before_loop(config, manager)
-        assert isinstance(worker._remote_manager, RemoteBackupManager)
-        assert worker._remote_manager.client_id == 'host-1'
-        assert worker._remote_manager.tls_dir == tmp_path / 'db.tls'
+
+    def test_before_loop_imports_the_remote_manager_class(self, tmp_path):
+        from zfsbackup.remote import RemoteBackupManager
+        worker = RemoteBackupWorker(self.config(), StopFlag(), client_id='host-1', tls_dir=tmp_path / 'db.tls')
+        assert worker._remote_cls is None and worker._local_cls is None
+        worker._before_loop(worker.config, MagicMock())
+        assert worker._remote_cls is RemoteBackupManager and worker._local_cls is None
+
+    def test_a_sender_is_built_with_the_handed_over_id_tls_dir_and_the_workers_memory(self, tmp_path):
+        from zfsbackup.remote import RemoteBackupManager
+        worker = RemoteBackupWorker(self.config(), StopFlag(), client_id='host-1', tls_dir=tmp_path / 'db.tls')
+        worker._before_loop(worker.config, MagicMock())
+        template = DatasetManager(worker.config, memory=worker._mem()).datasets[0]
+        kit = worker._new_kit(template, template.config.remote[0])
+        sender = kit.resolve()
+        assert isinstance(sender, RemoteBackupManager)
+        assert sender.client_id == 'host-1' and sender.tls_dir == tmp_path / 'db.tls'
+        assert sender._memory is worker._mem() and kit.manager._memory is worker._mem()
+        kit.close()
+
+    def test_the_local_manager_class_is_imported_only_when_a_zfs_destination_exists(self, mocker):
+        worker = RemoteBackupWorker(remote_config('usb', local=('usb',)), StopFlag(), client_id='c')
+        worker._before_loop(worker.config, MagicMock())
+        from zfsbackup.local import LocalBackupManager
+        assert worker._local_cls is LocalBackupManager
 
 
 class TestApiWorkerThread:
@@ -1339,8 +1316,14 @@ class TestWorkersNeverOpenTheConfigDatabase:
     def test_interval_comes_from_the_handed_config(self, armed):
         assert SnapshotWorker(armed, multiprocessing.Event())._get_interval(armed) == 600.0
         assert PruningWorker(armed, multiprocessing.Event())._get_interval(armed) == 5400.0
-        # min of the remote frequencies: the `offsite` override of 120m
-        assert RemoteBackupWorker(armed, multiprocessing.Event())._get_interval(armed) == 7200.0
+
+    def test_the_remote_schedule_comes_from_the_handed_config(self, armed, monkeypatch):
+        """The remote worker has no loop interval any more: each pair's period is its remote frequency
+        (here the `offsite` override of 120m), read from the config the worker was handed."""
+        rig = LoopRig(armed, monkeypatch)
+        rig.run()
+        periods = {k: rig.loop.schedule.spec(k).effective_period for k in rig.loop.schedule.keys()}
+        assert periods and 7200.0 in periods.values()
 
 
 @pytest.mark.skipif(
@@ -1398,100 +1381,89 @@ NTP_MESSAGE = 'system clock is behind the newest snapshot; check NTP'
 class TestFutureDatedAnchor:
     """The remote worker skips a destination whose anchor is younger than the frequency. An anchor
     dated beyond the clock tolerance is not 'young': the clock is wrong, and the destination is
-    due (`DatasetManager.clock_behind` logs the ERROR once per destination)."""
+    due (`DatasetManager.clock_behind` logs the ERROR once per destination). Driven through the real
+    scheduler loop: each pair's sender runs `send_pair`'s due check."""
 
-    def build(self, mocker, frozen_clock, anchors, *, check_interval=timedelta(minutes=5),
+    def build(self, monkeypatch, frozen_clock, anchors, *, check_interval=timedelta(minutes=5),
               destinations=('a', 'b')):
-        config = BackupConfig(
-            datasets=[DatasetConfig(
-                name='pool/data', frequency=timedelta(hours=1),
-                remote=[RemoteDatasetConfig(destination=d) for d in destinations],
-            )],
-            check_interval=check_interval,
-        )
-        manager = DatasetManager(config)
-        dsi = manager.datasets[0]
+        config = remote_config(*destinations, check_interval=check_interval)
+        rig = LoopRig(config, monkeypatch, real_methods=('clock_behind',))
         # one snapshot per distinct anchor offset (minutes from the frozen "now"), fixed at build time
         snaps = {m: listed_info(frozen_clock.stamp(timedelta(minutes=m)), txg=i + 1)
                  for i, m in enumerate(sorted(set(anchors.values())))}
         anchor_name = {dest: snaps[m].name for dest, m in anchors.items()}
-        mocker.patch.object(manager, 'list_snapshots', side_effect=lambda d: list(snaps.values()))
-        mocker.patch.object(manager, 'get_own_anchor', side_effect=lambda d, dest: anchor_name.get(dest))
-        worker = bare_remote_worker()
-        worker.name = 'remote-backup-worker'
-        worker._exit_reason = lambda: None
-        worker._remote_manager = MagicMock()
-        return worker, manager, dsi
+        rig.manager.list_snapshots.side_effect = lambda d: list(snaps.values())
+        rig.manager.get_own_anchor.side_effect = lambda d, dest: anchor_name.get(dest)
+        return rig
 
-    def cycle(self, worker, manager, dsi):
-        worker._remote_manager.backup_dataset.reset_mock()
-        worker._process_dataset(manager, dsi)
-        return [c.args[1].destination for c in worker._remote_manager.backup_dataset.call_args_list]
+    def cycle(self, rig):
+        rig.remote.attempts.clear()
+        rig.run()
+        return sorted(dest for _, dest in rig.remote.attempts)
 
-    def test_a_fresh_past_anchor_is_not_due(self, mocker, frozen_clock, caplog):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': -20, 'b': -20})
+    def test_a_fresh_past_anchor_is_not_due(self, monkeypatch, frozen_clock, caplog):
+        rig = self.build(monkeypatch, frozen_clock, {'a': -20, 'b': -20})
         with caplog.at_level(logging.DEBUG):
-            assert self.cycle(worker, manager, dsi) == []
+            assert self.cycle(rig) == []
         assert not [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
 
-    def test_an_old_anchor_is_due(self, mocker, frozen_clock):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': -90, 'b': -90})
-        assert self.cycle(worker, manager, dsi) == ['a', 'b']
+    def test_an_old_anchor_is_due(self, monkeypatch, frozen_clock):
+        rig = self.build(monkeypatch, frozen_clock, {'a': -90, 'b': -90})
+        assert self.cycle(rig) == ['a', 'b']
 
     def test_a_future_dated_anchor_is_due_with_one_error_per_destination(
-        self, mocker, frozen_clock, caplog
+        self, monkeypatch, frozen_clock, caplog
     ):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 600, 'b': 600})
+        rig = self.build(monkeypatch, frozen_clock, {'a': 600, 'b': 600})
         with caplog.at_level(logging.DEBUG):
             for _ in range(3):
-                assert self.cycle(worker, manager, dsi) == ['a', 'b']
+                assert self.cycle(rig) == ['a', 'b']
         errors = [r for r in caplog.records if NTP_MESSAGE in r.getMessage() and r.levelname == 'ERROR']
         assert len(errors) == 2                          # once for each destination, not per cycle
         text = ' '.join(r.getMessage() for r in errors)
         assert 'anchor for a' in text and 'anchor for b' in text
 
-    def test_each_destination_is_judged_by_its_own_anchor(self, mocker, frozen_clock, caplog):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 600, 'b': -20})
+    def test_each_destination_is_judged_by_its_own_anchor(self, monkeypatch, frozen_clock, caplog):
+        rig = self.build(monkeypatch, frozen_clock, {'a': 600, 'b': -20})
         with caplog.at_level(logging.DEBUG):
-            assert self.cycle(worker, manager, dsi) == ['a']
+            assert self.cycle(rig) == ['a']
         errors = [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
         assert len(errors) == 1 and 'anchor for a' in errors[0].getMessage()
 
-    def test_an_anchor_within_the_tolerance_is_just_young(self, mocker, frozen_clock, caplog):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 4, 'b': 4})
+    def test_an_anchor_within_the_tolerance_is_just_young(self, monkeypatch, frozen_clock, caplog):
+        rig = self.build(monkeypatch, frozen_clock, {'a': 4, 'b': 4})
         with caplog.at_level(logging.DEBUG):
-            assert self.cycle(worker, manager, dsi) == []
+            assert self.cycle(rig) == []
         assert not [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
 
-    def test_just_past_the_tolerance_it_is_due(self, mocker, frozen_clock):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 6, 'b': 6})
-        assert self.cycle(worker, manager, dsi) == ['a', 'b']
+    def test_just_past_the_tolerance_it_is_due(self, monkeypatch, frozen_clock):
+        rig = self.build(monkeypatch, frozen_clock, {'a': 6, 'b': 6})
+        assert self.cycle(rig) == ['a', 'b']
 
-    def test_a_long_check_interval_widens_the_tolerance(self, mocker, frozen_clock):
-        worker, manager, dsi = self.build(
-            mocker, frozen_clock, {'a': 20, 'b': 20}, check_interval=timedelta(minutes=30))
-        assert self.cycle(worker, manager, dsi) == []
+    def test_a_long_check_interval_widens_the_tolerance(self, monkeypatch, frozen_clock):
+        rig = self.build(monkeypatch, frozen_clock, {'a': 20, 'b': 20}, check_interval=timedelta(minutes=30))
+        assert self.cycle(rig) == []
 
-    def test_the_error_comes_again_for_a_later_episode(self, mocker, frozen_clock, caplog):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 600}, destinations=('a',))
+    def test_the_error_comes_again_for_a_later_episode(self, monkeypatch, frozen_clock, caplog):
+        rig = self.build(monkeypatch, frozen_clock, {'a': 600}, destinations=('a',))
         with caplog.at_level(logging.ERROR):
-            self.cycle(worker, manager, dsi)                       # episode 1
+            self.cycle(rig)                                         # episode 1
             frozen_clock.advance(timedelta(hours=11))               # the anchor is now past: normal
-            self.cycle(worker, manager, dsi)
+            self.cycle(rig)
             frozen_clock.advance(-timedelta(hours=11))              # the clock goes back again
-            self.cycle(worker, manager, dsi)                       # episode 2
+            self.cycle(rig)                                         # episode 2
         assert len([r for r in caplog.records if NTP_MESSAGE in r.getMessage()]) == 2
 
-    def test_no_anchor_is_due_and_not_an_error(self, mocker, frozen_clock, caplog):
-        worker, manager, dsi = self.build(mocker, frozen_clock, {'a': 0, 'b': 0})
-        manager.get_own_anchor.side_effect = lambda d, dest: None
+    def test_no_anchor_is_due_and_not_an_error(self, monkeypatch, frozen_clock, caplog):
+        rig = self.build(monkeypatch, frozen_clock, {'a': 0, 'b': 0})
+        rig.manager.get_own_anchor.side_effect = lambda d, dest: None
         with caplog.at_level(logging.ERROR):
-            assert self.cycle(worker, manager, dsi) == ['a', 'b']
+            assert self.cycle(rig) == ['a', 'b']
         assert not caplog.records
 
 
 # ---------------------------------------------------------------------------
-# Dataset order: the remote worker sends ancestors before descendants
+# Dataset order: an ancestor is sent before its descendants
 # ---------------------------------------------------------------------------
 
 def _named(*names):
@@ -1499,55 +1471,58 @@ def _named(*names):
     return [types.SimpleNamespace(name=n) for n in names]
 
 
-def _remote_worker():
-    worker = RemoteBackupWorker(BackupConfig(datasets=[], destinations={}), StopFlag(), client_id="c")
-    worker._remote_manager = MagicMock()
-    return worker
-
-
 class TestRemoteWorkerDatasetOrder:
     """A child sent before its parent would leave the parent's server dataset as an unowned
-    placeholder that a raw (or encrypted-target) full stream can never replace: the remote worker
-    visits datasets by path depth, shallowest first, and keeps config order within a depth."""
+    placeholder that a raw (or encrypted-target) full stream can never replace. The order is the
+    SCHEDULE's now (`SendSchedule.due`: an ancestor ahead of its descendants, then by due time, depth
+    and config order) and R-2 holds every child until its ancestor's copy is confirmed. These tests run
+    ONE sender at a time (`caps=(1, 1)`) so that the order of the `backup_dataset` calls is the order
+    the schedule chose."""
 
     @staticmethod
-    def order(*names):
-        manager = MagicMock(datasets=_named(*names))
-        return [d.name for d in _remote_worker()._get_datasets(manager)]
+    def order(monkeypatch, *names):
+        rig = LoopRig(remote_config('d', names=names), monkeypatch, caps=(1, 1)).run()
+        return [dataset for dataset, _ in rig.remote.attempts]
 
-    def test_a_child_listed_before_its_parent_is_processed_after_it(self):
-        assert self.order('tank/data/child', 'tank/data') == ['tank/data', 'tank/data/child']
+    def test_a_child_listed_before_its_parent_is_sent_after_it(self, monkeypatch):
+        assert self.order(monkeypatch, 'tank/data/child', 'tank/data') == ['tank/data', 'tank/data/child']
 
-    def test_equal_depth_keeps_config_order(self):
-        assert self.order('tank/b', 'tank/a', 'tank/c') == ['tank/b', 'tank/a', 'tank/c']
-        assert self.order('tank/c', 'tank/a', 'tank/b') == ['tank/c', 'tank/a', 'tank/b']
+    def test_equal_depth_keeps_config_order(self, monkeypatch):
+        assert self.order(monkeypatch, 'tank/b', 'tank/a', 'tank/c') == ['tank/b', 'tank/a', 'tank/c']
+        assert self.order(monkeypatch, 'tank/c', 'tank/a', 'tank/b') == ['tank/c', 'tank/a', 'tank/b']
 
-    def test_mixed_depths(self):
-        assert self.order('tank/x/y', 'tank/b', 'tank/x', 'tank/a/c', 'tank/a') == [
-            'tank/b', 'tank/x', 'tank/a', 'tank/x/y', 'tank/a/c']
+    def test_mixed_depths_an_ancestor_is_always_before_its_descendants(self, monkeypatch):
+        """Across unrelated trees the schedule no longer promises "every shallower dataset first" (a
+        child released by R-2 is due at its slot time, earlier than a sibling tree's catch-up): only
+        ancestor-before-descendant, which is what the server's placeholder problem needs."""
+        names = ('tank/x/y', 'tank/b', 'tank/x', 'tank/a/c', 'tank/a')
+        order = self.order(monkeypatch, *names)
+        assert sorted(order) == sorted(names) and order[0] == 'tank/b'
+        assert order.index('tank/x') < order.index('tank/x/y')
+        assert order.index('tank/a') < order.index('tank/a/c')
 
-    def test_nested_grandparents(self):
-        assert self.order('tank/p/c/g', 'tank/p/c', 'tank/p') == ['tank/p', 'tank/p/c', 'tank/p/c/g']
-        assert self.order('tank/p/c/g', 'tank/q', 'tank/p', 'tank/p/c') == [
+    def test_nested_grandparents(self, monkeypatch):
+        assert self.order(monkeypatch, 'tank/p/c/g', 'tank/p/c', 'tank/p') == ['tank/p', 'tank/p/c', 'tank/p/c/g']
+        assert self.order(monkeypatch, 'tank/p/c/g', 'tank/q', 'tank/p', 'tank/p/c') == [
             'tank/q', 'tank/p', 'tank/p/c', 'tank/p/c/g']
 
-    def test_a_pool_root_comes_first(self):
-        assert self.order('tank/a', 'tank') == ['tank', 'tank/a']
+    def test_a_pool_root_comes_first(self, monkeypatch):
+        assert self.order(monkeypatch, 'tank/a', 'tank') == ['tank', 'tank/a']
 
-    def test_the_config_list_itself_is_not_reordered(self):
-        names = ['tank/p/c', 'tank/p']
-        manager = MagicMock(datasets=_named(*names))
-        before = list(manager.datasets)
-        _remote_worker()._get_datasets(manager)
-        assert manager.datasets == before
+    def test_no_dataset_no_send(self, monkeypatch):
+        assert self.order(monkeypatch) == []
 
-    def test_an_empty_list_is_empty(self):
-        assert self.order() == []
+    def test_a_child_waits_for_a_parent_that_did_not_confirm(self, monkeypatch):
+        """R-2 for a CONFIGURED child too (the schedule holds every child pair)."""
+        rig = LoopRig(remote_config('d', names=('tank/p/c', 'tank/p')), monkeypatch, caps=(1, 1))
+        rig.remote.unconfirmed.add(('tank/p', 'd'))
+        rig.run()
+        assert rig.remote.attempts == [('tank/p', 'd')]
 
-    def test_begin_cycle_still_runs_first(self):
-        worker = _remote_worker()
-        worker._get_datasets(MagicMock(datasets=_named('tank/a/b', 'tank/a')))
-        worker._remote_manager.begin_cycle.assert_called_once_with()
+    def test_the_worker_never_calls_begin_cycle_but_the_scheduler_runs_the_certificate_reminder(self, monkeypatch):
+        rig = LoopRig(remote_config('d', names=('tank/a',)), monkeypatch).run()
+        rig.remote.begin_cycle.assert_not_called()
+        rig.remote.report_client_cert_expiry.assert_called_once_with()
 
 
 class TestSnapshotWorkerIsDepthSortedOthersKeepConfigOrder:

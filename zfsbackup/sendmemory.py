@@ -66,6 +66,17 @@ TOKEN_ERROR = 'token_error'
 NEGOTIATE_ZFS_ERROR = 'negotiate_zfs_error'
 #: `'remote'` once the "no client id" ERROR was logged.
 NO_CLIENT_ID = 'no_client_id'
+#: Destination names whose "cannot reach" ERROR (`/whoami` failed to connect) was
+#: logged: once per episode, cleared by the next answer from the server.
+UNREACHABLE = 'unreachable'
+#: Destination names whose "unexpected /whoami answer" ERROR (an HTTP status or
+#: body that is neither a refusal nor a binding) was logged: once per episode,
+#: cleared by the next well-formed answer.
+WHOAMI_UNEXPECTED = 'whoami_unexpected'
+#: Dataset names (local copies' missing ancestors) a sender is creating right
+#: now (`SendMemory.claim`): the negotiate of another sender that needs one of
+#: them gets a retryable "busy" instead of racing the `zfs create`.
+CLAIMS = 'claims'
 
 # ---- counters (key -> consecutive count) --------------------------------------
 TOKEN_SKIPS = 'token_skips'
@@ -78,6 +89,9 @@ REFUSALS = 'refusals'
 PENDING = 'pending'
 #: `'remote'` -> the last client-identity error logged.
 IDENTITY_ERROR = 'identity_error'
+#: `'remote'` -> the fingerprint of the client identity whose "loaded" INFO was
+#: logged last (a manager built per send would otherwise log it every time).
+IDENTITY_LOADED = 'identity_loaded'
 
 
 class SendMemory:
@@ -190,6 +204,26 @@ class SendMemory:
             table.difference_update([k for k in table if in_group(k)])
             table.update(keys)
             return fresh
+
+    def claim(self, names: Iterable[Hashable]) -> bool:
+        """Claim every name of `names` (table `CLAIMS`), all or nothing. ->
+        True when all were free and are now held by the caller, False (nothing
+        taken) when any is held by someone else. The caller `release()`s the
+        same names, in a `finally`. Not reentrant: claiming a name the caller
+        already holds fails. Never blocks."""
+        names = list(names)
+        with self._lock:
+            table = self._set(CLAIMS)
+            if any(n in table for n in names):
+                return False
+            table.update(names)
+            return True
+
+    def release(self, names: Iterable[Hashable]) -> None:
+        """Release names taken by `claim()` (idempotent)."""
+        names = list(names)
+        with self._lock:
+            self._set(CLAIMS).difference_update(names)
 
     # ---------------------------------------------------------------- counters
 

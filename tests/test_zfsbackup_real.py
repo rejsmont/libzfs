@@ -1533,36 +1533,38 @@ class TestRealSendReceive:
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
 
     # -- the worker's scheduling -----------------------------------------------
-    def _worker(self, e2e):
-        from zfsbackup.stopflag import StopFlag
-        from zfsbackup.workers import RemoteBackupWorker
+    @staticmethod
+    def _send_pair(e2e):
+        """What one sender thread of the remote worker does for the pair (`sendpair.send_pair`: the due
+        check on the dataset's own anchor, then `backup_dataset`), over the e2e manager."""
+        from zfsbackup.sendpair import send_pair
 
-        worker = RemoteBackupWorker(
-            e2e.manager.config, StopFlag(), tls_dir=e2e.client_tls, client_id=CLIENT_ID
-        )
-        worker._remote_manager = e2e.remote_mgr
-        return worker
+        e2e.remote_mgr.begin_cycle()
+        never = lambda: False  # noqa: E731
+        return send_pair(e2e.manager, e2e.dsi, e2e.dsi.config.remote[0], e2e.remote_mgr, never, never)
 
     def test_fresh_anchor_skips_the_backup_in_the_worker(self, e2e):
+        from zfsbackup.sendpair import PAIR_NOT_DUE
+
         e2e.write('data.bin', 1)
         s1 = e2e.snapshot(3)
         assert e2e.cycle() is True
         e2e.snapshot(2)     # newer, but the anchor (3h) is younger than the 24h frequency
 
-        self._worker(e2e)._process_dataset(e2e.manager, e2e.dsi)
+        assert self._send_pair(e2e).kind == PAIR_NOT_DUE
 
         assert list(e2e.server_snaps()) == [s1]
 
     def test_stale_anchor_makes_the_worker_send(self, e2e):
+        from zfsbackup.sendpair import PAIR_DONE
+
         e2e.write('data.bin', 1)
         s1 = e2e.snapshot(3)
         assert e2e.cycle() is True
         s2 = e2e.snapshot(2)
         e2e.dsi.config.remote[0].frequency = timedelta(minutes=1)   # anchor is 3h old
 
-        worker = self._worker(e2e)
-        worker._remote_manager.begin_cycle()
-        worker._process_dataset(e2e.manager, e2e.dsi)
+        assert self._send_pair(e2e).kind == PAIR_DONE
 
         assert set(e2e.server_snaps()) == {s1, s2}
         self._assert_replicated(e2e, s1, s2)

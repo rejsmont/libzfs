@@ -68,8 +68,18 @@ _warned_lock = threading.Lock()
 # instead of going quiet for the rest of a long-lived process.
 _WARNED_NAMES_TTL = 3600.0
 _warned_names_since = None
-# Bumped (under the lock) every time `_skip_invalid_name` logs a WARNING, for callers that cannot see its return value.
+# Bumped (under the lock) every time `_skip_invalid_name` logs a WARNING, in any thread. Process-wide, so it must NOT be
+# diffed around a call to learn whether THAT call warned (another thread's warning would count); use
+# `_thread_name_warnings()` for that.
 _name_warnings = 0
+# The same count per thread: only the calling thread bumps its own, so a before/after diff around a call in one thread
+# says whether that call (and nothing running beside it) logged a per-name WARNING.
+_thread_warnings = threading.local()
+
+
+def _thread_name_warnings() -> int:
+    """How many per-name WARNINGs `_skip_invalid_name` has logged in the calling thread."""
+    return getattr(_thread_warnings, 'count', 0)
 
 
 def _skip_invalid_name(name: str, error: Exception) -> bool:
@@ -90,12 +100,14 @@ def _skip_invalid_name(name: str, error: Exception) -> bool:
             if len(_warned_names) == _MAX_WARNED_NAMES:
                 _warned_names.add(None)
                 _name_warnings += 1
+                _thread_warnings.count = _thread_name_warnings() + 1
                 logger.warning('skipping names from zfs output: more than %d distinct names libzfseasy cannot '
                                'represent; further ones are skipped silently', _MAX_WARNED_NAMES)
                 return True
             return False
         _warned_names.add(name)
         _name_warnings += 1
+        _thread_warnings.count = _thread_name_warnings() + 1
     logger.warning('skipping %r from zfs output: libzfseasy cannot represent this name (%s)', _clip(name), error)
     return True
 
@@ -3052,12 +3064,13 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             skips.skip('%s (%r)' % (problem, _clip(name)))
             return None
         try:
-            before = _name_warnings
+            before = _thread_name_warnings()
             obj = GetCommand._build(name, dstype, properties)
             if obj is None:
                 # `_build` returns None only for a name libzfseasy cannot represent, and has reported it (or not,
-                # when the name was already reported: the serial says which).
-                skips.count_unrepresentable(name, warned=_name_warnings != before)
+                # when the name was already reported). The per-thread count says whether THIS call warned; the
+                # process-wide one would also move for a listing running in another thread.
+                skips.count_unrepresentable(name, warned=_thread_name_warnings() != before)
             return obj
         except ValueError as e:
             skips.skip('cannot build %r (%s)' % (_clip(name), _clip(e)))

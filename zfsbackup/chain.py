@@ -284,6 +284,14 @@ class ChainSender:
         # so reading all of it would blame this pair for another's refusal.
         # Reset at the start of every call, like `_call_note`.
         self._call_refusals: Set[Tuple[Optional[str], str]] = set()
+        # The message THIS call logged (or repeated at DEBUG) for each of those
+        # keys. `last_problem` reads it first: another sender on the same
+        # destination may pop or replace the shared `REFUSALS` entry (a good
+        # `/whoami`, a recovery) between this call's refusal and its
+        # classification, and the status text must not lose the reason then.
+        # A key without a message here (`(None, destination)` for a refusal
+        # logged by an EARLIER call on this manager) falls back to the memory.
+        self._call_refusal_messages: Dict[Tuple[Optional[str], str], str] = {}
 
     # What the memory holds, under the names the manager's state always had
     # (the LIVE containers, for tests and diagnostics; the chain itself only
@@ -418,12 +426,15 @@ class ChainSender:
         note = self._call_note.get((dataset, destination))
         if note:
             return note
-        mine = set(self._call_refusals)
-        # Iterates a copy: other threads write the table while this reads it.
-        for key, message in sorted(
-            self._memory.items(REFUSALS), key=lambda item: (item[0][0] or '', item[0][1])
-        ):
-            if key not in mine:
+        # This call's own record first (a sibling's pop cannot erase it), the
+        # shared table only for a key this call did not record a message for.
+        # `items()` is a copy: other threads write the table while this reads.
+        shared = dict(self._memory.items(REFUSALS))
+        for key in sorted(self._call_refusals, key=lambda k: (k[0] or '', k[1])):
+            message = self._call_refusal_messages.get(key)
+            if message is None:
+                message = shared.get(key)
+            if message is None:
                 continue
             label, dest = key
             if dest == destination and (
@@ -452,6 +463,7 @@ class ChainSender:
         self._call_note.pop((dsi.name, destination), None)
         self._call_retryable.pop((dsi.name, destination), None)
         self._call_refusals = set()
+        self._call_refusal_messages = {}
         dest = self.config.destinations.get(destination)
         if dest is None:
             self._logger.error(f"Unknown destination '{destination}' for {dsi.name}")
@@ -576,7 +588,7 @@ class ChainSender:
         if problem is not None:
             self._log_refusal_once(key, problem)
             return None
-        self._memory.pop(REFUSALS, key)
+        self._forget_refusal(key)
         return mode
 
     def _server_copy_matches(self, dsi: DatasetInfo, destination: str, mode: str) -> bool:
@@ -589,7 +601,7 @@ class ChainSender:
         key = (f"{dsi.name} [server copy]", destination)
         copy, server_ds = self._server_info.get((dsi.name, destination), (None, None))
         if copy not in ('plain', 'raw') or copy == mode:
-            self._memory.pop(REFUSALS, key)
+            self._forget_refusal(key)
             return True
         name = server_ds or dsi.name
         self._log_refusal_once(key, (
@@ -654,10 +666,10 @@ class ChainSender:
         copy, server_ds = self._server_info.get((dsi.name, destination), (None, None))
         server_ds = server_ds or dsi.name
         if common_snap is None:
-            self._memory.pop(REFUSALS, key)
-            self._memory.pop(REFUSALS, unknown_key)
+            self._forget_refusal(key)
+            self._forget_refusal(unknown_key)
             if copy not in ('plain', 'raw'):
-                self._memory.pop(REFUSALS, none_key)
+                self._forget_refusal(none_key)
                 return ()
             self._log_refusal_once(none_key, (
                 f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} holds snapshots "
@@ -668,23 +680,23 @@ class ChainSender:
                 + self._rejoin_pointer()
             ))
             return None
-        self._memory.pop(REFUSALS, none_key)
+        self._forget_refusal(none_key)
         if self._server_newer_status.get((dsi.name, destination)) == 'unknown':
             # The server has a common snapshot but could not tell what is newer
             # than it. That is not "nothing newer": writing an anchor now
             # could launder a rollback into the backstop later. Nothing is
             # written or sent (the stream would be refused with `listing`).
-            self._memory.pop(REFUSALS, key)
+            self._forget_refusal(key)
             self._log_warning_once(unknown_key, (
                 f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} could not list "
                 f"which of its snapshots are newer than {common_snap.name}, so nothing is sent "
                 "and no anchor is written this cycle; the next cycle retries"
             ))
             return None
-        self._memory.pop(REFUSALS, unknown_key)
+        self._forget_refusal(unknown_key)
         count, entries = self._server_newer.get((dsi.name, destination), (0, []))
         if not entries:
-            self._memory.pop(REFUSALS, key)
+            self._forget_refusal(key)
             return ()
         guid = None
         unreadable_key = (f"{dsi.name} [local anchor]", destination)
@@ -709,9 +721,9 @@ class ChainSender:
                     f"{self._receiver} may discard its newer snapshot; nothing is sent this cycle"
                 ))
                 return None
-        self._memory.pop(REFUSALS, unreadable_key)
+        self._forget_refusal(unreadable_key)
         if guid is not None:
-            self._memory.pop(REFUSALS, key)
+            self._forget_refusal(key)
             return (guid,)
         names = [str(e.get('name')) for e in entries if isinstance(e, dict)] or ['?']
         first, last = names[0], names[-1]
@@ -755,9 +767,18 @@ class ChainSender:
             and anchor.createtxg >= common_snap.createtxg
         )
 
+    def _forget_refusal(self, key):
+        """A standing refusal ended (a good answer): drop it from the shared
+        memory AND from this call's own record, so `last_problem` stops
+        reporting it. -> what the memory held (`None` if nothing)."""
+        self._call_refusals.discard(key)
+        self._call_refusal_messages.pop(key, None)
+        return self._memory.pop(REFUSALS, key)
+
     def _log_warning_once(self, key, message: str) -> None:
         """`_log_refusal_once` at WARNING (a condition that heals by itself)."""
         self._call_refusals.add(key)
+        self._call_refusal_messages[key] = message
         if self._memory.note_value(REFUSALS, key, message):
             self._logger.warning(message)
         else:
@@ -765,6 +786,7 @@ class ChainSender:
 
     def _log_refusal_once(self, key, message: str) -> None:
         self._call_refusals.add(key)
+        self._call_refusal_messages[key] = message
         if self._memory.note_value(REFUSALS, key, message):
             self._logger.error(message)
         else:
@@ -1158,7 +1180,7 @@ class ChainSender:
         # The receiver acknowledged `sent`: the copy exists, whatever happens
         # to the bookkeeping below.
         self._memory.note(COPY_CONFIRMED, (dsi.name, destination))
-        self._memory.pop(REFUSALS, (f"{dsi.name} [{self._refusal_label}]", destination))
+        self._forget_refusal((f"{dsi.name} [{self._refusal_label}]", destination))
         # The RAISING read: "unset" and "could not read" differ here. An
         # unreadable anchor must neither skip the never-backwards rule below
         # nor, with no `base`, let the sent-snapshot backstop `clear_anchor` a
@@ -1176,7 +1198,7 @@ class ChainSender:
                 f"negotiates again"
             ))
             return _ANCHOR_FAILED
-        self._memory.pop(REFUSALS, read_key)
+        self._forget_refusal(read_key)
         keep_anchor = False
         if old_anchor and old_anchor != sent.name:
             # Never move an anchor backwards (by createtxg): a snapshot older
@@ -1294,7 +1316,7 @@ class ChainSender:
                 "the next cycle retries"
             ))
             return False
-        self._memory.pop(REFUSALS, read_key)
+        self._forget_refusal(read_key)
         anchored = anchor == latest.name
         wrote = False
         if not anchored:

@@ -866,7 +866,7 @@ class DatasetManager:
     def expand_recursive(
         self, should_stop: Optional[Callable[[], bool]] = None,
         *, scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
-        quiet: bool = False,
+        quiet: bool = False, parent: Optional[str] = None,
     ) -> Expansion:
         """The descendants of the enabled `recursive: true` datasets that have
         `remote:` entries, each as its own sending pair (never `send -R`, `-p`
@@ -929,7 +929,12 @@ class DatasetManager:
         is checked before each parent; once it is true the result is partial
         and only fit for leaving. `Expansion.skipped` lists every backup copy and
         receive target left out, per parent (the ERRORs above say the same, once
-        per episode); `quiet=True` (the health check, which reports `skipped`
+        per episode); `parent=` (the remote worker's discovery threads: one per
+        parent at a time) expands only that recursive dataset, and forgets only
+        ITS episodes (the `EXPAND_*` latches of other parents are left alone, so
+        one parent's discovery never ends another's episode); a name that is not
+        an enabled recursive dataset with `remote:` entries expands nothing and
+        forgets its own latches. `quiet=True` (the health check, which reports `skipped`
         itself) logs those two ERRORs at DEBUG instead and does not mark the
         episode as announced. `scope()` (the health check passes one)
         returns a context manager every `zfs` call of the discovery runs in
@@ -939,6 +944,16 @@ class DatasetManager:
         failed: Dict[str, str] = {}
         configured = {c.name: c for c in self.config.datasets}
         roots = [c for c in self.config.enabled_datasets if c.recursive and c.remote]
+        if parent is not None:
+            # One parent's discovery: only its episodes are this call's to end.
+            # EXPAND_ERROR keys are the parent's name, the other two tables'
+            # keys are `(parent, ...)`.
+            owner = lambda k: k if isinstance(k, str) else k[0]  # noqa: E731
+            if not any(r.name == parent for r in roots):
+                for table in (EXPAND_ERROR, EXPAND_TARGET, EXPAND_COPY):
+                    self._memory.forget_where(table, lambda k: owner(k) == parent)
+                return Expansion(children, failed, {})
+            roots = [r for r in roots if r.name == parent]
         if not roots:
             for table in (EXPAND_ERROR, EXPAND_TARGET, EXPAND_COPY):
                 self._memory.reset_latches(table)
@@ -1033,13 +1048,25 @@ class DatasetManager:
             # Forget an episode that is over (the recovery INFO above covers
             # the parents that were listed; a parent no longer configured just goes).
             root_names = {r.name for r in roots}
-            self._memory.retain(EXPAND_ERROR, lambda k: k in root_names)
-            self._memory.retain(
-                EXPAND_TARGET, lambda k: k in blocked_now or k[0] not in listed_ok
-            )
-            self._memory.retain(
-                EXPAND_COPY, lambda k: k in copies_now or k[0] not in listed_ok
-            )
+            if parent is None:
+                self._memory.retain(EXPAND_ERROR, lambda k: k in root_names)
+                self._memory.retain(
+                    EXPAND_TARGET, lambda k: k in blocked_now or k[0] not in listed_ok
+                )
+                self._memory.retain(
+                    EXPAND_COPY, lambda k: k in copies_now or k[0] not in listed_ok
+                )
+            else:
+                # Scoped to this parent: every key of another parent is kept.
+                self._memory.retain(EXPAND_ERROR, lambda k: k != parent or k in root_names)
+                self._memory.retain(
+                    EXPAND_TARGET,
+                    lambda k: k[0] != parent or k in blocked_now or k[0] not in listed_ok,
+                )
+                self._memory.retain(
+                    EXPAND_COPY,
+                    lambda k: k[0] != parent or k in copies_now or k[0] not in listed_ok,
+                )
         return Expansion(
             children, failed,
             {parent: list(names.items()) for parent, names in skipped.items()},

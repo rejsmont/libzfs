@@ -130,12 +130,25 @@ _FORKSERVER_LOST_EXITCODE = 255
 #:      + 5s kill-join per worker that will not exit. The 30s budget is now
 #:      a single deadline shared by all workers rather than per-worker, so
 #:      four workers stuck in a long `zfs send` cost up to 30 + 4x10 = 70s
-#:      there, not 4x40 = 160s.
+#:      there, not 4x40 = 160s. (The remote worker runs up to
+#:      `sendschedule.MAX_SENDERS` = 4 sends at once, one thread each, so its
+#:      escalation tears up to 4 `receive -s` streams in one process instead of
+#:      one: `terminate()` kills the process and every thread in it. The
+#:      streams resume from their partial state, as before; the bound above is
+#:      per worker process and does not change.)
 #:
 #: So roughly 0.25 + 70 ~= 70s worst case, under the unit's
 #: `TimeoutStopSec=90`. On the healthy path -- workers parked in
 #: `stop_event.wait()` -- the tail is one worker's `stopflag.STOP_POLL`
 #: slice, not this one; measured end-to-end shutdowns land at 0.265-0.554s.
+#: (Those figures are for the snapshot and pruning workers. The remote
+#: worker's scheduler leaves within one slice of the flag too, but its exit
+#: also joins what it started: up to `sendloop.DISCOVERY_JOIN` = 5s, in all,
+#: for a discovery thread inside a slow `zfs list -r`, up to 1s per outcome
+#: it joins, and the tick's own work (a status flush, the certificate
+#: reminder). Those are a few seconds at most, inside the budget; the senders
+#: themselves are never cut mid-stream, so a running send is the escalation's
+#: business, as above.)
 #:
 #: A fourth term since live reload (item 17.2): a SIGTERM that lands while
 #: the supervisor is inside `_reload_tick` waits for that tick to finish. That
@@ -1449,14 +1462,36 @@ class BackupDaemon:
           `died` exit (the server thread died: it skips the stream-gate
           drain), can leave a `zfs receive` child committing after the worker
           pid is gone.
-        - An exception escaping `BaseWorker.run` before `_finish` (a crash,
-          exit 1) skips the remote worker's wait for its abandoned children.
+        - An exception escaping `BaseWorker.run` (the other workers) or the
+          remote worker's `run` before `_finish` (a crash, exit 1) skips the
+          remote worker's wait for its abandoned children. The scheduler's
+          `finally` still sets `leave` and joins its sender threads first
+          (`sendloop.SendLoop.run` never returns with a live sender), so no
+          sender outlives the process's decision to crash; but nothing waits
+          for a child a sender abandoned. A scheduler exception is logged at
+          ERROR with its traceback at once, naming how many senders it is
+          draining; the exit then WAITS for them (each stops at its next chain
+          step, so a long stream can take hours), with nothing new started and
+          the status file's heartbeat still written (as in every drain), so
+          the worker looks alive but idle until it exits.
+        - The remote worker runs up to 4 sends at once (threads of one process;
+          up to 2 per destination), so one SIGKILL or OOM kill of the worker, or
+          a crash in a C extension, ends up to 4 `zfs receive` writers' senders
+          at once, and the gate's PID view covers them all as one worker.
         - After a real supervisor death, or a stop followed by a new daemon,
           the new daemon waits on `<db>.workers.lock`, which exec'd `zfs`
           children do not hold.
         - The remote worker's wait for abandoned write children
           (`REMOTE_STUCK_WRITE_WAIT`) is bounded: on expiry it logs one
-          WARNING and exits, and the successor may race the child.
+          WARNING and exits, and the successor may race the child. It starts
+          only after EVERY sender thread has been joined (a sender leaves at
+          its next chain step, so a long stream delays it, as one dataset did
+          before); the stuck-child registry is per process, so it covers the
+          children of all senders.
+        - A recursive parent's discovery thread (a name-only `zfs list`, plus a read of the copy
+          roots' properties) is ABANDONED after a 5 s join when the worker
+          leaves: a `zfs` call that never returns is not waited for (it only
+          reads).
         - The pruning worker's timed local destroys are not waited for
           (pre-existing)."""
         if name != 'remote':

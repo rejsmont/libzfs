@@ -497,13 +497,13 @@ class TestSendPairNeverTouchesAStatusWriter:
         assert not {n for n in names if 'status' in n.lower() or n == 'health'}
 
     @pytest.mark.parametrize('case', ['done', 'not_due', 'waiting', 'failed', 'stopped', 'raises'])
-    def test_no_kind_reaches_the_writer_of_the_worker(self, case):
-        spy = _StatusSpy()
-        worker = bare_remote_worker(_status=spy, _remote_manager=FakeSender(), _local_manager=None)
+    def test_no_kind_reaches_a_real_status_writer(self, case, mocker):
+        """Every writer entry point raises: whatever `send_pair` returns, it never reached one."""
+        for method in ('record', 'flush', 'retain', 'load'):
+            mocker.patch.object(health.StatusWriter, method, side_effect=AssertionError(method))
         pair = make_dsi('pool/p')
         child = make_dsi('pool/p/c', expanded_from='pool/p')
-        worker._pairs = {'pool/p': pair}
-        worker._dependents = {}
+        rule = make_rule([pair, child])
         manager = FakeManager()
         sender = FakeSender(True)
         exit_pending = NO_EXIT
@@ -520,8 +520,7 @@ class TestSendPairNeverTouchesAStatusWriter:
         elif case == 'raises':
             sender = FakeSender(RuntimeError('x'))
         manager.config.destinations = {}
-        outcome = send_pair(
-            manager, dsi, make_cfg(), sender, NO_EXIT, exit_pending, rule=worker._ancestor_rule())
+        outcome = send_pair(manager, dsi, make_cfg(), sender, NO_EXIT, exit_pending, rule=rule)
         assert outcome.kind == {
             'done': PAIR_DONE, 'not_due': PAIR_NOT_DUE, 'waiting': PAIR_WAITING,
             'failed': PAIR_FAILED, 'stopped': PAIR_STOPPED, 'raises': PAIR_FAILED}[case]
@@ -1244,65 +1243,51 @@ class TestRecordOutcome:
         worker._record_outcome(PairOutcome('pool/data', DEST, PAIR_FAILED, error='x'))
         worker._record_outcome(PairOutcome('pool/data', DEST, PAIR_DONE))
 
-    def test_the_whole_path_through_the_worker_records_only_done_and_failed(self):
-        """`_send_to_destination` -> `send_pair` -> `_record_outcome`, kind by kind."""
+    def test_the_whole_path_through_the_scheduler_records_only_done_and_failed(self, monkeypatch):
+        """The scheduler loop -> `send_pair` -> `_record_outcome`, kind by kind: a success and a failure are
+        recorded, a False cut short by a stop is not."""
+        from _sendloop_support import LoopRig
+        from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig
+        config = BackupConfig(
+            datasets=[DatasetConfig(name='pool/data', remote=[RemoteDatasetConfig(destination=DEST)])],
+            destinations={DEST: Destination(url='https://h.example:8443')},
+        )
         for sender_result, pending, expected in [
             (True, False, [True]), (False, False, [False]), (False, True, []),
         ]:
-            worker, status = self.worker()
-            worker._exit_reason = lambda p=pending: 'stop' if p else None
-            worker._remote_manager = FakeSender(sender_result, problem='p')
-            worker.name = 'remote-backup-worker'
-            manager = FakeManager()
-            manager.config.destinations = {}
-            worker._send_to_destination(manager, make_dsi(), make_cfg(), logging.getLogger('t'))
+            rig = LoopRig(config, monkeypatch)
+            status = MagicMock()
+            rig.worker._open_status = lambda cfg, logger, status=status: status
+            rig.remote.backup_dataset.side_effect = (
+                lambda dsi, cfg, should_stop=None, r=sender_result, p=pending:
+                (rig.stop.set() if p else None) or r
+            )
+            rig.remote.last_problem.return_value = 'p'
+            rig.run()
             assert [c.kwargs['ok'] for c in status.record.call_args_list] == expected
 
-    def test_a_held_pair_through_the_worker_records_nothing(self):
-        worker, status = self.worker()
-        worker._exit_reason = lambda: None
-        worker._remote_manager = FakeSender(True)
-        worker.name = 'remote-backup-worker'
-        parent = make_dsi('pool/p')
-        child = make_dsi('pool/p/c', expanded_from='pool/p')
-        worker._pairs = {'pool/p': parent, 'pool/p/c': child}
-        worker._dependents = {('pool/p', DEST): 1}
-        manager = FakeManager(snapshots=[snap('s')])
-        manager.config.destinations = {}
-        worker._send_to_destination(manager, child, make_cfg(), logging.getLogger('t'))
-        status.record.assert_not_called()
-        assert worker._remote_manager.calls == []
-
-    def test_a_no_snapshots_child_through_the_worker_is_recorded_as_sent(self):
-        worker, status = self.worker()
-        worker._exit_reason = lambda: None
-        worker._remote_manager = FakeSender(True)
-        worker.name = 'remote-backup-worker'
-        parent = make_dsi('pool/p')
-        child = make_dsi('pool/p/c', expanded_from='pool/p')
-        worker._pairs = {'pool/p': parent, 'pool/p/c': child}
-        worker._dependents = {('pool/p', DEST): 1}
-        manager = FakeManager(snapshots=[])
-        manager.config.destinations = {}
-        worker._send_to_destination(manager, child, make_cfg(), logging.getLogger('t'))
-        assert [c.kwargs['ok'] for c in status.record.call_args_list] == [True]
-        assert worker._remote_manager.calls == []
+    def test_a_held_child_through_the_scheduler_records_nothing_and_is_never_sent(self, monkeypatch):
+        """The schedule (R-2) holds a child behind a parent that did not confirm: no sender, no record
+        for the child; the parent's own failure is recorded."""
+        from _sendloop_support import LoopRig
+        from zfsbackup.config import BackupConfig, DatasetConfig, Destination, RemoteDatasetConfig
+        config = BackupConfig(
+            datasets=[DatasetConfig(name=n, remote=[RemoteDatasetConfig(destination=DEST)])
+                      for n in ('pool/p', 'pool/p/c')],
+            destinations={DEST: Destination(url='https://h.example:8443')},
+        )
+        rig = LoopRig(config, monkeypatch)
+        status = MagicMock()
+        rig.worker._open_status = lambda cfg, logger: status
+        rig.remote.outcomes[('pool/p', DEST)] = False
+        rig.run()
+        assert rig.remote.attempts == [('pool/p', DEST)]
+        assert [(c.args[1], c.kwargs['ok']) for c in status.record.call_args_list] == [('pool/p', False)]
 
 
 class TestWorkerWiring:
-    def test_ancestor_rule_reads_the_workers_state_and_memory(self):
-        worker = bare_remote_worker()
-        rule = worker._ancestor_rule()
-        assert isinstance(rule, AncestorRule)
-        assert rule.pairs is worker._pairs and rule.dependents is worker._dependents
-        assert rule.memory is worker._mem()
-        assert rule.sender_for == worker._pair_sender
-
-    def test_the_rule_sees_a_replaced_pairs_dict(self):
-        """Built per use: replacing `_pairs` each cycle is seen by the next rule."""
-        worker = bare_remote_worker()
-        worker._pairs = {'pool': make_dsi('pool')}
-        assert worker._ancestor_rule().nearest_pair('pool/a', DEST).name == 'pool'
+    """The rule a sender uses is built by the scheduler loop (`SendLoop._make_rule`): its wiring is in
+    `test_zfsbackup_sendloop.py`."""
 
     def test_the_waiting_and_dry_run_names_are_read_only_views_of_the_memory(self):
         worker = RemoteBackupWorker(MagicMock(), MagicMock())

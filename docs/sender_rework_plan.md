@@ -260,6 +260,36 @@ Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 a
 - **Order.** A pair ranks by the earliest due time among itself and its due descendants, so an ancestor never ranks
   behind its child. `dispatch` reserves nothing: the caller calls `started` for each pair it returns.
 
+### Decisions taken while building B3 (`zfsbackup/sendloop.py`, 2026-11-11)
+
+B3 passed two rounds of `zfs-code-reviewer` + `concurrency-reviewer` and a final pass. What B4's prose must reflect:
+
+- **Structure.** `SendLoop` runs on the worker's main thread and only schedules (no `zfs`, no network). Sender threads
+  build a `SenderKit` (fresh `DatasetManager`/`DatasetInfo`, transport manager built lazily through `LazySender`)
+  from ONE factory (`RemoteBackupWorker._new_kit`/`_new_sender`, `memory=self._mem()`, checked by
+  `_shares_memory`). Discovery runs per parent (`expand_recursive(parent=)`, scoped latch forgetting).
+- **Recording.** A DONE outcome is always recorded at once, including DONE+retryable (a chain cut between steps, a
+  reload's drain), while its retry timing is kept. A retryable FAILED is recorded only when its retries are spent.
+- **Latches per episode, shared by all senders:** `UNREACHABLE` and `WHOAMI_UNEXPECTED` (ERROR once per destination,
+  DEBUG after, INFO when the server answers normally again); `IDENTITY_LOADED` by fingerprint (re-armed by a failed
+  load). A call's own refusal message is kept on the instance, so a sibling's `_forget_refusal` cannot erase it.
+- **R-2 announcements.** The waiting WARNING comes from the scheduler after `WAITING_NOTICE` (60 s), only for the
+  topmost holder, never while that holder runs or is due, and never when `COPY_CONFIRMED` is already noted. The INFO
+  follows only an announced episode whose ancestor is confirmed (else a DEBUG).
+- **Confirmation vs retry.** A once-per-incarnation confirmation is never due before a pending `retry_at`, whichever
+  of the discovery and the failure comes first (`_link`, `finished`).
+- **Local negotiate claim.** `SendMemory.claim/release` (non-blocking, all-or-nothing over the missing containers,
+  re-look under the claim, released in `finally`); a held name is a retryable `NegotiationFailed`.
+- **Exit paths.** Every exit sets `leave` and joins every sender (unbounded; a hung source pool holds the drain until
+  STOP) with heartbeats; discoveries are abandoned after `DISCOVERY_JOIN` (5 s). A scheduler exception is logged
+  with its traceback before the drain. A `Thread.start()` failure is a retryable FAILED.
+- **Known, accepted.** RELOAD/UPGRADE reaches senders up to one `STOP_POLL` late (through `leave`); after a reload
+  every unconfirmed parent with children negotiates at once (caps apply, no stagger); "every shallower dataset first"
+  across unrelated trees is no longer promised (ancestor before descendant still is); the `UNREACHABLE` latch can
+  flap ERROR/INFO when two senders see a server that really alternates.
+- **libzfseasy.** `GetCommand._finish` decides "this listing warned" from a per-thread counter
+  (`_thread_name_warnings()`), so concurrent listings no longer raise each other's summary to WARNING.
+
 ## Follow-ups found during Track A (not yet scheduled)
 
 - **`check` docs and residuals, from the last collector review (low; fold into A5):**

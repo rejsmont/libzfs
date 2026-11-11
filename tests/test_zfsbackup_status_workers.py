@@ -32,6 +32,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import _status_workers
+from _sendloop_support import LoopRig, seed_status, wait_for
 from _prune_support import prune_manager, prune_pool, records  # noqa: F401  (fixture)
 from _snapshot_support import frozen_clock, listed_snapshot  # noqa: F401  (frozen_clock: fixture)
 from zfsbackup import daemonlock, health, workers as workers_module
@@ -44,6 +45,7 @@ from zfsbackup.config import (
     RemoteServerConfig,
 )
 from zfsbackup.health import StatusWriter, ensure_status_dir, read_worker_status
+from zfsbackup.sendmemory import TOKEN_SKIPS
 from zfsbackup.stopflag import ReloadEpoch, StopFlag
 from zfsbackup.workers import (
     WORKER_EXIT_RELOAD,
@@ -820,29 +822,40 @@ class TestDiscoverRecord:
         assert health.KIND_DISCOVER == 'discover' and health.KIND_DISCOVER in health.STATUS_KINDS
 
 
+def without_heartbeats(flushes):
+    """The flushes after the first (the start's) without the heartbeat ones `(force=True, heartbeat=True)`."""
+    return [f for f in flushes[1:] if f != (True, True)]
+
+
 class RemoteRig:
-    def __init__(self, run, sdir, mocker, destinations=('off',), names=('pool/a',)):
-        self.sdir, self.run = sdir, run
-        self.rbm = MagicMock(name='RemoteBackupManager')
+    """The REAL `RemoteBackupWorker.run()` (its scheduler and sender threads, `tests/_sendloop_support.py`)
+    over one fake transport and a REAL `StatusWriter` in `sdir`: `go()` runs it until it is quiet."""
+
+    def __init__(self, monkeypatch, sdir, destinations=('off',), names=('pool/a',), epoch=None, status_dir=True):
+        self.sdir = sdir
+        self.names, self.destinations = names, destinations
+        self.config = config_for(*names, destinations=destinations)
+        self.rig = LoopRig(
+            self.config, monkeypatch, status_dir=sdir if status_dir else None, epoch=epoch, born_epoch=0,
+        )
+        self.rbm = self.rig.remote
+        self.rbm.backup_dataset.side_effect = None       # plain doubles: `return_value` rules
         self.rbm.backup_dataset.return_value = True
         self.rbm.last_problem.return_value = None
-        mocker.patch('zfsbackup.remote.RemoteBackupManager', return_value=self.rbm)
-        self.names, self.destinations = names, destinations
-        self.manager = manager_for(*[Dsi(n, destinations) for n in names])
-        self.config = config_for(*names, destinations=destinations)
+        self.manager = self.rig.manager
+        self.stop = self.rig.stop
 
-    def go(self, worker=None, cycles=1):
-        worker = worker or remote_worker(self.sdir, self.config)
-        self.run(worker, self.manager, cycles)
-        return worker
+    def go(self, **kw):
+        self.rig.run(**kw)
+        return self.rig.worker
 
     def records(self):
         return by_key(status(self.sdir, 'remote-backup-worker'))
 
 
 @pytest.fixture
-def rrig(run, sdir, mocker):
-    return RemoteRig(run, sdir, mocker)
+def rrig(monkeypatch, sdir):
+    return RemoteRig(monkeypatch, sdir)
 
 
 @pytest.mark.unit
@@ -898,42 +911,38 @@ class TestRemoteWorkerRecords:
         local.clear_inflight.assert_not_called()
 
     def test_a_pending_stop_makes_a_false_neither_success_nor_failure(self, rrig):
-        worker = remote_worker(rrig.sdir, rrig.config)
-
         def backup(dsi, remote_cfg, should_stop=None):
-            worker.stop_event.set()
+            rrig.stop.set()
             assert should_stop() is True
             return False
 
         rrig.rbm.backup_dataset.side_effect = backup
-        rrig.go(worker)
+        rrig.go()
         assert rrig.records() == {}
         rrig.rbm.last_problem.assert_not_called()
 
-    def test_a_pending_reload_makes_a_false_neither_success_nor_failure(self, run, sdir, mocker):
-        rig = RemoteRig(run, sdir, mocker)
+    def test_a_pending_reload_makes_a_false_neither_success_nor_failure(self, monkeypatch, sdir):
         epoch = ReloadEpoch()
-        worker = remote_worker(sdir, rig.config, reload_epoch=epoch, born_epoch=0)
+        rig = RemoteRig(monkeypatch, sdir, epoch=epoch)
 
         def backup(dsi, remote_cfg, should_stop=None):
             epoch.set(1)
+            assert wait_for(should_stop), 'the scheduler sets `leave` once it sees the epoch move'
             return False
 
         rig.rbm.backup_dataset.side_effect = backup
         with pytest.raises(SystemExit) as exc:
-            rig.go(worker)
+            rig.go()
         assert exc.value.code == WORKER_EXIT_RELOAD
         assert rig.records() == {}
 
     def test_a_true_while_a_stop_is_pending_is_still_a_success(self, rrig):
-        worker = remote_worker(rrig.sdir, rrig.config)
-
         def backup(dsi, remote_cfg, should_stop=None):
-            worker.stop_event.set()
+            rrig.stop.set()
             return True
 
         rrig.rbm.backup_dataset.side_effect = backup
-        rrig.go(worker)
+        rrig.go()
         assert rrig.records()[('send', 'pool/a', 'off')].result == 'ok'
 
     def test_an_exception_is_charged_to_the_destination_in_hand_and_still_logged(self, rrig, caplog):
@@ -944,8 +953,8 @@ class TestRemoteWorkerRecords:
         rec = rrig.records()[('send', 'pool/a', 'off')]
         assert rec.result == 'error' and rec.last_error == 'ConnectionError: reset by peer'
 
-    def test_destinations_are_recorded_independently_and_in_order(self, run, sdir, mocker):
-        rig = RemoteRig(run, sdir, mocker, destinations=('one', 'two', 'three'))
+    def test_destinations_are_recorded_independently(self, monkeypatch, sdir):
+        rig = RemoteRig(monkeypatch, sdir, destinations=('one', 'two', 'three'))
         rig.rbm.backup_dataset.side_effect = lambda dsi, cfg, should_stop=None: cfg.destination != 'two'
         rig.rbm.last_problem.side_effect = lambda ds, dest: f'{dest} is down'
         rig.go()
@@ -953,8 +962,8 @@ class TestRemoteWorkerRecords:
         assert [recs[('send', 'pool/a', d)].result for d in ('one', 'two', 'three')] == ['ok', 'error', 'ok']
         assert recs[('send', 'pool/a', 'two')].last_error == 'two is down'
 
-    def test_an_exception_at_the_second_destination_keeps_the_first_ones_success(self, run, sdir, mocker):
-        rig = RemoteRig(run, sdir, mocker, destinations=('one', 'two'))
+    def test_an_exception_at_the_second_destination_keeps_the_first_ones_success(self, monkeypatch, sdir):
+        rig = RemoteRig(monkeypatch, sdir, destinations=('one', 'two'))
 
         def backup(dsi, cfg, should_stop=None):
             if cfg.destination == 'two':
@@ -967,8 +976,8 @@ class TestRemoteWorkerRecords:
         assert recs[('send', 'pool/a', 'one')].result == 'ok'
         assert recs[('send', 'pool/a', 'two')].last_error == 'RuntimeError: boom'
 
-    def test_a_send_that_is_not_due_records_nothing(self, run, sdir, mocker):
-        rig = RemoteRig(run, sdir, mocker)
+    def test_a_send_that_is_not_due_records_nothing(self, monkeypatch, sdir):
+        rig = RemoteRig(monkeypatch, sdir)
         anchor = SimpleNamespace(name='autosnap_1', age=timedelta(minutes=5))
         rig.manager.get_own_anchor.return_value = 'autosnap_1'
         rig.manager.list_snapshots.return_value = [anchor]
@@ -977,53 +986,85 @@ class TestRemoteWorkerRecords:
         rig.rbm.backup_dataset.assert_not_called()
         assert rig.records() == {}
 
-    def test_each_outcome_is_written_before_the_next_destination_begins(self, run, sdir, mocker):
-        """The next destination may stream for hours."""
-        rig = RemoteRig(run, sdir, mocker, destinations=('one', 'two'))
+    def test_a_pair_attempted_in_the_current_slot_is_not_sent_again_after_a_restart(self, monkeypatch, sdir):
+        """The status file's `last_attempt` is what keeps a restart or a reload from re-sending every pair at once."""
+        seed = StatusWriter(sdir, 'remote-backup-worker')
+        seed.record('send', 'pool/a', 'off', ok=True)
+        seed.flush(force=True)
+        rig = RemoteRig(monkeypatch, sdir)
+        rig.go()
+        rig.rbm.backup_dataset.assert_not_called()
+
+    def test_an_outcome_is_written_while_another_send_is_still_running(self, monkeypatch, sdir):
+        """The other send may stream for hours: a recorded outcome is on disk at once."""
+        rig = RemoteRig(monkeypatch, sdir, destinations=('one', 'two'))
         seen = []
 
         def backup(dsi, cfg, should_stop=None):
-            st = status(sdir, 'remote-backup-worker')
-            seen.append((cfg.destination, None if st is None else sorted(r.destination for r in st.records)))
+            if cfg.destination == 'two':
+                seen.append(wait_for(lambda: ('send', 'pool/a', 'one') in rig.records()))
             return True
 
         rig.rbm.backup_dataset.side_effect = backup
         rig.go()
-        assert seen == [('one', None), ('two', ['one'])]
+        assert seen == [True]
 
-    def test_a_recorded_send_is_flushed_at_once_but_the_no_record_case_is_not(self, run, sdir, mocker, flushes):
-        rig = RemoteRig(run, sdir, mocker)
+    def test_a_recorded_send_is_flushed_at_once_but_the_no_record_case_is_not(self, monkeypatch, sdir, flushes):
+        rig = RemoteRig(monkeypatch, sdir)
         rig.go()
-        # before the dataset, FORCED right after the record, after the dataset, heartbeat, exit
-        assert flushes == [(True, False), (True, False), (False, False), (True, True), (True, False)]
+        # at the start (this incarnation's `started_at` on disk at once), FORCED right after the record, exit;
+        # an extra heartbeat (True, True) in between would only mean a slow host, not a different sequence
+        assert flushes[0] == (True, True) and without_heartbeats(flushes) == [(True, False), (True, False)]
         del flushes[:]
-        worker = remote_worker(sdir, rig.config)
 
         def backup(dsi, remote_cfg, should_stop=None):
-            worker.stop_event.set()
+            rig.stop.set()
             return False
 
         rig.rbm.backup_dataset.side_effect = backup
-        rig.go(worker)
-        assert flushes == [(True, False), (False, False), (True, True), (True, False)]
+        rig.go()
+        assert flushes[0] == (True, True) and without_heartbeats(flushes) == [(True, False)]
 
-    def test_status_keys_are_dataset_destination_pairs(self, rrig):
-        worker = remote_worker(rrig.sdir, rrig.config)
-        keys = worker._status_keys([Dsi('pool/a', ('one', 'two')), Dsi('pool/b', ()), Dsi('pool/c', ('one',))])
-        assert keys == {('pool/a', 'one'), ('pool/a', 'two'), ('pool/c', 'one')}
+    def test_status_records_are_keyed_by_dataset_and_destination(self, monkeypatch, sdir):
+        rig = RemoteRig(monkeypatch, sdir, destinations=('one', 'two'), names=('pool/a', 'pool/b'))
+        rig.go()
+        assert set(rig.records()) == {
+            ('send', 'pool/a', 'one'), ('send', 'pool/a', 'two'),
+            ('send', 'pool/b', 'one'), ('send', 'pool/b', 'two'),
+        }
 
-    def test_a_removed_destination_stops_being_reported(self, run, sdir, mocker):
-        seed = StatusWriter(sdir, 'remote-backup-worker')
-        seed.record('send', 'pool/a', 'old-dest', ok=False, error='x')
-        seed.record('send', 'pool/a', 'off', ok=False, error='x')
-        seed.flush(force=True)
-        rig = RemoteRig(run, sdir, mocker)
+    def test_a_removed_destination_stops_being_reported(self, monkeypatch, sdir):
+        seed_status(sdir, ('pool/a', 'old-dest', False, 'x'), ('pool/a', 'off', False, 'x'))
+        rig = RemoteRig(monkeypatch, sdir)
         rig.go()
         assert sorted(k[2] for k in rig.records()) == ['off']
+
+    def test_a_removed_dataset_stops_being_reported(self, monkeypatch, sdir):
+        seed_status(sdir, ('pool/gone', 'off', False, 'x'))
+        rig = RemoteRig(monkeypatch, sdir)
+        rig.go()
+        assert sorted(k[1] for k in rig.records()) == ['pool/a']
+
+    def test_the_first_flush_is_at_the_start_not_after_the_first_outcome(self, monkeypatch, sdir):
+        """`started_at`/`updated_at` of this incarnation are on disk before any send finishes."""
+        rig = RemoteRig(monkeypatch, sdir)
+        seen = []
+
+        def backup(dsi, cfg, should_stop=None):
+            st = status(sdir, 'remote-backup-worker')
+            seen.append(None if st is None else (st.pid, st.started_at is not None))
+            return True
+
+        rig.rbm.backup_dataset.side_effect = backup
+        rig.go()
+        assert seen == [(os.getpid(), True)]
 
 
 @pytest.mark.unit
 class TestRemoteWorkerSeedsTheSkipCounts:
+    """`_before_loop` seeds the shared `SendMemory`'s `TOKEN_SKIPS` per (dataset, destination) pair from
+    the previous incarnation's status file (it used to hand each manager its own destinations' counts)."""
+
     NOTE = 'resume token check failed'
 
     def seed(self, sdir, *rows):
@@ -1035,40 +1076,43 @@ class TestRemoteWorkerSeedsTheSkipCounts:
                 w.record('send', dataset, dest, ok=True)
         w.flush(force=True)
 
+    def counts(self, rig, *pairs):
+        return {p: rig.rig.memory.count(TOKEN_SKIPS, p) for p in pairs}
+
     def test_the_note_is_the_one_the_manager_writes(self):
         from zfsbackup.remote import TOKEN_SKIP_NOTE
         assert TOKEN_SKIP_NOTE == self.NOTE
 
-    def test_skip_records_seed_their_consecutive_failures(self, run, sdir, mocker):
+    def test_skip_records_seed_their_consecutive_failures(self, monkeypatch, sdir):
         self.seed(sdir, ('pool/a', 'off', 2, f'{self.NOTE}: HTTP 500', False))
-        rig = RemoteRig(run, sdir, mocker)
+        rig = RemoteRig(monkeypatch, sdir)
         rig.go()
-        rig.rbm.seed_token_skips.assert_called_once_with({('pool/a', 'off'): 2})
+        assert self.counts(rig, ('pool/a', 'off')) == {('pool/a', 'off'): 2}
 
-    def test_other_failures_do_not_seed(self, run, sdir, mocker):
+    def test_other_failures_do_not_seed(self, monkeypatch, sdir):
         self.seed(sdir, ('pool/a', 'off', 4, 'connection refused', False))
-        rig = RemoteRig(run, sdir, mocker)
+        rig = RemoteRig(monkeypatch, sdir)
         rig.go()
-        rig.rbm.seed_token_skips.assert_not_called()
+        assert self.counts(rig, ('pool/a', 'off')) == {('pool/a', 'off'): 0}
 
-    def test_a_record_that_has_since_succeeded_does_not_seed(self, run, sdir, mocker):
+    def test_a_record_that_has_since_succeeded_does_not_seed(self, monkeypatch, sdir):
         self.seed(sdir, ('pool/a', 'off', 2, f'{self.NOTE}: x', True))
-        rig = RemoteRig(run, sdir, mocker)
+        rig = RemoteRig(monkeypatch, sdir)
         rig.go()
-        rig.rbm.seed_token_skips.assert_not_called()
+        assert self.counts(rig, ('pool/a', 'off')) == {('pool/a', 'off'): 0}
 
-    def test_each_pair_is_seeded_on_its_own(self, run, sdir, mocker):
+    def test_each_pair_is_seeded_on_its_own(self, monkeypatch, sdir):
         self.seed(sdir, ('pool/a', 'one', 2, f'{self.NOTE}: x', False), ('pool/a', 'two', 1, f'{self.NOTE}: y', False),
                   ('pool/a', 'three', 5, 'other', False))
-        rig = RemoteRig(run, sdir, mocker, destinations=('one', 'two', 'three'))
+        rig = RemoteRig(monkeypatch, sdir, destinations=('one', 'two', 'three'))
         rig.go()
-        rig.rbm.seed_token_skips.assert_called_once_with({('pool/a', 'one'): 2, ('pool/a', 'two'): 1})
+        assert self.counts(rig, *[('pool/a', d) for d in ('one', 'two', 'three')]) == {
+            ('pool/a', 'one'): 2, ('pool/a', 'two'): 1, ('pool/a', 'three'): 0}
 
-    def test_no_writer_no_seed(self, run, mocker):
-        rig = RemoteRig(run, Path('/nonexistent'), mocker)
-        worker = RemoteBackupWorker(rig.config, StopFlag())
-        rig.go(worker)
-        rig.rbm.seed_token_skips.assert_not_called()
+    def test_no_writer_no_seed(self, monkeypatch):
+        rig = RemoteRig(monkeypatch, Path('/nonexistent'), status_dir=False)
+        rig.go()
+        assert self.counts(rig, ('pool/a', 'off')) == {('pool/a', 'off'): 0}
 
 
 # ---------------------------------------------------------------------------

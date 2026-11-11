@@ -95,6 +95,23 @@ class PairOutcome:
     confirmed: Optional[bool] = None
 
 
+def waiting_message(ancestor: str, destination: str, count: int) -> str:
+    """The one WARNING per (ancestor, destination) episode (R-2): `count`
+    descendants wait for `ancestor`'s copy. The sender (`AncestorRule.hold`) and
+    the scheduler (`sendloop.SendLoop`) word it alike and share the `WAITING`
+    latch, so one episode is announced once whoever notices it first."""
+    return (
+        f"{count} descendant{'' if count == 1 else 's'} of {ancestor} wait until "
+        f"its copy at {destination} is confirmed in this run (a negotiate that finds "
+        f"the copy, or an acknowledged send); they are not sent until then"
+    )
+
+
+def released_message(ancestor: str, destination: str) -> str:
+    """The INFO that ends that episode."""
+    return f"{ancestor} is confirmed at {destination}: its descendants follow"
+
+
 class LazySender:
     """A sender that is resolved only if the pair gets past R-2. `resolve()`
     returns the manager (or raises: what a missing local backup manager does,
@@ -221,9 +238,7 @@ class AncestorRule:
         key = (ancestor.name, destination)
         if self.confirmed(manager, ancestor, destination):
             if self.memory.clear(WAITING, key):
-                logger.info(
-                    f"{ancestor.name} is confirmed at {destination}: its descendants follow"
-                )
+                logger.info(released_message(ancestor.name, destination))
             return None
         snapshots = manager.list_snapshots(dsi)
         if not snapshots:
@@ -236,12 +251,7 @@ class AncestorRule:
             logger.debug(f"No snapshots available to send for {dsi.name}")
             return HOLD_NO_SNAPSHOTS
         if self.memory.note(WAITING, key):
-            count = self.dependents.get(key, 1)
-            logger.warning(
-                f"{count} descendant{'' if count == 1 else 's'} of {ancestor.name} wait until "
-                f"its copy at {destination} is confirmed in this run (a negotiate that finds "
-                f"the copy, or an acknowledged send); they are not sent until then"
-            )
+            logger.warning(waiting_message(ancestor.name, destination, self.dependents.get(key, 1)))
         logger.debug(f"{dsi.name} -> {destination}: waiting for {ancestor.name}")
         return HOLD_WAITING
 

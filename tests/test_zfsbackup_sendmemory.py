@@ -17,8 +17,8 @@ Pinned here:
 Nothing reaches `zfs`, a database or a network.
 
 Mutation-checked (scratch copy): replacing the lock of `SendMemory` by a no-op context manager fails
-5 of the stress tests here (`note` winners, `incr` totals, `note_value` winners, the expiry window
-claims and the mixed run).
+5 of the stress tests here (`incr` totals, the shared pending key, `replace_group`, one holder per claimed
+name, and the mixed run).
 """
 
 import copy
@@ -548,6 +548,58 @@ class _GuardedMemory(SendMemory):
         return super()._map(name)
 
 
+# ---------------------------------------------------------------------------------------------
+# claims (B3: the local negotiate's missing ancestors)
+# ---------------------------------------------------------------------------------------------
+
+
+class TestClaims:
+    """`claim(names)` / `release(names)`: all-or-nothing, never blocking, not reentrant."""
+
+    def test_free_names_are_claimed(self, mem):
+        assert mem.claim(['bk/c1', 'bk/c1/pool']) is True
+
+    def test_a_held_name_refuses_and_takes_nothing(self, mem):
+        assert mem.claim(['a']) is True
+        assert mem.claim(['b', 'a', 'c']) is False
+        assert mem.claim(['b', 'c']) is True, 'a refused claim took none of its other names'
+
+    def test_release_frees_the_names(self, mem):
+        mem.claim(['a', 'b'])
+        mem.release(['a'])
+        assert mem.claim(['a']) is True and mem.claim(['b']) is False
+
+    def test_release_is_idempotent_and_ignores_names_nobody_holds(self, mem):
+        mem.release(['never-claimed'])
+        mem.claim(['a'])
+        mem.release(['a'])
+        mem.release(['a'])
+        assert mem.claim(['a']) is True
+
+    def test_it_is_not_reentrant(self, mem):
+        assert mem.claim(['a']) is True
+        assert mem.claim(['a']) is False
+
+    def test_an_empty_claim_succeeds_and_holds_nothing(self, mem):
+        assert mem.claim([]) is True
+        assert mem.claim([]) is True
+
+    def test_it_never_blocks(self, mem):
+        mem.claim(['a'])
+        done = threading.Event()
+        threading.Thread(target=lambda: (mem.claim(['a']), done.set()), daemon=True).start()
+        assert done.wait(10), 'a claim on a held name returns at once'
+
+    def test_names_may_be_any_hashable_and_tables_are_separate_from_latches(self, mem):
+        assert mem.claim([('d', 1), 'x']) is True
+        assert mem.note(CLOCK, 'x') is True, 'the claims table is not a latch table'
+
+    def test_it_accepts_any_iterable(self, mem):
+        assert mem.claim(iter(['a', 'b'])) is True
+        mem.release(n for n in ['a', 'b'])
+        assert mem.claim(['a', 'b']) is True
+
+
 #: Every public operation, with arguments that make it touch its table.
 _OPERATIONS = {
     'note': lambda m: m.note(CLOCK, 'k'),
@@ -570,6 +622,8 @@ _OPERATIONS = {
     'pending_active': lambda m: m.pending_active('c', 5.0, 2.0),
     'pending_clear': lambda m: m.pending_clear('c'),
     'claim_expiry_check': lambda m: m.claim_expiry_check(10.0, 1.0),
+    'claim': lambda m: m.claim(['a', 'b']),
+    'release': lambda m: m.release(['a', 'b']),
     'latch_view': lambda m: m.latch_view(CLOCK),
     'counter_view': lambda m: m.counter_view(TOKEN_SKIPS),
     'value_view': lambda m: m.value_view(REFUSALS),
@@ -780,6 +834,54 @@ class TestStress:
 
         assert run_threads(work) == []
         assert len(won) == 1
+
+    def test_a_claimed_name_is_held_by_exactly_one_thread_at_a_time(self, mem):
+        """Threads claim, hold, check nobody else holds it and release: the critical sections never overlap."""
+        inside = [0]
+        worst = [0]
+        guard = threading.Lock()
+        claimed = [0] * THREADS
+
+        def work(t):
+            for _ in range(OPS):
+                if mem.claim(['shared']):
+                    with guard:
+                        inside[0] += 1
+                        worst[0] = max(worst[0], inside[0])
+                    claimed[t] += 1
+                    with guard:
+                        inside[0] -= 1
+                    mem.release(['shared'])
+
+        assert run_threads(work) == []
+        assert worst[0] == 1, 'two threads held the claim at once'
+        assert sum(claimed) >= 1
+        assert mem.claim(['shared']) is True, 'every claim was released'
+
+    def test_a_claim_is_all_or_nothing_under_contention(self, mem):
+        """Threads claim overlapping name pairs; a winner holds BOTH names of its pair, never one."""
+        pairs = [('n0', 'n1'), ('n1', 'n2'), ('n2', 'n3'), ('n3', 'n0')]
+        holders: dict = {}
+        guard = threading.Lock()
+        violations = []
+
+        def work(t):
+            mine = pairs[t % len(pairs)]
+            for _ in range(OPS):
+                if mem.claim(mine):
+                    with guard:
+                        for name in mine:
+                            if name in holders:
+                                violations.append((name, holders[name], t))
+                            holders[name] = t
+                    with guard:
+                        for name in mine:
+                            holders.pop(name, None)
+                    mem.release(mine)
+
+        assert run_threads(work) == []
+        assert violations == []
+        assert all(mem.claim([n]) for n in ('n0', 'n1', 'n2', 'n3'))
 
     def test_the_mixed_run(self, mem):
         """Every operation at once, from every thread, over shared and own keys."""

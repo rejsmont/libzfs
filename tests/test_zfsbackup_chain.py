@@ -984,3 +984,65 @@ class TestNoTransportImports:
             'requests': 'True', 'websocket': 'True', 'zfsbackup.identity': 'True',
             'zfsbackup.remote': 'True', 'zfsbackup.chain': 'True',
         }
+
+
+@pytest.mark.unit
+class TestLastProblemOwnRefusal:
+    """B3 review (CC 3): senders of one destination share the `REFUSALS` table, so a sibling's pop or
+    replacement between this call's refusal and its classification must not erase the status text.
+    `last_problem` reads the call's OWN message first (`_call_refusal_messages`); the shared table is only
+    for a key this call recorded no message for; `_forget_refusal` ends a refusal in both places."""
+
+    KEY = (DS, DEST)
+
+    def sender(self, rig_factory):
+        rig = rig_factory()
+        rig.sender._log_refusal_once(self.KEY, 'refused: not enrolled')
+        return rig.sender
+
+    def test_the_own_message_is_reported(self, rig_factory):
+        assert self.sender(rig_factory).last_problem(DS, DEST) == 'refused: not enrolled'
+
+    def test_a_siblings_pop_cannot_erase_it(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        sender = self.sender(rig_factory)
+        sender._memory.pop(REFUSALS, self.KEY)                       # another sender's good answer
+        assert sender.last_problem(DS, DEST) == 'refused: not enrolled'
+
+    def test_a_siblings_replacement_cannot_change_it(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        sender = self.sender(rig_factory)
+        sender._memory.put(REFUSALS, self.KEY, 'a different refusal')
+        assert sender.last_problem(DS, DEST) == 'refused: not enrolled'
+
+    def test_the_warning_variant_is_kept_too(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        rig = rig_factory()
+        rig.sender._log_warning_once(self.KEY, 'will heal')
+        rig.sender._memory.pop(REFUSALS, self.KEY)
+        assert rig.sender.last_problem(DS, DEST) == 'will heal'
+
+    def test_forget_refusal_ends_it_in_the_memory_and_in_the_call(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        sender = self.sender(rig_factory)
+        assert sender._forget_refusal(self.KEY) == 'refused: not enrolled'
+        assert sender.last_problem(DS, DEST) is None
+        assert self.KEY not in sender._call_refusals and self.KEY not in sender._call_refusal_messages
+        assert sender._memory.get(REFUSALS, self.KEY) is None
+
+    def test_forgetting_what_is_not_there_is_harmless(self, rig_factory):
+        assert rig_factory().sender._forget_refusal(self.KEY) is None
+
+    def test_a_key_without_an_own_message_falls_back_to_the_shared_table(self, rig_factory):
+        """`(None, destination)`: a refusal an EARLIER call on this manager logged."""
+        from zfsbackup.sendmemory import REFUSALS
+        rig = rig_factory()
+        rig.sender._memory.put(REFUSALS, (None, DEST), 'earlier refusal')
+        rig.sender._call_refusals.add((None, DEST))
+        assert rig.sender.last_problem(DS, DEST) == 'earlier refusal'
+
+    def test_the_next_call_starts_with_no_own_messages(self, rig_factory):
+        rig = rig_factory(listing(S1))
+        rig.sender._log_refusal_once(self.KEY, 'refused')
+        rig.run()
+        assert self.KEY not in rig.sender._call_refusal_messages

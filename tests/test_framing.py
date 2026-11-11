@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import libzfseasy as zfs
+from _timer_support import timer_stretch
 from libzfseasy.types import (
     Bookmark, Dataset, Filesystem, InvalidNameError, InvalidValueError, Property, Snapshot, Validate, Volume, ZFS,
 )
@@ -253,6 +254,16 @@ def _get_rows(name, dstype='filesystem', explicit=False, **props):
     for prop, value in props.items():
         rows.append((name, prop.replace('__', ':'), value, '-', 'local'))
     return rows
+
+
+_STRETCH = []
+
+
+def bound(seconds=30.0):
+    """A hard bound for a wait that normally takes milliseconds, scaled by this host's timer (`timer_stretch()`)."""
+    if not _STRETCH:
+        _STRETCH.append(max(1.0, timer_stretch()))
+    return seconds * _STRETCH[0]
 
 
 def _bounded(fn, timeout=30):
@@ -2542,6 +2553,79 @@ class TestSkippedNamesSummary:
         _skip_invalid_name('pool/.a', err)
         _skip_invalid_name('pool/.b', err)
         assert zfs_module._name_warnings == before + 2
+
+    @pytest.mark.unit
+    @pytest.mark.subprocess
+    @pytest.mark.parametrize('cmd', ['get', 'list'])
+    def test_a_concurrent_listings_warning_does_not_raise_this_listings_summary_level(
+            self, monkeypatch, caplog, cmd):
+        """Two listings run in two threads (the remote worker's sender and discovery threads). B meets only a name
+        that was reported long ago; A meets a fresh one and logs its per-name WARNING while B is in the middle of its
+        listing. B's summary must stay at DEBUG and A's is the WARNING: whether a listing warned is decided by what
+        THAT listing's thread logged, not by the process-wide counter (`zfs get` diffed it around `_build` and used to
+        turn B's summary into a WARNING; `zfs list` always used the return value of `_skip_invalid_name`).
+
+        Forced order: B snapshots (inside its parse of the bad name), A runs its whole listing, B resumes."""
+        err = InvalidNameError('x')
+        _skip_invalid_name('pool/.old', err)                       # reported already: B's name
+        moved_before = zfs_module._name_warnings
+        caplog.clear()
+        rows = {'A': 'pool/.fresh', 'B': 'pool/.old'}
+        b_inside, a_done = threading.Event(), threading.Event()
+
+        def stdout_for(who):
+            if cmd == 'list':
+                return _rows((rows[who], 'filesystem'), ('pool/ok', 'filesystem'))
+            return _rows(*_get_rows(rows[who]), *_get_rows('pool/ok'))
+
+        def popen(argv, *args, **kwargs):
+            return _Proc(stdout_for(threading.current_thread().name))
+
+        monkeypatch.setattr(subprocess, 'Popen', popen)
+
+        def pause_b(real):
+            def wrapper(*args, **kwargs):
+                result = real(*args, **kwargs)
+                if threading.current_thread().name == 'B':
+                    b_inside.set()
+                    assert a_done.wait(bound(30)), 'A never finished'
+                return result
+            return wrapper
+
+        if cmd == 'get':
+            monkeypatch.setattr(GetCommand, '_build', staticmethod(pause_b(GetCommand._build)))
+        else:
+            monkeypatch.setattr(zfs_module, '_skip_invalid_name', pause_b(zfs_module._skip_invalid_name))
+
+        def run():
+            command = GetCommand()(properties='all') if cmd == 'get' else ListCommand()()
+            return [o.name for o in command]
+
+        results, errors = {}, []
+
+        def body(who):
+            try:
+                results[who] = run()
+            except BaseException as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        with caplog.at_level(logging.DEBUG, logger='libzfseasy'):
+            b = threading.Thread(target=body, args=('B',), name='B')
+            a = threading.Thread(target=body, args=('A',), name='A')
+            b.start()
+            assert b_inside.wait(bound(30)), 'B never reached its name'
+            a.start()
+            a.join(bound(30))
+            a_done.set()
+            b.join(bound(30))
+        assert not (a.is_alive() or b.is_alive()) and errors == []
+        assert results == {'A': ['pool/ok'], 'B': ['pool/ok']}
+        assert self._summaries(caplog, cmd) == [
+            (logging.WARNING, self._wording(1, cmd)),      # A's: its own fresh name was reported
+            (logging.DEBUG, self._wording(1, cmd)),        # B's: only a name reported long ago
+        ]
+        assert zfs_module._name_warnings == moved_before + 1
+        assert len(self._per_name(caplog)) == 1
 
     # list ----------------------------------------------------------------------------------------------------------
 

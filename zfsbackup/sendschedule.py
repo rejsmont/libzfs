@@ -483,8 +483,10 @@ class SendSchedule:
             if st.confirmed or not st.children:
                 st.confirm_due = False
             elif not st.confirm_used and not st.confirm_due:
-                # Unconfirmed, children waiting, never asked: due once, now.
-                st.confirm_due, st.confirm_at = True, now
+                # Unconfirmed, children waiting, never asked: due once, now,
+                # but no earlier than a pending retry (its backoff governs).
+                st.confirm_due = True
+                st.confirm_at = now if st.retry_at is None else max(now, st.retry_at)
 
     # -- queries -------------------------------------------------------------
 
@@ -860,9 +862,16 @@ class SendSchedule:
         if kind is Outcome.RETRYABLE and st.retries_used < len(RETRY_DELAYS):
             st.retry_at = now + RETRY_DELAYS[st.retries_used]
             st.retries_used += 1
+            # A confirmation armed while it ran (`_link`, a discovery that
+            # returned meanwhile) must not make a failed pair due again before
+            # its own backoff: that would record the failure twice.
+            if st.confirm_due:
+                st.confirm_at = max(st.confirm_at, st.retry_at)
             return False
         st.retries_used = 0
         st.retry_at = now + FAILURE_RETRY_CAP
+        if st.confirm_due:
+            st.confirm_at = max(st.confirm_at, st.retry_at)
         return True
 
     def confirmed(self, key: Tuple[str, str]) -> None:

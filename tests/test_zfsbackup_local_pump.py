@@ -714,3 +714,76 @@ class TestPumpOverFakeHandles:
         pump.close()
         assert pump.receive_error == 'cannot receive: bad stream'
         assert send.terminated, "the send was stopped"
+
+
+# ---------------------------------------------------------------------------------------------
+# B3: several pumps in one process (the remote worker runs up to four sends at once)
+# ---------------------------------------------------------------------------------------------
+
+
+class TestConcurrentPumps:
+    """A smoke test of the concurrency the remote worker now has: four sender threads each run a `_Pump` over
+    a real send/receive pair while another thread keeps spawning children (the other senders' `zfs list`/`get`,
+    a discovery). Pinned: all four streams arrive hash-equal within a hard bound, every receive saw EOF (none
+    hangs at the commit bound), the spawning thread really did spawn meanwhile, and nothing is left running.
+
+    It does NOT detect a missing `close_fds` on the children: since PEP 446 every pipe fd is created
+    non-inheritable, so a child spawned by one thread cannot inherit another pump's pipe ends on this platform
+    either way (the `close_fds=False` mutation survives, by design)."""
+
+    PUMPS = 4
+
+    def test_four_pumps_at_once_every_receive_sees_eof_while_other_threads_spawn_children(self, children, tmp_path):
+        import threading
+
+        from _sendloop_support import bound
+
+        payloads = []
+        for i in range(self.PUMPS):
+            src = tmp_path / f'src{i}.bin'
+            src.write_bytes(os.urandom(2 * 1024 * 1024 + 17 * i))
+            payloads.append(types.SimpleNamespace(src=src, dst=tmp_path / f'dst{i}.bin', data=src.read_bytes()))
+        results, errors = {}, []
+        go = threading.Barrier(self.PUMPS + 1)
+        stop, warm = threading.Event(), threading.Event()
+
+        def pump_thread(i):
+            p = payloads[i]
+            try:
+                go.wait(bound())
+                warm.wait(bound())                  # spawning is under way before the first pump starts
+                results[i] = pump_run(children, script(SEND_FILE, p.src), script(RECV_SINK, p.dst))
+            except BaseException as e:  # noqa: BLE001
+                errors.append((i, repr(e)))
+
+        spawned = []
+
+        def spawner():
+            try:
+                go.wait(bound())
+                while not stop.is_set():
+                    handle = children.send(script('pass'), peek=False)
+                    spawned.append(handle)
+                    handle.close()
+                    if len(spawned) >= 3:
+                        warm.set()
+                    time.sleep(0.005)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(('spawner', repr(e)))
+                warm.set()
+
+        threads = [threading.Thread(target=pump_thread, args=(i,), daemon=True) for i in range(self.PUMPS)]
+        spawn = threading.Thread(target=spawner, daemon=True)
+        for t in threads + [spawn]:
+            t.start()
+        for t in threads:
+            t.join(bound(90))
+        stop.set()
+        spawn.join(bound())
+        assert not any(t.is_alive() for t in threads), 'a pump never finished: a receive did not see EOF'
+        assert errors == []
+        assert len(spawned) >= 3, 'the other threads really did spawn children meanwhile (and before the pumps began)'
+        for i, p in enumerate(payloads):
+            assert results[i].outcome == local.PUMP_OK, i
+            assert results[i].pump.send_error is None and results[i].pump.receive_error is None
+            assert sha(p.dst.read_bytes()) == sha(p.data), f'pump {i}: the stream arrived intact'
