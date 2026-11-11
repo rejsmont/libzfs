@@ -177,6 +177,19 @@
 #              token stays usable (C then enrolls under its own id with it); `identity set-client-id` of an enrolled id is refused;
 #              nothing is created under T/<server id>; `list destinations` shows `local (shared)`; `trust revoke --client <server id>` clears B
 #      Not covered: the loopback -> shared switch of an already running host (a destination URL change with copies in place).
+#   T  a RECURSIVE tree over the network (sender rework Track A, docs/sender_rework_plan.md; needs a tree with `expand_recursive`, else
+#      skipped). Fresh pools. The client has one entry, zbclient/tree (`recursive: true`), with an ENCRYPTED child (raw), its grandchild, an
+#      unencrypted child, children created (and one destroyed) mid-run, and a backup copy planted below it:
+#        T1  parent-first fulls: one server copy per descendant at <target>/<client id>/<pool>/<path>, plain or raw per child, the forced
+#            properties, LOCAL client_id / source_dataset and a stamped config naming the CHILD (recursive false), and a LOCAL anchor per
+#            child on the client (the inherited-anchor regression)
+#        T2  a backlog of three recursive snapshots goes out as a chain of incremental steps for every child
+#        T3  `late` and `gone` appear mid-run and are sent; `gone` is destroyed on the client: its server copy stays and the server's
+#            pruner thins it to its newest snapshot by the retention stamped on it
+#        T4  `zfsbackup-config check --json` on the client: one OK anchor entry per dataset x destination; `gone` is gone from it
+#        T5  a backup copy planted below the recursive dataset is never snapshotted (one atomic zfs snapshot over the source datasets: one
+#            createtxg), never sent, never pruned (a snapshot name it holds is kept across the tree, one it lacks is pruned), and `check`
+#            shows a `copies` WARN naming it
 # H, I and J need a real pool but little space (J: ~1.2 GiB per VM); they run after E-G, and also with --no-big.
 # E-G throttle the client's egress with `tc` (tbf) so a send lasts long enough to act on; the
 # throttle is always removed again (also on error). They write ~3 GiB per VM: the VMs need ~10G disk
@@ -202,6 +215,8 @@
 #   ./scenarios/test_two_vm_backup.sh --no-r     # everything except scenario R
 #   ./scenarios/test_two_vm_backup.sh --only-s   # provision, then only scenario S (local destination sharing the server's target)
 #   ./scenarios/test_two_vm_backup.sh --no-s     # everything except scenario S
+#   ./scenarios/test_two_vm_backup.sh --only-t   # provision, then only scenario T (a recursive tree over the network)
+#   ./scenarios/test_two_vm_backup.sh --no-t     # everything except scenario T
 #   ./scenarios/test_two_vm_backup.sh --purge    # delete the two VMs (and only those) at the end
 #   SRC_REF=<commit-ish> ./scenarios/test_two_vm_backup.sh   # ship that tree instead of HEAD; SRC_REF=WORKTREE ships the
 #                                                # working tree as it is, untracked files included (built from a throwaway
@@ -270,8 +285,8 @@ SNAP_TIMEOUT=120         # ~4 snapshot periods
 
 # Flags
 PURGE=0; KEEP_POOLS=0; KEEP=0; BIG=1
-ONLY_J=0; ONLY_K=0; ONLY_L1=0; ONLY_L2=0; ONLY_M=0; ONLY_B2=0; ONLY_R=0; ONLY_S=0
-NO_J=0;   NO_K=0;   NO_L1=0;   NO_L2=0;   NO_M=0;   NO_B2=0;   NO_R=0;   NO_S=0
+ONLY_J=0; ONLY_K=0; ONLY_L1=0; ONLY_L2=0; ONLY_M=0; ONLY_B2=0; ONLY_R=0; ONLY_S=0; ONLY_T=0
+NO_J=0;   NO_K=0;   NO_L1=0;   NO_L2=0;   NO_M=0;   NO_B2=0;   NO_R=0;   NO_S=0;   NO_T=0
 for arg in "$@"; do
     case "$arg" in
         --purge)      PURGE=1 ;;
@@ -292,6 +307,8 @@ for arg in "$@"; do
         --no-r)       NO_R=1 ;;       # everything except scenario R
         --only-s)     ONLY_S=1 ;;     # provision + scenario S (a local destination sharing the server's target) only
         --no-s)       NO_S=1 ;;       # everything except scenario S
+        --only-t)     ONLY_T=1 ;;     # provision + scenario T (a recursive tree over the network) only
+        --no-t)       NO_T=1 ;;       # everything except scenario T
         --no-j)       NO_J=1 ;;       # everything except scenario J
         --keep)       KEEP=1; KEEP_POOLS=1 ;;
         -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -301,8 +318,8 @@ done
 
 # Which scenario blocks run. With any --only-X flag set, exactly the blocks flagged run (A-I count as "default" and run
 # only when no --only-X is given); otherwise everything runs except the blocks named by --no-X.
-ONLY_ANY=$((ONLY_J + ONLY_K + ONLY_L1 + ONLY_L2 + ONLY_M + ONLY_B2 + ONLY_R + ONLY_S))
-scn_enabled() { # scn_enabled j|k|l1|l2|m|b2|r|s
+ONLY_ANY=$((ONLY_J + ONLY_K + ONLY_L1 + ONLY_L2 + ONLY_M + ONLY_B2 + ONLY_R + ONLY_S + ONLY_T))
+scn_enabled() { # scn_enabled j|k|l1|l2|m|b2|r|s|t
     local up only no; up="$(printf '%s' "$1" | tr 'a-z' 'A-Z')"; only="ONLY_$up"; no="NO_$up"
     if [ "$ONLY_ANY" -gt 0 ]; then [ "${!only}" -eq 1 ]; else [ "${!no}" -eq 0 ]; fi
 }
@@ -885,6 +902,17 @@ for vm in "$SERVER_VM" "$CLIENT_VM"; do
     fi
 done
 [ "$R_READY" -eq 1 ] || warn "shipped tree ($SRC_REF) has no \`zfsbackup-config backup\`: scenario R will be skipped"
+
+# Recursive sends (sender rework Track A): scenario T.
+T_READY=1
+for vm in "$SERVER_VM" "$CLIENT_VM"; do
+    if msh "$vm" "grep -q 'expand_recursive' '$SRC_DIR/zfsbackup/backup_manager.py'"; then
+        info "$vm: shipped tree has recursive sends (backup_manager.py expand_recursive)"
+    else
+        warn "$vm: shipped tree ($SRC_REF) lacks recursive sends: scenario T will be skipped (SRC_REF=WORKTREE ships the working tree)"
+        T_READY=0
+    fi
+done
 
 SERVER_IP="$(vm_ip "$SERVER_VM")"; [ -n "$SERVER_IP" ] || die "could not determine $SERVER_VM IP"
 put_jget "$SERVER_VM"; put_jget "$CLIENT_VM"
@@ -4424,6 +4452,286 @@ else
 
     stop_daemon "$CLIENT_VM"; stop_daemon "$SERVER_VM"
     msh "$CLIENT_VM" "rm -rf /var/lib/zfsbackup-b /var/lib/zfsbackup-c /tmp/zfsb-token-s-b /tmp/zfsb-token-s-c" || true
+fi
+
+# ═════════════ Scenario T: a recursive tree over the real network (sender rework, Track A; plan item A6b) ═════════════
+# docs/sender_rework_plan.md (Track A), README "Recursive datasets". Fresh pools and DBs, quiet-ish config: the client has ONE dataset entry,
+# `zbclient/tree` (recursive: true, snapshot frequency 30s, source retention 1s:1d, remote retention 1s:120s for the copies), with
+#   tree/enc         encrypted, its own encryption root       -> a RAW copy
+#   tree/enc/inner   inherits that encryption (grandchild)    -> a RAW copy
+#   tree/plain       unencrypted                              -> a plain copy
+#   tree/late, tree/gone   created while the daemon runs; `gone` is destroyed again
+#   tree/replica     (planted in T5) a BACKUP COPY: carries org.zfsbackup:client_id / source_dataset
+# The server (prune 20s) holds one copy per descendant at <target>/<client id>/<pool>/<path>, each stamped with ITS OWN config (the child's
+# name, recursive false, the 1s:120s retention).
+#   T1  parent-first fulls: every descendant has its own copy, plain or raw per child, the forced properties, LOCAL client_id /
+#       source_dataset / config, and its own LOCAL anchor on the client (the inherited-anchor regression)
+#   T2  a backlog of three recursive snapshots goes out as a chain for every child
+#   T3  `late` and `gone` appear mid-run and are sent (full, then incrementals); `gone` is destroyed on the client: its server copy stays and
+#       the SERVER's pruner thins it to its newest snapshot by the retention stamped on it
+#   T4  `zfsbackup-config check --json` on the client: one OK anchor entry per dataset x destination, `gone` is no longer listed
+#   T5  a backup copy planted below the recursive dataset on the client is never snapshotted (one atomic zfs snapshot over the source
+#       datasets: one createtxg), never sent (nothing under the server's target), never pruned (a snapshot name it holds is kept across the
+#       tree; a name it lacks is pruned), and `check` shows a `copies` WARN naming it
+T_TOP="${CLIENT_POOL}/tree"; T_ENC="${T_TOP}/enc"; T_INNER="${T_ENC}/inner"; T_PLAIN="${T_TOP}/plain"
+T_LATE="${T_TOP}/late"; T_GONE="${T_TOP}/gone"; T_REPL="${T_TOP}/replica"
+T_KEY="/root/zfsb-t.key"; T_RET=120
+t_all=("$T_TOP" "$T_ENC" "$T_INNER" "$T_PLAIN")
+t_sds()    { printf '%s' "${TARGET_DS}/${CLIENT_ID}/$1"; }                                                                  # the server's copy of client dataset $1
+t_get()    { msh "$1" "zfs get -H -o value $2 '$3' 2>/dev/null" | tr -d '[:space:]'; }                                         # t_get <vm> <prop> <dataset>
+t_gets()   { msh "$1" "zfs get -H -o value,source $2 '$3' 2>/dev/null" | tr '\t' ' ' | tr -s ' ' | sed 's/ *$//'; }           # "value source"
+t_snaps()  { msh "$1" "zfs list -H -d 1 -t snapshot -s createtxg -o name '$2' 2>/dev/null" | sed 's/.*@//' | grep -v '^$' || true; }   # t_snaps <vm> <dataset>
+t_exists() { msh "$1" "zfs list -H -o name '$2' >/dev/null 2>&1 && echo yes || echo no" | tr -d '[:space:]'; }                   # t_exists <vm> <dataset or snapshot>
+t_local_anchor() { local v; v="$(t_gets "$CLIENT_VM" "org.zfsbackup:anchor.${DEST_NAME}" "$1")"; case "$v" in *" local") printf '%s' "${v% local}" ;; esac; }
+t_has()    { local cg sg; cg="$(guid "$CLIENT_VM" "$1@$2")"; sg="$(guid "$SERVER_VM" "$(t_sds "$1")@$2")"; [ -n "$cg" ] && [ "$cg" = "$sg" ]; }   # t_has <client ds> <snap>: on its server copy, same guid
+t_idx()    { t_snaps "$CLIENT_VM" "$1" | grep -nx "$2" | cut -d: -f1 | head -n1; }
+t_cfg()    { msh "$SERVER_VM" "zfs get -H -o value -s local org.zfsbackup:config '$(t_sds "$1")' | base64 -d 2>/dev/null | '$PY' '$JGET_PY' '$2'" | tr -d '[:space:]'; }   # t_cfg <client ds> '<expr over the stamped config d>'
+t_write() { msh "$CLIENT_VM" "dd if=/dev/urandom of=\$(zfs get -H -o value mountpoint '$1')/$2 bs=1M count=$3 status=none"; }                 # t_write <ds> <file> <MiB>
+t_snap_r() { # a recursive snapshot of the whole tree on the client, taken now (the 2 s sleep keeps names apart); prints the short name
+    local n="" i
+    for i in 1 2 3; do
+        sleep 2
+        n="$(msh "$CLIENT_VM" "n=autosnap_\$(date -u +%Y%m%d%H%M%S); zfs snapshot -r '$T_TOP'@\$n && echo \$n" | tr -d '[:space:]')"
+        [ -n "$n" ] && break
+    done
+    printf '%s' "$n"
+}
+T_N=""
+t_copies_have() { local d; for d in "$@"; do t_has "$d" "$T_N" || return 1; done; }      # every dataset in "$@" has $T_N on its server copy with the client's guid
+t_first_done() { local d; for d in "${t_all[@]}"; do [ -n "$(t_snaps "$SERVER_VM" "$(t_sds "$d")")" ] && [ -n "$(t_local_anchor "$d")" ] || return 1; done; }
+t_anchor_states() { ck_expr "$CLIENT_VM" '",".join(sorted(e["subject"] + ":" + e.get("peer", "") + "=" + e["state"] for e in d["entries"] if e["source"] == "anchor"))' | tr -d '[:space:]'; }
+t_entries() { ck_expr "$CLIENT_VM" '"; ".join("%s:%s %s=%s" % (e["source"], e["subject"], e.get("peer", ""), e["state"]) for e in d["entries"])'; }
+t_wait() { local waited=0 timeout="$1"; shift; until "$@"; do [ "$waited" -ge "$timeout" ] && return 1; sleep 3; waited=$((waited+3)); done; }
+write_t_config() {
+    local pin_line=""
+    [ -n "$PIN_FP" ] && pin_line="    server_fingerprint: \"${PIN_FP}\""
+    step "Writing client config on $CLIENT_VM (scenario T: recursive $T_TOP)"
+    put_config "$CLIENT_VM" <<EOF
+# zfsbackup CLIENT config (scenario T)
+snapshot_prefix: "autosnap"
+check_interval: "15s"
+prune_interval: "20s"
+destinations:
+  ${DEST_NAME}:
+    url: "https://${SERVER_IP}:${API_PORT}"
+${pin_line}
+datasets:
+  - name: "${T_TOP}"
+    enabled: true
+    frequency: "30s"
+    recursive: true
+    retention:
+      "1s": "1d"
+    remote:
+      - destination: ${DEST_NAME}
+        frequency: "20s"
+        retention:
+          "1s": "${T_RET}s"
+EOF
+}
+
+echo
+step "SCENARIO T — a recursive tree over the network: every descendant is its own copy (raw where encrypted), children come and go, a planted backup copy is left alone"
+if ! scn_enabled t; then
+    info "scenario T skipped (--no-t / another --only-X)"
+elif [ "$T_READY" -ne 1 ]; then
+    warn "scenario T skipped: the shipped tree has no recursive sends (expand_recursive; SRC_REF=WORKTREE ships the working tree)"
+else
+    TARGET_DS="${SERVER_POOL}/backups"
+    stop_daemon "$SERVER_VM"; stop_daemon "$CLIENT_VM"
+    remove_config "$SERVER_VM"; remove_config "$CLIENT_VM"
+    recreate_pool "$SERVER_VM" "$SERVER_POOL"; recreate_pool "$CLIENT_VM" "$CLIENT_POOL"
+    msh "$SERVER_VM" "zfs create -p '$TARGET_DS'" || die "(T) failed to create $TARGET_DS"
+    msh "$CLIENT_VM" "
+        set -e
+        printf '%s' 'zfsb-t-client-passphrase-0001' > '$T_KEY'; chmod 600 '$T_KEY'
+        zfs create '$T_TOP'
+        zfs create -o encryption=on -o keyformat=passphrase -o keylocation=file://$T_KEY '$T_ENC'
+        zfs create '$T_INNER'
+        zfs create '$T_PLAIN'
+        for d in '$T_TOP' '$T_ENC' '$T_INNER' '$T_PLAIN'; do dd if=/dev/urandom of=\$(zfs get -H -o value mountpoint \$d)/seed.bin bs=1M count=2 status=none; done
+        zfs list -H -r -o name,encryption,keystatus,encryptionroot '$T_TOP'
+    " || die "(T) could not create the tree under $T_TOP"
+    check "(T) precondition: enc and enc/inner are encrypted with a loaded key and share one encryption root; the parent and plain are not" "yes yes $T_ENC $T_ENC off off" \
+        "$([ "$(t_get "$CLIENT_VM" encryption "$T_ENC")" != off ] && echo yes) $([ "$(t_get "$CLIENT_VM" encryption "$T_INNER")" != off ] && echo yes) $(t_get "$CLIENT_VM" encryptionroot "$T_ENC") $(t_get "$CLIENT_VM" encryptionroot "$T_INNER") $(t_get "$CLIENT_VM" encryption "$T_TOP") $(t_get "$CLIENT_VM" encryption "$T_PLAIN")"
+    SERVER_PRUNE="20s"; PIN_FP=""; CLIENT_ID=""
+    write_server_config
+    write_t_config
+    start_daemon "$SERVER_VM"
+    wait_health || die "(T) server API never became healthy"
+    enroll_client
+    tmark_c="$(loglines "$CLIENT_VM")"; tmark_s="$(loglines "$SERVER_VM")"
+
+    # ── T1: parent-first fulls ──
+    echo
+    step "T1 — parent-first full sends: one copy per descendant, plain or raw, with its own stamped config and its own local anchor"
+    start_daemon "$CLIENT_VM"
+    if t_wait 360 t_first_done; then pass "(T1) all four datasets (parent, enc, enc/inner, plain) have a snapshot on the server and a local anchor on the client"
+    else fail "(T1) not every dataset reached the server within 360 s: $(for d in "${t_all[@]}"; do printf '%s=[%s] ' "${d#$T_TOP}" "$(t_snaps "$SERVER_VM" "$(t_sds "$d")" | count)"; done)"; fi
+    for d in "${t_all[@]}"; do
+        check "(T1) $d: the server copy is exactly at <target>/<client id>/<pool>/<path>" "yes" "$(t_exists "$SERVER_VM" "$(t_sds "$d")")"
+    done
+    for c in "${TARGET_DS}/${CLIENT_ID}" "${TARGET_DS}/${CLIENT_ID}/${CLIENT_POOL}"; do
+        check "(T1) the container $c is owned (client_id local)" "$CLIENT_ID local" "$(t_gets "$SERVER_VM" org.zfsbackup:client_id "$c")"
+    done
+    check "(T1) the parent and plain copies are PLAIN (not encrypted)" "off off" "$(t_get "$SERVER_VM" encryption "$(t_sds "$T_TOP")") $(t_get "$SERVER_VM" encryption "$(t_sds "$T_PLAIN")")"
+    check "(T1) the encrypted child's copy is RAW: encrypted, key unavailable, its own encryption root, not mounted" "yes unavailable $(t_sds "$T_ENC") no" \
+        "$([ "$(t_get "$SERVER_VM" encryption "$(t_sds "$T_ENC")")" != off ] && echo yes) $(t_get "$SERVER_VM" keystatus "$(t_sds "$T_ENC")") $(t_get "$SERVER_VM" encryptionroot "$(t_sds "$T_ENC")") $(t_get "$SERVER_VM" mounted "$(t_sds "$T_ENC")")"
+    check "(T1) the grandchild's copy is RAW too (encrypted, key unavailable, not mounted)" "yes unavailable no" \
+        "$([ "$(t_get "$SERVER_VM" encryption "$(t_sds "$T_INNER")")" != off ] && echo yes) $(t_get "$SERVER_VM" keystatus "$(t_sds "$T_INNER")") $(t_get "$SERVER_VM" mounted "$(t_sds "$T_INNER")")"
+    info "evidence: the grandchild's server copy has encryptionroot '$(t_get "$SERVER_VM" encryptionroot "$(t_sds "$T_INNER")")' (the client's is $T_ENC)"
+    for d in "${t_all[@]}"; do
+        check "(T1) $d: org.zfsbackup:client_id / source_dataset on the copy are LOCAL: $CLIENT_ID, $d" "$CLIENT_ID local $d local" \
+            "$(t_gets "$SERVER_VM" org.zfsbackup:client_id "$(t_sds "$d")") $(t_gets "$SERVER_VM" org.zfsbackup:source_dataset "$(t_sds "$d")")"
+        check "(T1) $d: the stamped config names the CHILD, recursive=false (the parent's: true), retention ${T_RET}s" "$d $([ "$d" = "$T_TOP" ] && echo True || echo False) ${T_RET}" \
+            "$(t_cfg "$d" 'd["name"]') $(t_cfg "$d" 'd["recursive"]') $(t_cfg "$d" 'int(d["retention_rules"][0]["keep_for"])')"
+        check "(T1) $d: readonly=on, canmount=noauto, mountpoint=none, setuid/exec/devices off, LOCAL on the copy" "on noauto none off off off" \
+            "$(t_get "$SERVER_VM" readonly "$(t_sds "$d")") $(t_get "$SERVER_VM" canmount "$(t_sds "$d")") $(t_get "$SERVER_VM" mountpoint "$(t_sds "$d")") $(t_get "$SERVER_VM" setuid "$(t_sds "$d")") $(t_get "$SERVER_VM" exec "$(t_sds "$d")") $(t_get "$SERVER_VM" devices "$(t_sds "$d")")"
+        check "(T1) $d: no org.zfsbackup:* property was received (the stream carries none)" "0" \
+            "$(msh "$SERVER_VM" "zfs get -H -s received -o property all '$(t_sds "$d")' 2>/dev/null | grep -c '^org.zfsbackup:' || true" | tr -d '[:space:]')"
+        a="$(t_local_anchor "$d")"
+        check "(T1) $d has its own LOCAL anchor.$DEST_NAME ($a) naming a snapshot on its copy with the client's guid (a child never reads its parent's)" "yes" "$([ -n "$a" ] && t_has "$d" "$a" && echo yes || echo no)"
+    done
+    tlog="$(log_since_vm "$CLIENT_VM" "$tmark_c")"
+    fp="$(printf '%s\n' "$tlog" | grep -nE "Backup complete: ${T_TOP}@" | head -n1 | cut -d: -f1)"
+    fc="$(printf '%s\n' "$tlog" | grep -nE "Backup complete: ${T_TOP}/[a-z]+(/[a-z]+)?@" | head -n1 | cut -d: -f1)"
+    check "(T1) the log completes the parent's send before any child's (parents first)" "yes" "$([ -n "$fp" ] && [ -n "$fc" ] && [ "$fp" -lt "$fc" ] && echo yes || echo no)"
+    check_has "(T1) the encrypted child's first send was a full one" "Backup complete: ${T_ENC}@[^ ]+ \\(full\\)" "$tlog"
+    check_lacks "(T1) no Traceback on either side" "Traceback" "$tlog$(log_since_vm "$SERVER_VM" "$tmark_s")"
+
+    # ── T2: a backlog goes out as a chain for every child ──
+    echo
+    step "T2 — a backlog of three recursive snapshots: a chain of incremental steps for every child"
+    stop_daemon "$CLIENT_VM"
+    sleep 3
+    TC=()
+    for i in 1 2 3; do
+        for d in "${t_all[@]}"; do t_write "$d" "chain$i.bin" 1; done
+        TC+=("$(t_snap_r)")
+    done
+    info "backlog: ${TC[*]}"
+    tmark2="$(loglines "$CLIENT_VM")"
+    start_daemon "$CLIENT_VM"
+    T_N="${TC[2]}"
+    if t_wait 300 t_copies_have "${t_all[@]}"; then pass "(T2) the newest backlog snapshot ${TC[2]} is on all four server copies with the client's guids"
+    else fail "(T2) ${TC[2]} did not reach every copy within 300 s: $(for d in "${t_all[@]}"; do printf '%s=%s ' "${d#$T_TOP}" "$(t_has "$d" "$T_N" && echo yes || echo no)"; done)"; fi
+    for d in "${t_all[@]}"; do
+        a="$(t_local_anchor "$d")"
+        check "(T2) $d: the local anchor is on the server (guid equal) and at or past ${TC[2]}" "yes" \
+            "$([ -n "$a" ] && t_has "$d" "$a" && [ "$(t_idx "$d" "$a")" -ge "$(t_idx "$d" "$T_N")" ] 2>/dev/null && echo yes || echo no)"
+    done
+    steps_enc="$(log_since_vm "$CLIENT_VM" "$tmark2" | grep -cE "Sending incremental ${T_ENC}:" || true)"
+    steps_in="$(log_since_vm "$CLIENT_VM" "$tmark2" | grep -cE "Sending incremental ${T_INNER}:" || true)"
+    check "(T2) the encrypted child and the grandchild each went out as >= 3 incremental steps ($steps_enc / $steps_in logged)" "yes" "$([ "${steps_enc:-0}" -ge 3 ] && [ "${steps_in:-0}" -ge 3 ] && echo yes || echo no)"
+    check "(T2) the raw copies are still locked on the server" "unavailable unavailable" "$(t_get "$SERVER_VM" keystatus "$(t_sds "$T_ENC")") $(t_get "$SERVER_VM" keystatus "$(t_sds "$T_INNER")")"
+
+    # ── T3: children come and go ──
+    echo
+    step "T3 — children created mid-run are discovered and sent; a destroyed child's copy stays and the server prunes it by its stamped retention"
+    msh "$CLIENT_VM" "
+        set -e
+        zfs create '$T_LATE'; zfs create '$T_GONE'
+        for d in '$T_LATE' '$T_GONE'; do dd if=/dev/urandom of=\$(zfs get -H -o value mountpoint \$d)/seed.bin bs=1M count=2 status=none; done
+    " || fail "(T3) could not create the mid-run children"
+    tmark3="$(loglines "$CLIENT_VM")"
+    t_late_gone() { [ -n "$(t_local_anchor "$T_LATE")" ] && [ -n "$(t_local_anchor "$T_GONE")" ] && [ "$(t_snaps "$SERVER_VM" "$(t_sds "$T_GONE")" | count)" -ge 3 ]; }
+    if t_wait 420 t_late_gone; then pass "(T3) late and gone were discovered and sent: copies with a local anchor, >= 3 snapshots on gone's copy"
+    else fail "(T3) late/gone did not get copies in 420 s (late: [$(t_snaps "$SERVER_VM" "$(t_sds "$T_LATE")" | count)] anchor '$(t_local_anchor "$T_LATE")', gone: [$(t_snaps "$SERVER_VM" "$(t_sds "$T_GONE")" | count)] anchor '$(t_local_anchor "$T_GONE")')"; fi
+    check_has "(T3) the first send of gone was a FULL one" "Backup complete: ${T_GONE}@[^ ]+ \\(full\\)" "$(log_since_vm "$CLIENT_VM" "$tmark3")"
+    check "(T3) late's copy is a plain copy at <target>/<client id>/<pool>/<path>" "yes off" "$(t_exists "$SERVER_VM" "$(t_sds "$T_LATE")") $(t_get "$SERVER_VM" encryption "$(t_sds "$T_LATE")")"
+    check "(T3) gone's copy is stamped with its own name, recursive=false" "$T_GONE False" "$(t_cfg "$T_GONE" 'd["name"]') $(t_cfg "$T_GONE" 'd["recursive"]')"
+    G_COPY="$(t_sds "$T_GONE")"
+    destroyed=0
+    for i in 1 2 3 4 5; do
+        if msh "$CLIENT_VM" "zfs destroy -r '$T_GONE' 2>&1"; then destroyed=1; break; fi
+        sleep 4
+    done
+    check "(T3) the client's child $T_GONE was destroyed" "yes" "$([ "$destroyed" -eq 1 ] && [ "$(t_exists "$CLIENT_VM" "$T_GONE")" = no ] && echo yes || echo no)"
+    send_idle_t() { ! send_running; }
+    t_wait 60 send_idle_t          # a send of gone that was already running (the destroy is refused while it runs) has ended
+    G_NEWEST="$(t_snaps "$SERVER_VM" "$G_COPY" | tail -n1)"; G_COPY_GUID="$(guid "$SERVER_VM" "$G_COPY")"; G_COUNT0="$(t_snaps "$SERVER_VM" "$G_COPY" | count)"
+    info "gone's copy right after the destroy: $G_COUNT0 snapshots, newest $G_NEWEST"
+    gone_thinned() { [ "$(t_snaps "$SERVER_VM" "$G_COPY" | count)" = "1" ]; }
+    if t_wait 420 gone_thinned; then pass "(T3) the SERVER's pruner thinned the destroyed child's copy to ONE snapshot by the retention stamped on it ($G_COUNT0 -> 1)"
+    else fail "(T3) the copy of the destroyed child still has $(t_snaps "$SERVER_VM" "$G_COPY" | count) snapshots after 420 s: [$(t_snaps "$SERVER_VM" "$G_COPY" | tr '\n' ' ')]"; fi
+    check "(T3) ... the one left is its newest, $G_NEWEST" "$G_NEWEST" "$(t_snaps "$SERVER_VM" "$G_COPY" | tail -n1)"
+    check "(T3) the copy itself still exists (same guid): nothing destroys a copy" "$G_COPY_GUID" "$(guid "$SERVER_VM" "$G_COPY")"
+    sleep 45
+    check "(T3) after 2 more prune cycles it still holds exactly its newest" "1 $G_NEWEST" "$(t_snaps "$SERVER_VM" "$G_COPY" | count) $(t_snaps "$SERVER_VM" "$G_COPY" | tail -n1)"
+    check_lacks "(T3) no Traceback in the client log" "Traceback" "$(log_since_vm "$CLIENT_VM" "$tmark_c")"
+
+    # ── T4: check grades one anchor per child x destination ──
+    echo
+    step "T4 — zfsbackup-config check on the client: one anchor entry per dataset x destination"
+    t_all2=("${t_all[@]}" "$T_LATE")
+    T_N="$(t_snap_r)"
+    t_all2_have() { t_copies_have "${t_all2[@]}"; }
+    t_wait 240 t_all2_have || fail "(T4) the last recursive snapshot $T_N did not reach every copy"
+    ck_run "$CLIENT_VM" --json
+    st="$(t_anchor_states)"
+    echo "    entries: $(t_entries)"
+    want="$(for d in "${t_all2[@]}"; do printf '%s:%s=OK\n' "$d" "$DEST_NAME"; done | LC_ALL=C sort | paste -sd, -)"
+    check "(T4) check --json: one anchor entry per dataset x $DEST_NAME (parent and four children), every one OK once caught up" "$want" "$st"
+    check "(T4) ... the destroyed child $T_GONE has no entry any more" "0" "$(printf '%s\n' "$st" | grep -c "$T_GONE" || true)"
+    check "(T4) check: overall state OK, exit 0" "0 OK" "$CK_RC $(ck_expr "$CLIENT_VM" 'd["state"]' | tr -d '[:space:]')"
+
+    # ── T5: a backup copy below the recursive dataset ──
+    echo
+    step "T5 — a backup copy planted below the recursive dataset is never snapshotted, sent or pruned"
+    W_N="$T_N"
+    stop_daemon "$CLIENT_VM"
+    sleep 35          # the next snapshot is then due the moment the daemon is back
+    X_NAME="autosnap_20200101000001"; Y_NAME="autosnap_20200101000002"
+    msh "$CLIENT_VM" "
+        set -e
+        zfs create -o canmount=noauto -o mountpoint=none -o org.zfsbackup:client_id=zfsb-foreign -o org.zfsbackup:source_dataset=otherpool/data '$T_REPL'
+        zfs snapshot -r '$T_TOP'@$X_NAME
+        zfs snapshot \$(zfs list -H -o name -r -t filesystem,volume '$T_TOP' | grep -vE '^${T_REPL}\$' | sed 's/\$/@$Y_NAME/' | tr '\\n' ' ')
+    " || fail "(T5) could not plant the copy $T_REPL and the old snapshots"
+    REPL_GUID="$(guid "$CLIENT_VM" "$T_REPL")"; REPL_SNAP_GUID="$(guid "$CLIENT_VM" "$T_REPL@$X_NAME")"
+    check "(T5) precondition: $T_REPL holds the stray name $X_NAME (from the recursive snapshot) and not $Y_NAME" "$X_NAME 1" \
+        "$(t_snaps "$CLIENT_VM" "$T_REPL" | tr '\n' ' ' | sed 's/ *$//') $(t_snaps "$CLIENT_VM" "$T_REPL" | count)"
+    tmark5="$(loglines "$CLIENT_VM")"
+    start_daemon "$CLIENT_VM"
+    replica_logged() { log_since_vm "$CLIENT_VM" "$tmark5" | gq -E " ERROR .*${T_REPL}"; }
+    t_wait 150 replica_logged
+    check_has "(T5) the client logs an ERROR naming the copy $T_REPL (and how to move it out)" "ERROR.*${T_REPL}" "$(log_since_vm "$CLIENT_VM" "$tmark5")"
+    t_newest() { t_snaps "$CLIENT_VM" "$T_TOP" | tail -n1; }
+    t_new_snap() { local n; n="$(t_newest)"; [ -n "$n" ] && [ "$n" != "$W_N" ] && [ "$n" != "$X_NAME" ] && [ "$n" != "$Y_NAME" ]; }
+    t_wait 150 t_new_snap
+    N5="$(t_newest)"
+    info "the snapshot taken after the plant: $N5"
+    check "(T5) the worker took a new snapshot of the tree after the copy appeared ($N5)" "yes" "$([ "$N5" != "$W_N" ] && [ "$N5" != "$X_NAME" ] && [ "$N5" != "$Y_NAME" ] && echo yes || echo no)"
+    check "(T5) the new snapshot is on the parent and on every source child" "yes" \
+        "$(ok=yes; for d in "${t_all2[@]}"; do [ "$(t_exists "$CLIENT_VM" "$d@$N5")" = yes ] || ok=no; done; echo $ok)"
+    check "(T5) ... all of them in ONE transaction (a single atomic zfs snapshot: the same createtxg everywhere)" "1" \
+        "$(msh "$CLIENT_VM" "for d in ${t_all2[*]}; do zfs get -H -o value createtxg \"\$d@$N5\"; done | sort -u | wc -l" | tr -d '[:space:]')"
+    check "(T5) NEVER SNAPSHOTTED: the copy $T_REPL has no snapshot but the stray $X_NAME" "$X_NAME" "$(t_snaps "$CLIENT_VM" "$T_REPL" | tr '\n' ' ' | sed 's/ *$//')"
+    y_pruned() { [ "$(t_exists "$CLIENT_VM" "$T_ENC@$Y_NAME")" = no ] && [ "$(t_exists "$CLIENT_VM" "$T_TOP@$Y_NAME")" = no ] && [ "$(t_exists "$CLIENT_VM" "$T_PLAIN@$Y_NAME")" = no ]; }
+    if t_wait 150 y_pruned; then pass "(T5) $Y_NAME, a name the copy does not hold, was pruned from the parent and the children (the client's pruner is alive)"
+    else fail "(T5) $Y_NAME is still on the client's tree after 150 s"; fi
+    sleep 65
+    check "(T5) NEVER PRUNED: $X_NAME, a name the copy holds, is still on the copy" "yes" "$(t_exists "$CLIENT_VM" "$T_REPL@$X_NAME")"
+    check "(T5) ... and so is the same name on the parent and the children (a recursive destroy would have taken the copy's too)" "yes yes yes" \
+        "$(t_exists "$CLIENT_VM" "$T_TOP@$X_NAME") $(t_exists "$CLIENT_VM" "$T_ENC@$X_NAME") $(t_exists "$CLIENT_VM" "$T_PLAIN@$X_NAME")"
+    check "(T5) the copy's guid, its snapshot's guid and its markers are unchanged" "$REPL_GUID $REPL_SNAP_GUID zfsb-foreign local otherpool/data" \
+        "$(guid "$CLIENT_VM" "$T_REPL") $(guid "$CLIENT_VM" "$T_REPL@$X_NAME") $(t_gets "$CLIENT_VM" org.zfsbackup:client_id "$T_REPL" | tr -d '\n') $(t_get "$CLIENT_VM" org.zfsbackup:source_dataset "$T_REPL")"
+    check "(T5) NEVER SENT: nothing under the server's target is, or comes from, $T_REPL" "0 0" \
+        "$(msh "$SERVER_VM" "zfs list -H -r -o name '$TARGET_DS' | grep -c '/replica\$' || true" | tr -d '[:space:]') $(msh "$SERVER_VM" "zfs get -H -r -o value org.zfsbackup:source_dataset '$TARGET_DS' | grep -c '^${T_REPL}\$' || true" | tr -d '[:space:]')"
+    check "(T5) the other children kept being sent: the encrypted child's anchor is on the server" "yes" \
+        "$(a="$(t_local_anchor "$T_ENC")"; [ -n "$a" ] && t_has "$T_ENC" "$a" && echo yes || echo no)"
+    ck_run "$CLIENT_VM" --json
+    echo "    entries: $(t_entries)"
+    check "(T5) check --json has a WARN 'copies' entry naming $T_REPL" "WARN" \
+        "$(ck_expr "$CLIENT_VM" '",".join(sorted(set(e["state"] for e in d["entries"] if e["source"] == "copies" and e["subject"] == "'"$T_REPL"'")))' | tr -d '[:space:]')"
+    check "(T5) ... the copy is not graded as a child (no anchor entry for it), and the overall exit is non-zero (1)" "0 1" \
+        "$(ck_expr "$CLIENT_VM" 'sum(1 for e in d["entries"] if e["source"] == "anchor" and e["subject"] == "'"$T_REPL"'")' | tr -d '[:space:]') $CK_RC"
+    check_lacks "(T5) no Traceback in the client log" "Traceback" "$(log_since_vm "$CLIENT_VM" "$tmark_c")"
+    check_lacks "(T5) no Traceback in the server log" "Traceback" "$(log_since_vm "$SERVER_VM" "$tmark_s")"
+    echo "    evidence (not asserted): the client's lines about the copy"
+    log_since_vm "$CLIENT_VM" "$tmark5" | grep -E "${T_REPL}" | cut -c1-230 | sort | uniq -c | sort -rn | head -n 5 | sed 's/^/      log: /'
+    stop_daemon "$CLIENT_VM"; stop_daemon "$SERVER_VM"
+    msh "$CLIENT_VM" "zfs destroy -r '$T_REPL' >/dev/null 2>&1; rm -f '$T_KEY'; true" || true
 fi
 
 # ─────────────────────────────── Report ─────────────────────────────────────

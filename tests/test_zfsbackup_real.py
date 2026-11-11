@@ -2772,16 +2772,20 @@ class TestRealSnapshotSkipsCopies:
         assert len(errors) == 1
         # M1: the ERROR's discriminator is true: a stray `snapshot -r` left in the copy has the SAME createtxg as
         # the source's snapshot of that name (one atomic command), which is how it is told from received history
-        assert f'zfs get -H -o name,value createtxg {source_fs.name}@<name> {copy}@<name>' in errors[0]
-        assert 'must never be destroyed' in errors[0] and "destroy the copy's" not in errors[0]
+        assert f'zfs get -H -o name,value createtxg {source_fs.name}@<name>' in errors[0]
+        assert f'zfs get -r -t snapshot -H -o name,value createtxg {copy}' in errors[0]     # the copy and everything below it
+        # (the wording is pinned in test_zfsbackup_prune_backup_copies.py: "destroy" survives only as the reason for the
+        # protection, never as advice to destroy anything in the copy)
+        assert 'must never be destroyed' in errors[0] and 'its source does not have' not in errors[0]
         for name in olds[3:]:
             assert _txg(copy, name) == _txg(source_fs.name, name), 'a stray is the same txg as its source'
 
     def test_a_name_libzfseasy_cannot_represent_inside_the_copy_keeps_the_atomic_snapshot(self, source_fs, caplog):
-        """A dataset name with a space is legal in zfs and refused by libzfseasy's strict listing. Inside a copy it is
-        never read (the walk around the copies), so the cycle still takes the ONE atomic snapshot of the sources."""
+        """A dataset name with a LEADING space is legal in zfs and refused by libzfseasy (an inner space is accepted).
+        Inside a copy it is never read (the walk around the copies), so the cycle still takes the ONE atomic
+        snapshot of the sources."""
         c, g, copy, inner = self.tree(source_fs)
-        _zfs_run('create', f'{copy}/has space')
+        _zfs_run('create', f'{copy}/ lead')
         manager, dsi = _recursive_manager(source_fs.name)
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             created = manager.create_snapshot(dsi)
@@ -2798,7 +2802,7 @@ class TestRealSnapshotSkipsCopies:
         snapshots into the copy: the stated trade), says so once, and the first cycle after the name is gone is
         atomic again."""
         c, g, copy, inner = self.tree(source_fs)
-        odd = f'{c}/has space'
+        odd = f'{c}/ lead'            # a leading space: legal in zfs, not representable in libzfseasy
         _zfs_run('create', odd)
         manager, dsi = _recursive_manager(source_fs.name)
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):

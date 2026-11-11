@@ -272,6 +272,16 @@ Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 a
 - **Copies without markers** (a manual `send | recv` with no `-o`, a syncoid replica without properties), not under a
   known receive target, are indistinguishable from source children. They are sent as children (A2) and pruned
   recursively. A6a: also add a `real_zfs` test proving `zfs destroy -r R@x` keeps a MARKED copy's `@x`.
+- **Found by A6 (2026-11-11; no code bug: the real tier passed on 2.1.5/2.2.2/2.3.9/2.4.1, the recursive scenarios
+  152/152 local and 70/70 two-VM):**
+  - `scenarios/test_openzfs_matrix.sh`: install `samba` on jammy so the 2.1 raw-receive `sharesmb` tests run instead
+    of skipping (they pass with it), and put a `timeout` around `add-apt-repository` (Launchpad was unreachable and
+    it hung for over 10 minutes before the `uv` fallback).
+  - `test_zfsbackup_real.py::…test_a_modified_server_head_with_the_base_the_newest_snapshot_still_succeeds` always
+    skips: the copy has the forced `mountpoint=none`; set a mountpoint before mounting it.
+  - The real tier has no recursive-SEND test (only prune/snapshot); the scenarios cover it. Add one.
+  - The multipass wedge also hits a long `log_since … | grep | cut | tail` pipeline in scenario 5 of
+    `test_local_destination.sh`; filter in-guest.
 
 ## Known trade-offs of the thread model
 
