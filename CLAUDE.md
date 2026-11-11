@@ -131,8 +131,13 @@ and lists afterwards best-effort (`[own] + rest`; a listing failure never turns 
 `property_sources(properties=[…])` replaces `all` with an explicit list (unrequested rows refused, unset user rows
 dropped); every builder puts options before operands (`zfs inherit [-r] [-S] <prop> <ds>`: BSD/macOS getopt does not
 permute). The exec core closes a child's pipes on every path (`_close_child_pipes`: stdout always, stderr once its
-reader thread ended, never waiting), and a FORKED process (`owner` pid recorded at Popen, `_forked`) never closes,
-reaps, signals or registers the parent's child.
+reader thread ended, never waiting), and a FORKED process (`owner` pid recorded BEFORE Popen, `_forked`) never closes,
+reaps, signals or registers the parent's child. It also never trusts one (in a fork `poll()`/`wait()` get ECHILD,
+which CPython reports as exit 0): resuming an inherited generator, continuing `_exec_collect`, or using a
+`StreamHandle` (`poll`/`terminate`/`close`/I/O) raises `ZFSForkError`. A fork's `close()` first drops its own fd
+copies (no flush) so the parent still sees EOF/EPIPE. Known gap: GC in a fork can still flush an unflushed
+`BufferedWriter` into the parent's receive (strict xfail in `test_libzfseasy_pipe_leaks.py`; an at-fork hook is the
+follow-up).
 
 **[libs/libzfseasy/libzfseasy/\_\_init\_\_.py](libs/libzfseasy/libzfseasy/__init__.py)** instantiates one singleton per command class and exports them as module-level names (`zfs.list`, `zfs.create`, `zfs.snapshot`, etc.). This is the public API.
 

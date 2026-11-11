@@ -362,6 +362,20 @@ class ZFSTimeoutError(Exception):
     command that timed out is unknown: a write may or may not have happened."""
 
 
+class ZFSForkError(Exception):
+    """A command, or the `StreamHandle` of a `send`/`receive`, was started by one process and used from a process
+    forked from it. A plain `Exception` (like `ZFSTimeoutError` and `ZFSOutputError`): not an `OSError`, `ValueError`
+    or `RuntimeError`.
+
+    The child belongs to the process that spawned it. The fork inherits the generator, the `Popen` and its pipes, but
+    cannot wait for the child: `Popen.poll()`/`wait()` there fail with `ECHILD`, which the standard library turns into
+    a return code of 0. Carrying on would end a listing early as if it were complete, or report a failed or running
+    child as a clean exit, so the fork is refused instead, before it trusts anything it reads. The fork leaves the
+    child and its pipes alone (no signal, wait, close or stuck-child registration); the original process is
+    unaffected and still gets its complete result. Not raised by anything that only drops the object (closing or
+    collecting an inherited generator)."""
+
+
 _timeout_var = contextvars.ContextVar('libzfseasy_timeout', default=None)
 
 _Thread = threading.Thread
@@ -750,7 +764,9 @@ class Command:
 
         Fork: a process forked while the generator is live inherits it, but the child belongs to the original process.
         In the fork the generator's cleanup leaves the child and its pipes alone (no signal, wait, close or stuck-child
-        registration; see `_forked`) and just ends; the original process still cleans up after itself."""
+        registration; see `_forked`) and just ends; the original process still cleans up after itself. Resuming it
+        there raises `ZFSForkError` instead of reading further (the fork cannot wait for the child, and a return code
+        it got would be a bogus 0), so a truncated listing never looks complete."""
         _log_command(cmd)
         seconds = _timeout_var.get()
         if seconds is not None:
@@ -766,8 +782,8 @@ class Command:
         completed = False
         settled = False
         try:
+            owner = os.getpid()  # before the spawn: no interruptible gap between a child and its owner
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
-            owner = os.getpid()
             stderr_thread = cls._start_stderr_reader_lines(process, errors)
             watchdog = _SlowCommandWatchdog.for_command(cmd, getattr(process, 'pid', None))
             if watchdog is not None:
@@ -776,6 +792,9 @@ class Command:
             if fd is None:
                 timed = False
                 while True:
+                    # Resumed after a yield, in a fork? The pipe is shared with the parent: reading would steal its
+                    # output, and `poll()` below would answer ECHILD as a clean exit (see `ZFSForkError`).
+                    cls._refuse_fork(owner, cmd)
                     line = process.stdout.readline()
                     rc = process.poll()
                     if isinstance(line, (bytes, bytearray)):
@@ -788,11 +807,14 @@ class Command:
                     rc = process.wait()
             else:
                 try:
-                    rc = yield from cls._read_until(process, fd, deadline)
+                    rc = yield from cls._read_until(process, fd, deadline, owner, cmd)
                 except _DeadlineReached:
                     error = cls._expire(process, stderr_thread, cmd, seconds, owner)
                     settled = True  # the child is reaped or registered; the cleanup below must not repeat it
                     raise error from None
+            # A fork can also continue mid-call (a signal handler that forks and returns), not only at a yield: never
+            # take a return code obtained there for the child's.
+            cls._refuse_fork(owner, cmd)
             if timed:
                 # The budget bounds this wait too (the child has exited; only a grandchild holding stderr can stall it).
                 cls._join_stderr_reader(stderr_thread, min(_TERMINATE_TIMEOUT, max(0.0, deadline - time.monotonic())))
@@ -828,6 +850,15 @@ class Command:
                         watchdog.cancel()
         if rc != 0:
             raise Exception(_failure_text(errors, rc))
+
+    @classmethod
+    def _refuse_fork(cls, owner, cmd, action: str = 'read') -> None:
+        """Raise `ZFSForkError` in a process forked from the one that spawned the child (`_forked`). Called wherever a
+        resumed or continuing call is about to read from the child's pipe or trust `poll()`/`wait()`, which in a fork
+        answer `ECHILD` as a clean exit (return code 0)."""
+        if cls._forked(owner):
+            raise ZFSForkError(f'{_command_label(cmd)}: this command was started by process {owner} and cannot be '
+                               f'{action} from a forked process (this is process {os.getpid()})')
 
     @staticmethod
     def _forked(owner) -> bool:
@@ -868,7 +899,7 @@ class Command:
         return fd if isinstance(fd, int) and not isinstance(fd, bool) else None
 
     @staticmethod
-    def _read_until(process, fd: int, deadline: float):
+    def _read_until(process, fd: int, deadline: float, owner=None, cmd=None):
         """Generator behind `_exec_lines` under a timeout: yield the lines of the child's stdout (same framing and
         decoding as the `readline` path) reading with `selectors` and `os.read` so the wait can end at `deadline` (a
         monotonic time), then wait for the child to exit, also until `deadline`. Returns its return code. Raises
@@ -877,7 +908,10 @@ class Command:
 
         A child that has already exited when the deadline passes is not a timeout: what is already in the pipe is
         read without blocking and the call completes normally (if a grandchild still holds the pipe open, stdout is
-        closed here, this being its only reader)."""
+        closed here, this being its only reader).
+
+        `owner` and `cmd` (the spawner's pid and the argv) are for the fork guard: after every yield, and before every
+        `poll()`, a process forked from the spawner raises `ZFSForkError` (see `_refuse_fork`)."""
         selector = selectors.DefaultSelector()
         held = False
         try:
@@ -886,6 +920,7 @@ class Command:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    Command._refuse_fork(owner, cmd)
                     if process.poll() is None:
                         raise _DeadlineReached()
                     remaining = 0.0  # finished: take what is already there, never block
@@ -904,10 +939,12 @@ class Command:
                     if end < 0:
                         break
                     yield pending[start:end].decode('utf-8', errors='surrogateescape')
+                    Command._refuse_fork(owner, cmd)
                     start = end + 1
                 pending = pending[start:]
             if pending:
                 yield pending.decode('utf-8', errors='surrogateescape')
+            Command._refuse_fork(owner, cmd)
             rc = process.poll()
             if rc is None:
                 try:
@@ -919,7 +956,7 @@ class Command:
             return rc
         finally:
             selector.close()
-            if held:
+            if held and not Command._forked(owner):
                 StreamHandle._close_pipe(process.stdout)
 
     @classmethod
@@ -1009,7 +1046,8 @@ class Command:
         reaped and the stderr thread joined (bounded, see `_join_stderr_reader`), even if the caller is interrupted.
         `env` replaces the child's environment when given (default: `_child_env()`, the C locale). Output is decoded as UTF-8 with
         replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe).
-        In a process forked mid-call the cleanup leaves the child and its pipes alone (see `_forked`)."""
+        In a process forked mid-call the cleanup leaves the child and its pipes alone (see `_forked`) and the call
+        raises `ZFSForkError` rather than return what the fork read."""
         _log_command(cmd)
         errors = _BoundedErrors()
         process = None
@@ -1019,10 +1057,10 @@ class Command:
         owner = None  # the pid that spawned the child (see `_forked`)
         completed = False
         try:
+            owner = os.getpid()  # before the spawn: no interruptible gap between a child and its owner
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
                                        encoding='utf-8', errors='replace',
                                        env=_child_env() if env is None else env)
-            owner = os.getpid()
             if raw_stderr:
                 stderr = process.stderr
 
@@ -1045,11 +1083,14 @@ class Command:
             if watchdog is not None:
                 watchdog.start()
             while True:
+                cls._refuse_fork(owner, cmd)  # a fork that continues the call would steal the parent's output
                 line = process.stdout.readline()
                 if line == '':
                     break
                 lines.append(line.rstrip('\n'))
+            cls._refuse_fork(owner, cmd)  # `wait()` in a fork answers ECHILD as a clean exit (see `ZFSForkError`)
             rc = process.wait()
+            cls._refuse_fork(owner, cmd)
             cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
@@ -1146,11 +1187,14 @@ class Command:
         thread._libzfseasy_joined = True
 
     @classmethod
-    def _abort_stream(cls, process, thread):
+    def _abort_stream(cls, process, thread, owner=None):
         """Reap a streaming child after a failed start (or an interrupt while starting): terminate it if it is
         still running, wait for it, join the stderr reader and close the pipes. Exceptions are swallowed, but the
         pipes are closed (and the child killed) even if a further interrupt arrives mid-cleanup; that interrupt
-        then propagates."""
+        then propagates. In a forked process (`owner`, see `_forked`) the child and its pipes are the parent's and
+        nothing is done."""
+        if cls._forked(owner):
+            return
         reaped = False
         try:
             try:
@@ -1204,12 +1248,44 @@ class StreamHandle:
         errors: list -- stderr lines captured so far (mutated in place, default [])
         stderr_thread: threading.Thread -- the thread appending the child's stderr lines to `errors`; joined by
             `close()` (default None: stderr is read directly in `close()` instead)
+        owner: int -- the pid of the process that spawned the child (default: this process; the stream cores pass
+            the pid they took before the spawn)
+
+    Fork. The child, the stream and the pipes belong to the process that spawned the child (`owner`). A process forked
+    from it (`os.fork()` with the handle alive) inherits the objects but cannot wait for the child (`Popen.poll()`/
+    `wait()` there answer `ECHILD`, which the standard library reports as return code 0), so it may only let go:
+      * `poll()` and `terminate()` raise `ZFSForkError` and touch nothing: no signal, no wait.
+      * `close()` closes the fork's own descriptor copies of the stream (and of `process.stdin`/`process.stdout`) at
+        the descriptor, without flushing and without taking any buffer lock, and then raises `ZFSForkError`. A copy
+        left open would keep a receive from seeing EOF (the owner's `close()` would wait for `zfs receive` for as long
+        as the fork lives) and keep a send from getting EPIPE. Closing a descriptor in the fork never affects the
+        owner's (separate descriptor tables). It reports nothing as closed, joins no reader, closes no stderr and
+        never flushes buffered bytes into the shared pipe.
+      * Every public attribute that is not a status query (`read`, `write`, `peek`, `readinto`, `flush`, `fileno`,
+        `raw`, `buffer`, ... everything but `closed`, `readable`, `writable`, `seekable`, `name`, `mode`,
+        `isatty`) raises `ZFSForkError` instead of being forwarded: a fork could otherwise take bytes from the owner's
+        send or inject bytes into its receive. Underscore names are forwarded as before.
+      * `pid` and an already-closed handle's `close()` still work.
+    Not covered: the stream object itself (what `with handle as stream` yields, or was taken before the fork) is a
+    plain buffered file and is not guarded, and when a fork is garbage-collected or the interpreter finalises there,
+    an unflushed `BufferedWriter` of a receive that was never `close()`d in the fork can still flush its buffered bytes
+    into the owner's receive. Known follow-up (not implemented): an `os.register_at_fork(after_in_child=...)` hook
+    that `dup2`s `/dev/null` over the inherited pipe descriptors. A fork that has called `close()` is safe from that,
+    as its stream's descriptor is already closed. Only the owner can close the handle for good and learn how the child
+    ended.
 
     Returns:
         None
     """
 
-    def __init__(self, process, stream, errors: Optional[list] = None, stderr_thread=None):
+    # Attributes of the wrapped stream that only report state: forwarded in a fork, everything else refused.
+    _FORK_SAFE_ATTRS = frozenset(('closed', 'readable', 'writable', 'seekable', 'name', 'mode', 'isatty'))
+    # Names of the wrapped stream whose refusal in a fork says what was attempted ("... cannot be <action> ...").
+    _FORK_WRITE_ATTRS = frozenset(('write', 'writelines', 'flush'))
+
+    def __init__(self, process, stream, errors: Optional[list] = None, stderr_thread=None, owner=None):
+        # The process that spawned the child (see `Command._forked`).
+        self._owner = os.getpid() if owner is None else owner
         self._process = process
         self._stream = stream
         self._errors = errors if errors is not None else []
@@ -1227,7 +1303,36 @@ class StreamHandle:
         return False
 
     def __getattr__(self, name):
+        # Only reached for names the handle does not define itself: the wrapped stream's methods and attributes. In a
+        # fork the I/O ones are refused (see the class docstring); `__dict__` is read so a half-built handle cannot
+        # recurse.
+        if not name.startswith('_') and name not in self._FORK_SAFE_ATTRS:
+            owner = self.__dict__.get('_owner')
+            if owner is not None and Command._forked(owner):
+                Command._refuse_fork(owner, getattr(self.__dict__.get('_process'), 'args', None),
+                                     'written' if name in self._FORK_WRITE_ATTRS else 'read' if name.startswith('read')
+                                     or name == 'peek' else 'used')
         return getattr(self._stream, name)
+
+    def _refuse_fork(self, action: str) -> None:
+        """`ZFSForkError` in a process forked from the one that created the handle (see the class docstring)."""
+        Command._refuse_fork(self._owner, getattr(self._process, 'args', None), action)
+
+    def _release_in_fork(self) -> None:
+        """In a forked process: close this process's own descriptor copies of the stream pipes, at the descriptor.
+
+        Never flushes (the buffered bytes belong to the owner's stream and a flush would write them into the shared
+        pipe a second time), takes no buffer lock (a lock the owner's thread held when the fork happened can never be
+        released here) and never signals or waits. Errors are ignored. The `Buffered` object closes quietly
+        afterwards, its raw being closed (as in `_close_abandoned`)."""
+        process = self._process
+        for pipe in (self._stream, getattr(process, 'stdin', None), getattr(process, 'stdout', None)):
+            if pipe is None or getattr(pipe, 'closed', False):
+                continue
+            try:
+                getattr(pipe, 'raw', pipe).close()
+            except Exception:
+                pass
 
     @property
     def pid(self):
@@ -1265,12 +1370,16 @@ class StreamHandle:
         but not yet recorded it. A pidfd would close it, but only on Linux and with extra fd bookkeeping, so it is not
         used.
 
+        Raises:
+            ZFSForkError -- in a process forked from the one that created the handle (nothing is signalled)
+
         Returns:
             bool -- True if the child was abandoned (it survived SIGKILL and may still be running), False otherwise
         """
         process = self._process
         if process is None:
             return False
+        self._refuse_fork('terminated')
         with self._terminate_lock:
             if self._terminate_done:
                 return self._abandoned
@@ -1303,12 +1412,17 @@ class StreamHandle:
         `poll()` is not None, call `close()`. Do not call `poll()` from a thread while another is inside `close()`'s
         `wait()` expecting an exact return code: both are safe, they just share the reaping.
 
+        Raises:
+            ZFSForkError -- in a process forked from the one that created the handle: it cannot see the child, and
+                `Popen.poll()` there would report a running child as exited with code 0
+
         Returns:
             int | None -- the child's return code, or None if it is still running or there is no process
         """
         process = self._process
         if process is None:
             return None
+        self._refuse_fork('polled')
         return process.poll()
 
     def _abandoned_and_running(self) -> bool:
@@ -1367,9 +1481,17 @@ class StreamHandle:
         exited by now, `close()` takes the normal path and reports its exit status.
 
         Bounded close: `close()` on a child that has not been abandoned is an unbounded `wait()`. Call it only once
-        `poll()` is not None or after `terminate()` if you need it bounded (see `poll()`)."""
+        `poll()` is not None or after `terminate()` if you need it bounded (see `poll()`).
+
+        In a process forked from the one that created the handle it closes that process's descriptor copies of the
+        stream (no flush, no lock, no signal, no wait) and raises `ZFSForkError`: it cannot wait for the child, so it
+        could not tell success from failure (see the class docstring). An already-closed handle is a no-op
+        everywhere."""
         if self._closed:
             return
+        if Command._forked(self._owner):
+            self._release_in_fork()
+            self._refuse_fork('closed')
         # A `terminate()` escalating in another thread holds the lock for up to ~10 s: wait for it (bounded, so a
         # re-entrant call from a signal handler on the terminating thread cannot deadlock) so the abandon decision is
         # not taken halfway through it. The lock is never held across the wait for the child below.
@@ -3364,32 +3486,45 @@ class SendCommand(Command):
         _log_command(cmd)
         errors = _BoundedErrors()
         stderr_thread = None
+        owner = os.getpid()  # the spawner, taken before the spawn (see `_forked`); the handle carries it on
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
         try:
             # stderr is drained on its own thread from the start, so a child writing more than a pipe buffer of
             # diagnostics can neither block itself nor stall the stdout peek below.
             stderr_thread = cls._start_stderr_reader_bin(process, errors)
             if not peek:
-                return StreamHandle(process, process.stdout, errors, stderr_thread)
+                # Only a fork that continues this call from inside it (a signal handler that forks) can be here under
+                # another pid; the handle is built for the spawner either way, so it refuses use there too.
+                cls._refuse_fork(owner, cmd)
+                return StreamHandle(process, process.stdout, errors, stderr_thread, owner=owner)
             while True:
-                output = cls._exec_capture_bin(process, errors, stderr_thread)
+                output = cls._exec_capture_bin(process, errors, stderr_thread, owner)
+                # What the peek or `poll()` told a fork is not the child's (see `ZFSForkError`).
+                cls._refuse_fork(owner, cmd)
                 if output is False:
                     # Process exited successfully without ever producing output
                     # (e.g. an empty stream); still hand back a StreamHandle so
                     # callers have a uniform close()/context-manager API.
-                    return StreamHandle(process, process.stdout, errors, stderr_thread)
+                    return StreamHandle(process, process.stdout, errors, stderr_thread, owner=owner)
                 elif output is not None:
-                    return StreamHandle(process, output, errors, stderr_thread)
+                    return StreamHandle(process, output, errors, stderr_thread, owner=owner)
         except BaseException:
             # Startup failed (or was interrupted): leave no child, pipe or reader thread behind.
-            cls._abort_stream(process, stderr_thread)
+            cls._abort_stream(process, stderr_thread, owner)
             raise
 
     @classmethod
-    def _exec_capture_bin(cls, process, errors, stderr_thread=None) -> Union[bool, io.BufferedReader, None]:
+    def _exec_capture_bin(cls, process, errors, stderr_thread=None, owner=None) -> Union[bool, io.BufferedReader, None]:
+        # `owner` (the spawner's pid; None = no fork guard) makes a process forked from the spawner raise
+        # `ZFSForkError` before it touches the parent's pipes (peek takes the reader's buffer lock, and a close could
+        # wait for ever on a lock the parent's reader thread holds) and before it trusts `poll()`/`wait()`, which in
+        # a fork answer ECHILD as a clean exit.
+        label = getattr(process, 'args', None)
+        cls._refuse_fork(owner, label)
         # Guard against mocked processes without real stdout. peek() blocks until the first byte or EOF; stderr is
         # drained concurrently by `stderr_thread`, so that cannot deadlock on a chatty child.
         stdout = process.stdout.peek(8) if getattr(process, 'stdout', None) else b''
+        cls._refuse_fork(owner, label)  # a fork can continue the call from inside it (a signal handler)
         if len(stdout):
             return process.stdout
         # stdout hit EOF (or there is none): the child is finished or about to be. Block until it exits (never spin
@@ -3405,9 +3540,12 @@ class SendCommand(Command):
                         _append_error(errors, error)
             except Exception:
                 pass
+        cls._refuse_fork(owner, label)
         rc = process.poll()
         if rc is None:
+            cls._refuse_fork(owner, label)
             rc = process.wait()
+        cls._refuse_fork(owner, label)  # before the join and before any close: a fork's rc is not the child's
         cls._join_stderr_reader(stderr_thread)
         if rc != 0:
             StreamHandle._close_pipe(getattr(process, 'stdout', None))
@@ -3565,6 +3703,7 @@ class ReceiveCommand(Command, StringListArgument):
         # process.wait().
         errors = _BoundedErrors()
         stderr_thread = None
+        owner = os.getpid()  # the spawner, taken before the spawn (see `_forked`); the handle carries it on
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                    env=_child_env())
         try:
@@ -3573,13 +3712,14 @@ class ReceiveCommand(Command, StringListArgument):
             stderr_thread = cls._start_stderr_reader_bin(process, errors)
             # Poll once to catch immediate startup failures; zfs receive emits no stderr while waiting for data
             rc = process.poll()
+            cls._refuse_fork(owner, cmd)  # `poll()` in a fork answers ECHILD as a clean exit (see `ZFSForkError`)
             if rc is not None and rc != 0:
                 cls._join_stderr_reader(stderr_thread)
                 raise Exception(_failure_text(errors, rc))
         except BaseException:
-            cls._abort_stream(process, stderr_thread)
+            cls._abort_stream(process, stderr_thread, owner)
             raise
-        return StreamHandle(process, process.stdin, errors, stderr_thread)
+        return StreamHandle(process, process.stdin, errors, stderr_thread, owner=owner)
 
 
 class LoadKeyCommand(Command):

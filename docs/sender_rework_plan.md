@@ -272,6 +272,13 @@ Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 a
 - **Copies without markers** (a manual `send | recv` with no `-o`, a syncoid replica without properties), not under a
   known receive target, are indistinguishable from source children. They are sent as children (A2) and pruned
   recursively. A6a: also add a `real_zfs` test proving `zfs destroy -r R@x` keeps a MARKED copy's `@x`.
+- **libzfseasy at-fork hook (low, libzfseasy-developer).**
+  - The gap: a process forked while a `StreamHandle` write stream holds unflushed bytes, which never calls `close()`,
+    flushes those bytes into the parent's `zfs receive` when GC finalises its `BufferedWriter`.
+  - Fix: register an `os.register_at_fork(after_in_child=...)` hook that `dup2`s `/dev/null` over every live
+    handle's inherited pipe fds (a `WeakSet` of handles and `_exec_*` `Popen`s).
+  - Not reachable from zfsbackup: no worker forks with a live stream.
+  - Pinned by a strict xfail in `test_libzfseasy_pipe_leaks.py`.
 - **Found by A6 (2026-11-11; no code bug: the real tier passed on 2.1.5/2.2.2/2.3.9/2.4.1, the recursive scenarios
   152/152 local and 70/70 two-VM):**
   - `scenarios/test_openzfs_matrix.sh`: install `samba` on jammy so the 2.1 raw-receive `sharesmb` tests run instead

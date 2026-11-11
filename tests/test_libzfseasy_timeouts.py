@@ -94,6 +94,10 @@ class Kids:
         self.stderr_threads = []
         self.extra_pids = []
         self.unkillable = False   # while True: poll() says "running" and a timed wait() times out, whatever really is
+        # While False, terminate()/kill() are counted but never delivered, so a child faked as unkillable really stays
+        # alive: its stderr reader stays blocked, which is what the "stderr is left open" assertions rely on. (Delivered,
+        # the real child dies, its reader ends, and under load `_close_child_pipes` then correctly closes stderr.)
+        self.signals_land = True
         kids = self
         real_popen = subprocess.Popen  # the (guarded) class; subclassing keeps the guard
 
@@ -112,11 +116,13 @@ class Kids:
 
             def terminate(self):
                 kids.terminated[self.pid] = kids.terminated.get(self.pid, 0) + 1
-                super().terminate()
+                if kids.signals_land:
+                    super().terminate()
 
             def kill(self):
                 kids.killed[self.pid] = kids.killed.get(self.pid, 0) + 1
-                super().kill()
+                if kids.signals_land:
+                    super().kill()
 
         monkeypatch.setattr(subprocess, 'Popen', Recording)
         real_start = Command._start_stderr_reader_lines
@@ -150,6 +156,7 @@ class Kids:
 
     def kill_all(self):
         self.unkillable = False
+        self.signals_land = True
         for pid in self.extra_pids:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -1304,6 +1311,7 @@ class TestTimedCleanup:
         gen = self._timed_generator(kids)
         proc = kids.procs[0]
         kids.unkillable = True                       # wait() times out and poll() says running, whatever is real
+        kids.signals_land = False                    # and the child really survives, so its stderr reader stays blocked
         with caplog.at_level(logging.WARNING, logger='libzfseasy'):
             if how == 'close':
                 gen.close()
@@ -1340,6 +1348,7 @@ class TestTimedCleanup:
         monkeypatch.setattr(zfs_module, '_EXPIRY_WAIT', 0.2)
         cmd = py(HELLO_THEN_SLEEP)
         kids.unkillable = True
+        kids.signals_land = False                    # really survives TERM and KILL: the reader stays blocked on stderr
         _, exc = kids.bounded(lambda: run_lines(cmd, 0.4))
         proc = kids.procs[0]
         assert isinstance(exc, ZFSTimeoutError)
@@ -1348,6 +1357,8 @@ class TestTimedCleanup:
         assert stuck_pids() == [proc.pid] and proc.stdout.closed and not proc.stderr.closed
         # the "pool wakes up": the child is really gone (the kill landed), the sweep drops it and frees stderr
         kids.unkillable = False
+        kids.signals_land = True
+        proc.kill()
         assert wait_until(lambda: proc.poll() is not None, 10)
         assert wait_until(lambda: not any(t.is_alive() for t in kids.stderr_threads), 10)
         assert zfs_module._sweep_stuck() == [] and zfs_module._stuck == []
