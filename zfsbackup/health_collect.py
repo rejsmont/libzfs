@@ -22,7 +22,8 @@ left)`; `deadline` (seconds for the whole collection, measured from the call;
 default `None` = unbounded, the caller sets it) bounds the run. The BATCHED
 reads, whose run time grows with the size of a tree rather than with the
 health of the pool (the recursive listings under a recursive dataset, the
-two-step property read of its descendants, and the listing and batched
+two-step property read of its descendants, the descendant listing and
+backup-copy marker read of the expansion itself, and the listing and batched
 property read of the received datasets), get the time LEFT of `deadline`
 instead of `per_call`: ~60 000 snapshots can take longer than 10 s on a
 healthy host. Without a `deadline` they get `per_call`, as everything else.
@@ -38,10 +39,10 @@ be killed (a hung pool) makes every later timed call fail fast (libzfseasy):
 the rest of the run then reads as "cannot read", which is the right answer
 for a probe. The overshoot of the deadline is at most one command's kill time
 (libzfseasy terminates a timed-out child: SIGTERM, then SIGKILL after 2 s,
-each waited for at most 2 s, plus up to 2 s to join its stderr reader, so
-about 4-6 s): a command starts only if its scope is entered with time left,
-and is cut at the deadline, and the next command's scope is refused. What
-runs between commands (parsing a listing) is not timed.
+each waited for at most 2 s, plus at most `_EXPIRY_JOIN` (0.05 s) to join its
+stderr reader, so about 4 s): a command starts only if its scope is entered
+with time left, and is cut at the deadline, and the next command's scope is
+refused. What runs between commands (parsing a listing) is not timed.
 
 What is observed, per enabled dataset (a disabled one is skipped):
 
@@ -251,11 +252,13 @@ def collect(
     finite; `None` = unbounded). `per_call`: seconds any one `zfs` command may
     run (positive, finite; `None` = unlimited; default
     `DEFAULT_PER_CALL_SECONDS`), except the batched reads (a recursive
-    dataset's snapshot listing and property read, the received datasets'
-    listing and property read), which may run for the time left of `deadline`
-    (for `per_call` when there is no `deadline`). Each command is timed
-    separately, and the deadline is overshot by at most the time a timed-out
-    child needs to be killed (about 4-6 s). Both keyword-only; anything else
+    dataset's descendant listing and backup-copy marker read, its
+    descendants' snapshot listing, property read and name re-listing, the
+    received datasets' listing and property read), which may run for the time
+    left of `deadline` (for `per_call` when there is no `deadline`). Each
+    command is timed separately, and the deadline is overshot by at most the
+    time a timed-out child needs to be killed (about 4 s: 2 s after SIGTERM, 2 s
+    after SIGKILL, and at most 0.05 s to join the stderr reader). Both keyword-only; anything else
     raises `ValueError` before a command runs. When the deadline passes, what is not
     yet checked is named in one WARN `CheckEntry` (`source` `check`, subject
     `(time limit)`) at the end of the result; the order of work is the

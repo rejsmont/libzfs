@@ -2223,9 +2223,10 @@ class DatasetManager:
         wrong column count, a row outside the tree, a duplicate), because a
         dropped row may be a child's newest snapshot and the answer would be
         wrong, not smaller. The exception is a listing refused because its
-        FIRST untrusted row is a name libzfseasy cannot represent (its names
-        are ASCII: a user's snapshot or dataset with an umlaut in its name)
-        anywhere under the parent. Strict alone made one such name fail EVERY
+        FIRST untrusted row is a name libzfseasy cannot represent anywhere
+        under the parent. (ZFS names are ASCII, so an umlaut is not the
+        trigger. It is a name ZFS allows and libzfseasy's validation refuses,
+        for example a dataset component starting with `.` or `-`.) Strict alone made one such name fail EVERY
         child of the parent ("could not be trusted") while the daemon, which
         skips the name with a WARNING, and the parent's own observation carry
         on. That listing is read again without `strict` (libzfseasy logs each
@@ -2376,9 +2377,10 @@ class DatasetManager:
           is never split because it would not be atomic), fall back to plain
           `snapshot -r` with one ERROR per episode. Deliberate (user
           decision): a stray snapshot in a copy is recoverable, a missed
-          source snapshot is not. A zfs FAILURE of `many` itself is not
-          caught (a plain `-r` would fail the same way): it ends the cycle as
-          before.
+          source snapshot is not. A zfs FAILURE of `many` itself does not
+          fall back (a plain `-r` would fail the same way): it ends the
+          cycle, after the one retry of `_run_tree_command` when datasets of
+          the tree already hold the name (below).
         * `dsi` itself at or below a receive target (`validate_config`
           refuses such a configuration; `_copy_tops` then makes `dsi` the top):
           nothing is snapshotted and this raises `_InsideReceiveTarget`

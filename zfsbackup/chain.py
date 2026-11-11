@@ -23,6 +23,11 @@ the in-flight pin and the anchor. A subclass supplies the transport:
 ...) let each name its receiving side, the defaults being the remote wording.
 This module imports neither `requests`, `websocket` nor `zfsbackup.identity`.
 
+`copy_confirmed(dataset, destination)` says whether a copy has been CONFIRMED
+in this incarnation (a negotiate that found one, or an acknowledged stream);
+the remote worker's parent-first rule for the descendants of a recursive
+dataset reads it, and it is never persisted.
+
 Every subclass `_negotiate` must fill `_server_info`, `_server_newer` and
 `_server_newer_status` on success: a missing value fails OPEN (`absent` reads
 as a server that predates B-2b in `_settle_up_to_date`, a missing

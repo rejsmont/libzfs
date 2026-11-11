@@ -13,7 +13,15 @@ What it does, in order:
 2. Lazily imports `zfsbackup.health_collect` (which imports `libzfseasy`, so a
    host without ZFS can still run every other command: the `rename.py`
    precedent) and `zfsbackup.health` (stdlib only). `health_collect.collect`
-   makes the read-only `zfs list` / `zfs get` calls; `health.evaluate` grades them.
+   makes the read-only `zfs list` / `zfs get` calls (per enabled dataset, the
+   anchors of the descendants of its recursive datasets, and the received
+   datasets on a server; also one WARN per backup copy it finds below a
+   recursive dataset); `health.evaluate` grades them. The reads are bounded by
+   `--time-limit` in all and `--per-call-timeout` per command, except the batched
+   reads of a large tree (the descendants' listing and backup-copy marker read,
+   their snapshot and property reads, the received datasets' listing and
+   property read), which may use all the time left of `--time-limit`; what was
+   not checked in time is one WARN `(time limit)` entry.
 3. Adds this command's own entries as `health.CheckEntry`s, so every serialiser
    handles them: the daemon (not running = CRIT; running but not on the stored
    generation = WARN; draining for an upgrade = WARN `daemon/upgrade`), the client certificate (expired = CRIT, expiring
@@ -633,7 +641,8 @@ def register(
         cls=_CheckCommand,
         help=(
             "Is this host's backup healthy? Grades, per enabled dataset, the newest "
-            "snapshot, the snapshot last sent to each destination and (on a server) "
+            "snapshot, the snapshot last sent to each destination (for a recursive "
+            "dataset, also of each of its descendants) and (on a server) "
             "each received client dataset against how often they should be taken: "
             "WARN from --warn-factor times that interval, CRIT from --crit-factor "
             "times it. Also checks that a daemon is running on the stored "
@@ -644,6 +653,8 @@ def register(
             "--crit-factor); a last attempt that succeeded but recorded a warning (for "
             "example a recursive snapshot that left backup copies out) is WARN until the "
             "next attempt is clean; no status files is no data, never a failure. "
+            "A backup copy found below a recursive dataset is one WARN: it is not "
+            "snapshotted, sent or pruned with the tree. "
             "Read-only: it runs only `zfs list`/`zfs get`, takes no lock "
             "and never signals the daemon.\n\n"
             "Output: text by default; --json; --prometheus (text exposition format); "
@@ -655,10 +666,13 @@ def register(
             "collector).\n\n"
             "Time bound: the ZFS reads stop after --time-limit seconds (default 60) in all, "
             "and any one zfs command after --per-call-timeout seconds (default 10), except "
-            "the batched reads of a large tree (a recursive dataset's snapshot and property "
-            "reads, the received datasets' listing and property read), which may use all the "
+            "the batched reads of a large tree (a recursive dataset's descendant listing and "
+            "backup-copy marker read, its descendants' snapshot and property reads, the "
+            "received datasets' listing and property read), which may use all the "
             "time left of --time-limit; what was not checked in time is reported as one WARN "
-            "entry '(time limit)', never as OK. --time-limit may be overshot by a few seconds "
+            "entry '(time limit)', never as OK. A slow pool, or a hung one whose zfs can still "
+            "be killed, can spend all the time left on one batched read, and the items not "
+            "reached are then that WARN. --time-limit may be overshot by a few seconds "
             "at most (a timed-out zfs child needs up to about 6 s to be killed). "
             "0 or none turns a limit off. A caller's own timeout must exceed --time-limit "
             "plus a few seconds: NRPE's -t (command_timeout) must be larger than it, or NRPE "
@@ -697,12 +711,12 @@ def register(
     @click.option("--per-call-timeout", "per_call_timeout", default=str(int(DEFAULT_PER_CALL_TIMEOUT)),
                   show_default=True, metavar="SECONDS",
                   callback=_seconds_option("per_call_timeout"),
-                  help="Give up on one zfs command after SECONDS, except the batched reads of a "
-                       "large tree (a recursive dataset's snapshot and property reads, the "
-                       "received datasets' listing and property read), which may use all the "
-                       "time left of --time-limit (or SECONDS if --time-limit is off); a hung "
-                       "pool then costs this, not the whole --time-limit. 0 or none: no "
-                       "per-command limit.")
+                  help="Give up on one single-dataset zfs command after SECONDS (a hung pool "
+                       "costs this per such read). The batched reads of a large tree (a "
+                       "recursive dataset's descendant listing and backup-copy marker read, its "
+                       "descendants' snapshot and property reads, the received datasets' listing "
+                       "and property read) may use all the time left of --time-limit (or SECONDS "
+                       "if --time-limit is off). 0 or none: no per-command limit.")
     @click.option("--output", "-o", "output", default=None, metavar="FILE",
                   help="Write the output to FILE (atomically) instead of stdout.")
     @click.option("--warn-factor", type=float, default=2.0, show_default=True, metavar="N",

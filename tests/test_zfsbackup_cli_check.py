@@ -2978,7 +2978,10 @@ class TestTimeLimitOptions:
         assert "NRPE's -t (command_timeout) must be larger than it" in text
         assert "TimeoutStartSec=150" in text and "2 x the limit + 30 s" in text
         assert "the shipped zfsbackup-check.service assumes the default of 60" in text
-        assert "a hung pool then costs this, not the whole --time-limit" in text
+        assert "a hung pool costs this per such read" in text
+        assert "may use all the time left of --time-limit (or SECONDS if --time-limit is off)" in text
+        assert "can spend all the time left on one batched read" in text
+        assert "descendant listing and backup-copy marker read" in text
 
     def test_the_shipped_unit_matches_the_default_limit(self):
         unit = (REPO / "packaging" / "systemd" / "zfsbackup-check.service").read_text()

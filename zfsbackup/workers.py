@@ -812,7 +812,15 @@ class BaseWorker(_SupervisorWatch, Process):
 
 
 class SnapshotWorker(BaseWorker):
-    """Worker that periodically checks all datasets and creates snapshots as needed."""
+    """Worker that periodically checks all datasets and creates snapshots as needed.
+
+    Datasets are taken by path depth (`_get_datasets`): an enabled recursive
+    dataset snapshots its whole tree before a configured descendant has its
+    turn, and a descendant whose snapshot for the period that command just
+    created over it "rides" on it (`DatasetManager.ridden_snapshot`) instead of
+    failing with "already exists". A recursive snapshot that left backup copies
+    out of the tree is recorded with a standing `warning`
+    (`DatasetManager.last_snapshot_note`)."""
 
     def __init__(
         self,
@@ -1103,7 +1111,15 @@ class RemoteBackupWorker(BaseWorker):
     """Worker that periodically sends snapshots to the configured destinations:
     remote ones (`https://`, `zfsbackup.remote.RemoteBackupManager`) and local
     ones (`zfs:<dataset>`, `zfsbackup.local.LocalBackupManager`), one after
-    another in the configured order, both managers built lazily."""
+    another in the configured order, both managers built lazily.
+
+    The descendants of every enabled `recursive: true` dataset with `remote:`
+    entries are sent here too, each as a pair of its own
+    (`DatasetManager.expand_recursive`, once per cycle, in `_get_datasets`):
+    its own `-i` chain and copy, never `send -R`. Ancestors go first, and an
+    expanded child additionally waits until its nearest ancestor's copy at the
+    same destination is CONFIRMED in this incarnation (`_waits_for_ancestor`,
+    R-2); the snapshot and pruning workers never see a child."""
 
     #: Imports `zfsbackup.remote` lazily from disk: leaves for an upgrade drain
     #: first (stage 1).
