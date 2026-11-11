@@ -117,6 +117,10 @@ class InheritingZfs:
       name,property,source -s local,received,inherited -r ... all <root>` (the backup-copy read of
       A2) when it fails; the fake answers it with `local`, `received` and `inherited from <ds>` rows
     * `snapshot_list_failures` -- datasets whose snapshot listing (`zfs list -t snapshot`) fails
+    * `tree_list_failures` -- roots whose RECURSIVE snapshot listing (`zfs list -r -t snapshot`, the
+      health check's one read of a recursive parent's whole tree) fails
+    * `rows_failures` -- roots whose phase-2 value batch (`zfs get -H -o name,property,value,source
+      -r ... <root>`) fails; so does one that asks for a property in `unreadable` below the root
     * `encryption[name]` -- the `encryption` property of a dataset's snapshots (default `off`;
       anything else reads as encrypted with its key `available`)
 
@@ -142,6 +146,8 @@ class InheritingZfs:
         self.list_extra: Dict[str, List[Tuple[str, str]]] = {}
         self.copy_read_failures: Dict[str, str] = {}
         self.snapshot_list_failures: Set[str] = set()
+        self.tree_list_failures: Set[str] = set()
+        self.rows_failures: Set[str] = set()
         self.encryption: Dict[str, str] = {}
         self.allow_writes = False
         self.unset_rows = False        # print a source `-` row for an unset requested property of the copy read
@@ -169,6 +175,8 @@ class InheritingZfs:
             return self._get_value(rest)
         if rest[:4] == ['get', '-H', '-o', 'name,property,source']:
             return self._get_sources(rest)
+        if rest[:4] == ['get', '-H', '-o', 'name,property,value,source']:
+            return self._get_rows(rest)
         if rest[:1] == ['list']:
             return self._list(rest)
         if self.allow_writes and rest[:1] == ['set']:
@@ -255,6 +263,30 @@ class InheritingZfs:
                     lines.append(f"{n}\t{prop}\t-\n")      # an unset requested property: `-` (the reader drops it)
         return _Proc(''.join(lines).encode())
 
+    def _get_rows(self, rest):
+        """`zfs get -H -o name,property,value,source [-r] -t <types> name,type,<props> <root>`, the strict phase 2
+        of a two-step read: per dataset (the root, then with `-r` everything below) its `name` and `type`
+        rows, then each requested property in order -- value and source (`local`, `received`, `inherited from
+        X`), or `-` `-` when nobody sets it. A failing batch exits 1."""
+        root = rest[-1]
+        requested = rest[-2].split(',')[2:]
+        if root in self.rows_failures:
+            return _Proc(b'', f"cannot open '{root}': pool I/O is currently suspended\n".encode(), 1)
+        if root not in self.datasets:
+            return _Proc(b'', f"cannot open '{root}': dataset does not exist\n".encode(), 1)
+        names = [root] + ([n for n in self.datasets if n.startswith(root + '/')] if '-r' in rest else [])
+        lines = []
+        for n in names:
+            lines.append(f"{n}\tname\t{n}\t-\n")
+            lines.append(f"{n}\ttype\t{self.datasets[n]}\t-\n")
+            for prop in requested:
+                if (n, prop) in self.unreadable:
+                    return _Proc(b'', f"cannot open '{n}': pool I/O is currently suspended\n".encode(), 1)
+                value, _ = self._effective(n, prop)
+                source = self._source_of(n, prop)
+                lines.append(f"{n}\t{prop}\t-\t-\n" if value is None else f"{n}\t{prop}\t{value}\t{source}\n")
+        return _Proc(''.join(lines).encode())
+
     def name_sources_reads(self, root=None):
         """The backup-copy reads asked for (`get -H -o name,property,source ...`), of `root` if given."""
         return [a for a in self.calls if a[:4] == ['get', '-H', '-o', 'name,property,source']
@@ -283,9 +315,14 @@ class InheritingZfs:
                 return _Proc(b'', f"cannot open '{root}': pool I/O is currently suspended\n".encode(), 1)
             known = ['name', 'type'] + list(SNAPSHOT_LIST_PROPERTIES)
             lines = []
-            for snap in self.snaps.get(root, []):
-                cells = dict(zip(known, self._snapshot_row(snap, root).rstrip('\n').split('\t')))
-                lines.append('\t'.join(cells.get(c, '-') for c in columns))
+            recursive = '-r' in rest
+            if recursive and root in self.tree_list_failures:
+                return _Proc(b'', f"cannot open '{root}': pool I/O is currently suspended\n".encode(), 1)
+            below = [root] + ([n for n in self.datasets if n.startswith(root + '/')] if recursive else [])
+            for name in below:
+                for snap in self.snaps.get(name, []):
+                    cells = dict(zip(known, self._snapshot_row(snap, name).rstrip('\n').split('\t')))
+                    lines.append('\t'.join(cells.get(c, '-') for c in columns))
             return _Proc(''.join(line + '\n' for line in lines).encode())
         wanted = types.split(',')
         names = [root] + (
@@ -595,7 +632,7 @@ class TestA1MatrixHealth:
             # A3: the raising read. "could not be read" is an error observation (CRIT "cannot read"),
             # not "never sent" (the child shows no anchor, and no WARN "not yet sent" either)
             assert obs.newest_ts is None
-            assert obs.error and 'the anchor or send pin could not be read' in obs.error
+            assert obs.error and obs.error.startswith('the anchor could not be read: ')
             assert 'pool I/O is currently suspended' in obs.error
             (entry,) = evaluate([obs], now)
             assert entry.state == STATE_CRIT and entry.reason.startswith('cannot read: ')
@@ -618,7 +655,11 @@ class TestA1MatrixHealth:
         note = f'send in flight: {old} -> {new}'
         assert (note in (obs.detail or '')) == (source == 'local')
         if source == 'unreadable':
-            assert obs.error and 'could not be read' in obs.error      # A3: not "no pin"
+            # an unreadable PIN does not discard the (here absent) anchor: no error observation, the
+            # detail says the pin could not be read, never "no pin"
+            assert obs.error is None
+            assert obs.detail.startswith('send pin could not be read: ')
+            assert 'pool I/O is currently suspended' in obs.detail
 
     def test_every_read_of_the_childs_own_values_is_local(self, zfs_world):
         old, new = two_snapshot_pair(zfs_world)
@@ -2617,9 +2658,9 @@ class TestA3Health:
         assert [o.source for o in collect(cfg) if not hasattr(o, 'expected_seconds')] == []
         assert self.of(collect(cfg), CHILD) != []
 
-    def test_a_childs_failed_snapshot_listing_leaves_anchor_error_observations_only(self, zfs_world):
+    def test_a_failed_tree_listing_leaves_anchor_error_observations_only(self, zfs_world):
         two_snapshot_pair(zfs_world)
-        zfs_world.snapshot_list_failures.add(CHILD)
+        zfs_world.tree_list_failures.add(PARENT)       # the parent's tree is ONE listing: the batch is the unit
         collected = collect(config(two_destination_parent()))
         assert self.of(collected, CHILD, 'snapshot') == []
         errors = self.of(collected, CHILD)
@@ -2629,16 +2670,43 @@ class TestA3Health:
         assert not self.of(collected, PARENT)[0].error
 
     @pytest.mark.parametrize('prop', [ANCHOR, PIN])
-    def test_an_unreadable_anchor_or_pin_is_an_error_for_that_destination_only(self, zfs_world, prop):
+    def test_an_unreadable_anchor_or_pin_of_a_child_is_the_error_of_the_whole_batch(self, zfs_world, prop):
+        """The children are read in ONE batch per parent: a value that cannot be read makes every child and
+        destination of that parent an error observation ("the anchor could not be read"), never a smaller or
+        a wrong answer; the parent itself, read on its own, is untouched."""
         old, new = two_snapshot_pair(zfs_world)
         zfs_world.set_prop(CHILD, ANCHOR2, new)
-        zfs_world.unreadable.add((CHILD, prop))
+        zfs_world.set_prop(CHILD, prop, new if prop == ANCHOR else f'{old},{new}')   # phase 1 finds it ...
+        zfs_world.unreadable.add((CHILD, prop))                                       # ... phase 2 cannot read it
         collected = collect(config(two_destination_parent()))
         first, second = self.of(collected, CHILD)
-        assert first.peer == DEST and first.error and 'could not be read' in first.error
-        assert second.error is None and second.detail == new
-        assert [e.state for e in evaluate([first, second], self.NOW())] == [STATE_CRIT, STATE_OK]
+        assert (first.peer, second.peer) == (DEST, SECOND)
+        assert all(o.error and o.error.startswith('the anchor could not be read: ') for o in (first, second))
+        assert all('pool I/O is currently suspended' in o.error for o in (first, second))
+        assert [e.state for e in evaluate([first, second], self.NOW())] == [STATE_CRIT, STATE_CRIT]
         assert all(o.error is None for o in self.of(collected, PARENT))
+
+    @pytest.mark.parametrize('prop', [ANCHOR, PIN])
+    def test_an_unreadable_value_of_a_configured_dataset_is_per_destination(self, zfs_world, prop):
+        """A CONFIGURED dataset (here the child, listed explicitly) is not batched: an unreadable anchor is
+        the error of that destination only; an unreadable pin only a note on a readable anchor."""
+        old, new = two_snapshot_pair(zfs_world)
+        zfs_world.set_prop(CHILD, ANCHOR2, new)
+        zfs_world.set_prop(CHILD, ANCHOR, new)
+        zfs_world.unreadable.add((CHILD, prop))
+        two = DatasetConfig(name=CHILD, frequency=Duration('1h'),
+                            remote=[RemoteDatasetConfig(destination=DEST), RemoteDatasetConfig(destination=SECOND)])
+        collected = collect(config(dataset(PARENT), two, destinations={
+            DEST: Destination(url='https://h:8443'), SECOND: Destination(url='https://h2:8443')}))
+        first, second = self.of(collected, CHILD)
+        assert second.error is None and second.detail == new
+        if prop == ANCHOR:
+            assert first.error.startswith('the anchor could not be read: ') and first.newest_ts is None
+            assert [e.state for e in evaluate([first, second], self.NOW())] == [STATE_CRIT, STATE_OK]
+        else:
+            assert first.error is None and first.newest_ts is not None
+            assert first.detail.startswith(new) and 'send pin could not be read' in first.detail
+            assert [e.state for e in evaluate([first, second], self.NOW())] == [STATE_OK, STATE_OK]
 
     def test_an_unreadable_anchor_of_a_configured_dataset_is_an_error_too(self, zfs_world):
         old, new = two_snapshot_pair(zfs_world)
@@ -2652,3 +2720,285 @@ class TestA3Health:
         two_snapshot_pair(zfs_world)
         collect(config(two_destination_parent()))
         assert zfs_world.writes == [] and {c[0] for c in zfs_world.calls} == {'list', 'get'}
+
+
+# ---------------------------------------------------------------------------------------------
+# `Expansion.skipped`, `quiet=` and `scope=` (the check reports the copies itself)
+# ---------------------------------------------------------------------------------------------
+
+CID_PROP, SRC_PROP = 'org.zfsbackup:client_id', 'org.zfsbackup:source_dataset'
+PROPS_TEXT = f'{CID_PROP} or {SRC_PROP}'
+TARGET_WHY = 'a receive target, which holds copies'
+
+
+@pytest.mark.unit
+class TestExpansionSkipped:
+    """`Expansion.skipped`: for each recursive parent, `(name, why)` of every backup copy or receive target
+    left out, topmost only, one entry per name, in listing order; no key for a parent with none, nor for one
+    whose discovery failed."""
+
+    COPY = f'{PARENT}/copy'
+
+    def tree(self, world):
+        add_tree(world, PARENT, f'{PARENT}/ok', self.COPY, f'{self.COPY}/c1', f'{self.COPY}/c1/x', f'{PARENT}/zcopy')
+
+    def skipped(self, cfg, **kw):
+        return DatasetManager(cfg).expand_recursive(**kw).skipped
+
+    def test_the_default_is_an_empty_read_only_mapping(self):
+        exp = Expansion([], {})
+        assert dict(exp.skipped) == {} and Expansion([], {}).skipped is exp.skipped
+        with pytest.raises(TypeError):
+            exp.skipped['pool/data'] = []
+
+    def test_a_config_without_recursive_roots_has_an_empty_mapping(self, zfs_world):
+        exp = DatasetManager(config(dataset(PARENT))).expand_recursive()
+        assert dict(exp.skipped) == {}
+
+    def test_a_local_marker(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, CID_PROP, 'x')
+        assert dict(self.skipped(config(dataset(PARENT, recursive=True)))) == {
+            PARENT: [(self.COPY, f'carries a local {PROPS_TEXT}')]}
+
+    def test_the_other_marker_too(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, SRC_PROP, 'x')
+        assert self.skipped(config(dataset(PARENT, recursive=True)))[PARENT] == [
+            (self.COPY, f'carries a local {PROPS_TEXT}')]
+
+    def test_a_received_marker(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.received[(self.COPY, CID_PROP)] = 'orig'
+        assert self.skipped(config(dataset(PARENT, recursive=True)))[PARENT] == [
+            (self.COPY, f'carries a received {PROPS_TEXT}')]
+
+    def test_an_inherited_marker_names_the_origin_and_only_the_topmost_is_listed(self, zfs_world):
+        """A marker on `copy` is inherited by `c1` and `x`: one entry, the topmost, whose marker is its own."""
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, CID_PROP, 'x')
+        assert self.skipped(config(dataset(PARENT, recursive=True)))[PARENT] == [
+            (self.COPY, f'carries a local {PROPS_TEXT}')]
+
+    def test_a_parent_inside_a_copy_is_the_one_entry_and_names_where_the_marker_comes_from(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.add('pool')
+        zfs_world.set_prop('pool', CID_PROP, 'x')
+        assert self.skipped(config(dataset(PARENT, recursive=True)))[PARENT] == [
+            (PARENT, f'inherits {PROPS_TEXT} from pool')]
+
+    def test_a_received_marker_above_the_parent(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.add('pool')
+        zfs_world.received[('pool', SRC_PROP)] = 'x'
+        assert self.skipped(config(dataset(PARENT, recursive=True)))[PARENT] == [
+            (PARENT, f'inherits {PROPS_TEXT} from pool')]
+
+    def test_several_copies_are_listed_in_listing_order_one_entry_per_name(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, CID_PROP, 'x')
+        zfs_world.set_prop(f'{self.COPY}/c1', SRC_PROP, 'y')             # nested under the first: no entry
+        zfs_world.set_prop(f'{PARENT}/zcopy', SRC_PROP, 'z')
+        got = self.skipped(config(dataset(PARENT, recursive=True)))[PARENT]
+        assert [name for name, _ in got] == [self.COPY, f'{PARENT}/zcopy']
+
+    def test_a_receive_target_below_the_parent(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/ok', f'{PARENT}/srv', f'{PARENT}/srv/c/x')
+        cfg = config(dataset(PARENT, recursive=True),
+                     remote_backup=RemoteServerConfig(target_dataset=f'{PARENT}/srv', enabled=False))
+        assert self.skipped(cfg)[PARENT] == [(f'{PARENT}/srv', TARGET_WHY)]
+
+    def test_a_local_destination_target_below_the_parent(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/ok', f'{PARENT}/vault', f'{PARENT}/vault/c')
+        cfg = config(dataset(PARENT, recursive=True), destinations={DEST: Destination(url=f'zfs:{PARENT}/vault')})
+        assert self.skipped(cfg)[PARENT] == [(f'{PARENT}/vault', TARGET_WHY)]
+
+    def test_a_parent_inside_a_receive_target_names_the_target(self, zfs_world):
+        add_tree(zfs_world, 'bk', 'bk/data', 'bk/data/a')
+        cfg = config(dataset('bk/data', recursive=True), destinations={DEST: Destination(url='zfs:bk')})
+        assert self.skipped(cfg)['bk/data'] == [('bk', TARGET_WHY)]
+
+    def test_the_target_wins_over_a_marker_on_the_same_name(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/vault')
+        zfs_world.set_prop(f'{PARENT}/vault', CID_PROP, 'x')
+        cfg = config(dataset(PARENT, recursive=True), destinations={DEST: Destination(url=f'zfs:{PARENT}/vault')})
+        assert self.skipped(cfg)[PARENT] == [(f'{PARENT}/vault', TARGET_WHY)]
+
+    def test_a_parent_with_none_has_no_key_and_neither_has_one_that_failed(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', 'pool/other', 'pool/other/c', 'pool/bad', 'pool/bad/c')
+        zfs_world.set_prop('pool/other/c', CID_PROP, 'x')
+        zfs_world.list_failures['pool/bad'] = 'pool I/O is currently suspended'
+        cfg = config(dataset(PARENT, recursive=True), dataset('pool/other', recursive=True),
+                     dataset('pool/bad', recursive=True))
+        exp = DatasetManager(cfg).expand_recursive()
+        assert list(exp.skipped) == ['pool/other'] and list(exp.failed) == ['pool/bad']
+
+    def test_a_marker_read_that_fails_leaves_no_entry(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, CID_PROP, 'x')
+        zfs_world.copy_read_failures[PARENT] = 'pool I/O is currently suspended'
+        exp = DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()
+        assert dict(exp.skipped) == {} and PARENT in exp.failed
+
+    def test_a_configured_child_is_not_a_skipped_copy(self, zfs_world):
+        """A descendant that is configured explicitly is not expanded at all: nothing to report for it."""
+        add_tree(zfs_world, PARENT, f'{PARENT}/ok', self.COPY)
+        zfs_world.set_prop(self.COPY, CID_PROP, 'x')
+        cfg = config(dataset(PARENT, recursive=True), dataset(self.COPY))
+        assert dict(self.skipped(cfg)) == {}
+
+    def test_two_parents_have_their_own_lists(self, zfs_world):
+        add_tree(zfs_world, 'pool/a', 'pool/a/c', 'pool/b', 'pool/b/c')
+        zfs_world.set_prop('pool/a/c', CID_PROP, 'x')
+        zfs_world.set_prop('pool/b/c', SRC_PROP, 'y')
+        got = self.skipped(config(dataset('pool/a', recursive=True), dataset('pool/b', recursive=True)))
+        assert {k: [n for n, _ in v] for k, v in got.items()} == {'pool/a': ['pool/a/c'], 'pool/b': ['pool/b/c']}
+
+    def test_the_result_is_equal_whether_quiet_or_not(self, zfs_world):
+        self.tree(zfs_world)
+        zfs_world.set_prop(self.COPY, CID_PROP, 'x')
+        cfg = config(dataset(PARENT, recursive=True))
+        assert self.skipped(cfg) == self.skipped(cfg, quiet=True)
+        assert child_names(DatasetManager(cfg).expand_recursive()) == child_names(
+            DatasetManager(cfg).expand_recursive(quiet=True))
+
+
+@pytest.mark.unit
+class TestExpansionQuiet:
+    """`quiet=True` (the health check): the two copy ERRORs go to DEBUG and the episodes are NOT marked, so
+    the daemon's own once-per-episode ERROR is unaffected; `quiet=False` is what it always was."""
+
+    COPY = f'{PARENT}/copy'
+
+    def setup_world(self, world, target=False):
+        add_tree(world, PARENT, f'{PARENT}/ok', self.COPY, f'{self.COPY}/c1')
+        world.set_prop(self.COPY, CID_PROP, 'x')
+        if target:
+            add_tree(world, f'{PARENT}/vault', f'{PARENT}/vault/c')
+        kw = {'destinations': {DEST: Destination(url=f'zfs:{PARENT}/vault')}} if target else {}
+        return DatasetManager(config(dataset(PARENT, recursive=True), **kw))
+
+    @pytest.mark.parametrize('target', [False, True], ids=['copy', 'copy+target'])
+    def test_no_error_is_logged_and_the_episodes_stay_unmarked(self, zfs_world, caplog, target):
+        manager = self.setup_world(zfs_world, target)
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            for _ in range(3):
+                exp = manager.expand_recursive(quiet=True)
+        assert records_at(caplog, logging.ERROR) == []
+        assert manager._expand_copy_noted == set() and manager._expand_target_noted == set()
+        assert sorted(child_names(exp)) == [f'{PARENT}/ok']
+        debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any('is a backup copy: not sent' in m and self.COPY in m for m in debug)
+        if target:
+            assert any('receive target' in m and f'{PARENT}/vault' in m for m in debug)
+
+    def test_a_quiet_pass_does_not_use_up_the_daemons_error(self, zfs_world, caplog):
+        manager = self.setup_world(zfs_world, target=True)
+        manager.expand_recursive(quiet=True)
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            manager.expand_recursive()
+            manager.expand_recursive()
+        errors = records_at(caplog, logging.ERROR)
+        assert len(errors) == 2 and any(self.COPY in e for e in errors) and any('receives copies' in e for e in errors)
+
+    def test_not_quiet_logs_once_per_episode_and_marks_it(self, zfs_world, caplog):
+        manager = self.setup_world(zfs_world, target=True)
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            for _ in range(3):
+                manager.expand_recursive()
+        assert len(records_at(caplog, logging.ERROR)) == 2
+        assert manager._expand_copy_noted == {(PARENT, self.COPY)}
+        assert manager._expand_target_noted == {(PARENT, f'{PARENT}/vault')}
+
+    def test_the_default_is_not_quiet(self, zfs_world, caplog):
+        manager = self.setup_world(zfs_world)
+        with caplog.at_level(logging.ERROR, logger=BACKUP_LOGGER):
+            manager.expand_recursive()
+        assert len(records_at(caplog, logging.ERROR)) == 1
+
+    def test_a_quiet_pass_still_logs_a_failed_discovery_as_before(self, zfs_world, caplog):
+        manager = self.setup_world(zfs_world)
+        zfs_world.list_failures[PARENT] = 'pool I/O is currently suspended'
+        with caplog.at_level(logging.DEBUG, logger=BACKUP_LOGGER):
+            exp = manager.expand_recursive(quiet=True)
+        assert PARENT in exp.failed
+        assert len(records_at(caplog, logging.ERROR)) == 1          # `quiet` covers the two copy ERRORs only
+
+
+class _Scope:
+    """A `scope()` for `expand_recursive` / `_copy_roots` / `received_datasets`: counts the contexts entered."""
+
+    def __init__(self, error=None, fail_on=None):
+        self.entered = 0
+        self.error = error
+        self.fail_on = fail_on
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.error is not None and (self.fail_on is None or self.calls == self.fail_on):
+            raise self.error
+        return self
+
+    def __enter__(self):
+        self.entered += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.unit
+class TestExpansionScope:
+    def test_every_zfs_call_of_the_discovery_runs_in_a_scope(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', 'pool/two', 'pool/two/b')
+        scope = _Scope()
+        DatasetManager(config(dataset(PARENT, recursive=True), dataset('pool/two', recursive=True))
+                       ).expand_recursive(scope=scope)
+        assert scope.entered == scope.calls == 4 and len(zfs_world.calls) == 4     # (list + marker read) x 2 parents
+
+    def test_without_one_nothing_changes(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        assert child_names(DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive()) == [
+            f'{PARENT}/a']
+
+    @pytest.mark.parametrize('fail_on', [1, 2], ids=['listing', 'marker-read'])
+    def test_a_timeout_from_the_scope_is_that_parents_failure_and_the_next_parent_goes_on(self, zfs_world, fail_on):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a', 'pool/two', 'pool/two/b')
+        scope = _Scope(error=ZFSTimeoutError('the time limit is spent'), fail_on=fail_on)
+        exp = DatasetManager(config(dataset(PARENT, recursive=True), dataset('pool/two', recursive=True))
+                             ).expand_recursive(scope=scope)
+        assert exp.failed == {PARENT: 'ZFSTimeoutError: the time limit is spent'}
+        assert child_names(exp) == ['pool/two/b']
+        assert PARENT not in exp.skipped
+
+    def test_a_timeout_from_a_call_is_that_parents_failure(self, zfs_world, mocker):
+        add_tree(zfs_world, PARENT, f'{PARENT}/a')
+        mocker.patch('zfsbackup.backup_manager.zfs.get.property_sources',
+                     side_effect=ZFSTimeoutError('zfs get took too long'))
+        exp = DatasetManager(config(dataset(PARENT, recursive=True))).expand_recursive(scope=_Scope())
+        assert exp.failed == {PARENT: 'ZFSTimeoutError: zfs get took too long'} and exp.children == []
+
+    def test_copy_roots_runs_its_read_in_the_scope(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/copy')
+        zfs_world.set_prop(f'{PARENT}/copy', CID_PROP, 'x')
+        scope = _Scope()
+        assert DatasetManager._copy_roots(PARENT, scope=scope) == {f'{PARENT}/copy': 'local'}
+        assert scope.entered == 1 and len(zfs_world.calls) == 1
+
+    def test_copy_roots_without_a_scope_is_unchanged(self, zfs_world):
+        add_tree(zfs_world, PARENT, f'{PARENT}/copy')
+        zfs_world.set_prop(f'{PARENT}/copy', CID_PROP, 'x')
+        assert DatasetManager._copy_roots(PARENT) == {f'{PARENT}/copy': 'local'}
+
+    def test_copy_roots_passes_a_scope_timeout_through_unchanged(self, zfs_world):
+        add_tree(zfs_world, PARENT)
+        error = ZFSTimeoutError('over the limit')
+        with pytest.raises(ZFSTimeoutError) as caught:
+            DatasetManager._copy_roots(PARENT, scope=_Scope(error=error))
+        assert caught.value is error and zfs_world.calls == []
+
+    def test_copy_roots_wraps_any_other_scope_failure_naming_the_parent(self, zfs_world):
+        add_tree(zfs_world, PARENT)
+        with pytest.raises(RuntimeError, match=f'at or below {PARENT}'):
+            DatasetManager._copy_roots(PARENT, scope=_Scope(error=ValueError('odd')))

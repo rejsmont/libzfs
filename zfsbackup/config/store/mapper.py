@@ -845,24 +845,39 @@ def _validate_rules(
 
 
 _PROPERTY_NAME_CHARS = re.compile(r"[A-Za-z0-9_.:-]+")
+# The two per-destination user properties the daemon writes
+# (`backup_manager.PROP_ANCHOR_PREFIX` / `PROP_INFLIGHT_PREFIX`; not imported,
+# because the store must load on a host without `zfs`). The pin is the longer
+# of the two, so the name is measured against IT: a name that fits only the
+# anchor gets a storable anchor but a pin libzfseasy refuses to write
+# (`Validate.attribute`), and `check` then reports a permanent CRIT for it.
 _ANCHOR_PROPERTY_PREFIX = "org.zfsbackup:anchor."
-_MAX_PROPERTY_NAME = 256  # ZAP_MAXNAMELEN
+_INFLIGHT_PROPERTY_PREFIX = "org.zfsbackup:inflight."
+_LONGEST_PROPERTY_PREFIX = max(
+    _ANCHOR_PROPERTY_PREFIX, _INFLIGHT_PROPERTY_PREFIX, key=len
+)
+# A property name is at most 255 characters: OpenZFS refuses a user-property
+# name of ZAP_MAXNAMELEN (256) or more, which counts the NUL, and libzfseasy's
+# `Validate.attribute` enforces `Validate.max_name_len` (255). The bound used
+# to be 256, which let one name length through that libzfseasy then raised on.
+_MAX_PROPERTY_NAME = 255
 
 
 def destination_name_problem(name: str) -> Optional[str]:
-    """Why `name` cannot hold a ZFS anchor, or None if it can. Pure.
+    """Why `name` cannot hold a ZFS anchor and in-flight pin, or None if it
+    can. Pure.
 
-    A destination's name is part of a ZFS user-property name,
-    `org.zfsbackup:anchor.<name>`. OpenZFS accepts ASCII letters, digits and
-    `-` `_` `.` `:` in user-property names (`zprop_valid_char`; the manual
-    recommends lowercase) and at most 256 characters in all. This is the
-    conservative form of that rule. A name outside it can never have an
-    anchor stored, so the incremental base of every transfer to that
-    destination is unprotected from pruning.
+    A destination's name is part of two ZFS user-property names,
+    `org.zfsbackup:anchor.<name>` and `org.zfsbackup:inflight.<name>`.
+    OpenZFS accepts ASCII letters, digits and `-` `_` `.` `:` in user-property
+    names (`zprop_valid_char`; the manual recommends lowercase) and at most
+    255 characters in all; the longer `inflight.` property is the one that
+    bounds the name. This is the conservative form of that rule. A name
+    outside it can never have an anchor and/or pin stored, so the incremental
+    base of every transfer to that destination is unprotected from pruning.
 
-    Public: `validate_config` reports it as a WARNING (existing configs may
-    legitimately contain such names), and `zfsbackup-config rename
-    destination` uses it as a hard refusal for the NEW name.
+    Public: `validate_config` and `zfsbackup-config rename destination` both
+    use it as a hard refusal.
     """
     if not name:
         return "it is empty"
@@ -870,13 +885,14 @@ def destination_name_problem(name: str) -> Optional[str]:
         bad = sorted({c for c in name if not _PROPERTY_NAME_CHARS.fullmatch(c)})
         return (
             f"it contains {' '.join(repr(c) for c in bad)}; the name becomes part of the ZFS "
-            f"property {_ANCHOR_PROPERTY_PREFIX}<name>, which allows only letters, digits "
-            "and - _ . :"
+            f"properties {_ANCHOR_PROPERTY_PREFIX}<name> and {_INFLIGHT_PROPERTY_PREFIX}<name>, "
+            "which allow only letters, digits and - _ . :"
         )
-    if len(_ANCHOR_PROPERTY_PREFIX) + len(name) > _MAX_PROPERTY_NAME:
+    if len(_LONGEST_PROPERTY_PREFIX) + len(name) > _MAX_PROPERTY_NAME:
         return (
-            f"it is too long: {_ANCHOR_PROPERTY_PREFIX}<name> may be at most "
-            f"{_MAX_PROPERTY_NAME} characters"
+            f"it is too long: {_INFLIGHT_PROPERTY_PREFIX}<name> may be at most "
+            f"{_MAX_PROPERTY_NAME} characters, so the name may be at most "
+            f"{_MAX_PROPERTY_NAME - len(_LONGEST_PROPERTY_PREFIX)}"
         )
     return None
 
@@ -1199,7 +1215,12 @@ def validate_config(config: BackupConfig) -> List[str]:
       own client id, which the server reserves)
       (`_require_disjoint_receive_targets`);
     - a `zfs:` destination that carries a `server_fingerprint`
-      (`destination_problem`).
+      (`destination_problem`);
+    - a destination name that cannot be a ZFS user-property suffix
+      (`destination_name_problem`: empty, a character outside letters, digits
+      and `- _ . :`, or longer than 232 characters): its
+      `org.zfsbackup:anchor.<name>` anchor and `org.zfsbackup:inflight.<name>`
+      pin can never be stored.
 
     Warns (returned, not raised):
 
@@ -1213,9 +1234,6 @@ def validate_config(config: BackupConfig) -> List[str]:
       full;
     - `api_port` 0 (the API binds an ephemeral port that changes on every
       start);
-    - a destination name that cannot be a ZFS user-property suffix
-      (`destination_name_problem`): its `org.zfsbackup:anchor.<name>` anchor
-      can never be stored;
     - exact `(age, keep_for)` duplicates within a scope, naming both
       literals -- `save_config` drops the later one because the DB's
       unique indexes cannot hold them.
@@ -1326,17 +1344,20 @@ def validate_config(config: BackupConfig) -> List[str]:
                     f"{dest.server_fingerprint!r} is not canonical; "
                     f"expected {canonical!r} (64 lowercase hex digits)"
                 )
-        # WARNING, not an error: configs that predate this check may already
-        # carry such names, and refusing to load/import them would strand
-        # the operator. The cost of the name is real but silent -- no anchor
-        # can ever be written for it, so the snapshot an incremental send
-        # depends on is not protected from pruning.
+        # A REFUSAL (user decision 2026-11-11), not a warning. The name is part
+        # of the ZFS properties `org.zfsbackup:anchor.<name>` and
+        # `org.zfsbackup:inflight.<name>`; a name that cannot form them can
+        # never have an anchor or a send pin stored, so the snapshot an
+        # incremental send depends on is not protected from pruning (and
+        # `check` reports a permanent CRIT for the pin). Raising here covers
+        # every path that validates: import, set/edit, a daemon (re)load.
         problem = destination_name_problem(name)
         if problem is not None:
-            warnings.append(
-                f"destinations[{name}]: the name cannot hold a ZFS anchor "
-                f"({problem}); anchors can never be stored for it, so the "
-                "incremental base for this destination is not protected "
+            raise ValueError(
+                f"destinations[{name}]: the name cannot form the ZFS properties "
+                f"{_ANCHOR_PROPERTY_PREFIX}<name> and {_INFLIGHT_PROPERTY_PREFIX}<name> "
+                f"({problem}); anchors and send pins can never be stored for it, so "
+                "the incremental base for this destination would not be protected "
                 "from pruning"
             )
 

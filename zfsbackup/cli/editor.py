@@ -330,6 +330,8 @@ def _anchor_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
         after = {r["destination"] for r in new_ds[name].get("remote", [])}
         for dest in sorted(before - after):
             covered.add(dest)
+            if dotpath.destination_name_problem(dest):
+                continue  # never held an anchor: no property to clear
             messages.append(
                 f"datasets[{name}] no longer sends to {dest!r}: its "
                 f"org.zfsbackup:anchor.{dest} property stays behind and keeps "
@@ -338,6 +340,8 @@ def _anchor_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
                 "no longer needed"
             )
     for dest in sorted(set(old_dest) - set(new_dest) - covered):
+        if dotpath.destination_name_problem(dest):
+            continue  # never held an anchor: no property to clear
         messages.append(
             f"destination {dest!r} is deleted: datasets that sent to it keep "
             f"their org.zfsbackup:anchor.{dest} property, which keeps pinning "

@@ -940,8 +940,10 @@ def stale_anchor_warnings(name: str, old: Destination, new: Destination, config:
     -S` (it clears the LOCAL value and leaves a received one alone; plain
     `zfs inherit` would hide a received anchor, which the pruner still
     protects). Empty when no dataset sends to `name` (no anchor can exist) or
-    the URL is unchanged."""
-    if _anchor_url(old.url) == _anchor_url(new.url):
+    the URL is unchanged, or `name` cannot form an anchor property at all (a
+    stored name `validate_config` now refuses: nothing was ever stored under it,
+    and the advice would be an invalid `zfs inherit`)."""
+    if _anchor_url(old.url) == _anchor_url(new.url) or destination_name_problem(name):
         return []
     senders = [d for d in config.datasets if any(r.destination == name for r in d.remote)]
     if not senders:

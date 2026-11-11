@@ -86,6 +86,7 @@ from _cli_support import (
     isolated,
     live_daemon,
     make_db,
+    plant_destination_name,
     run,
     scratch_tmp,
     seed_client_id,
@@ -2233,7 +2234,8 @@ class TestRenameDestination:
             ("ok-1_x.y:z", None),
             ("", "it is empty"),
             ("a b", "it contains ' '"),
-            ("x" * 235, None),
+            ("x" * 232, None),
+            ("x" * 233, "it is too long"),
             ("x" * 240, "it is too long"),
         ],
     )
@@ -2245,9 +2247,224 @@ class TestRenameDestination:
             assert problem is not None and expected in problem
 
     def test_the_length_limit_is_on_the_whole_property_name(self):
-        limit = 256 - len("org.zfsbackup:anchor.")
+        # measured against the longer `inflight.` pin property, 255 characters at most
+        limit = 255 - len("org.zfsbackup:inflight.")
+        assert limit == 232
         assert dotpath.destination_name_problem("x" * limit) is None
         assert "too long" in dotpath.destination_name_problem("x" * (limit + 1))
+
+    def test_the_longest_name_is_renamed_to_and_one_more_is_refused(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {})
+        fake_zfs.add("tank/other", {})
+        state = db_state(rich)
+        refused = run("rename", "destination", "offsite", "y" * 233, "-c", rich)
+        assert refused.exit_code == 1 and "it is too long" in refused.stderr
+        assert db_state(rich) == state
+        assert run("rename", "destination", "offsite", "y" * 232, "-c", rich).exit_code == 0
+        assert "y" * 232 in stored(rich).destinations
+
+    def test_a_stored_unusable_name_nothing_refers_to_is_renamed_to_a_usable_one(self, run, rich):
+        """The way out: read-only commands and `rename destination BAD GOOD` work on a bad stored name
+        (planted with SQL, as an older release could have stored it)."""
+        plant_destination_name(rich, "spare", "bad name")
+        gen = generation(rich)
+        assert run("list", "destinations", "-c", rich).exit_code == 0
+        assert run("export", "-c", rich).exit_code == 0
+        result = run("rename", "destination", "bad name", "spare", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert generation(rich) == gen + 1
+        assert sorted(stored(rich).destinations) == ["dc.two", "offsite", "spare"]
+
+    BAD = "bad name"
+    NOTE = (
+        "note: the old name 'bad name' could not hold anchors or send pins "
+        f"({dotpath.destination_name_problem('bad name')}), "
+        "so there is nothing to copy; the first send to 'offsite' negotiates its base"
+    )
+
+    def planted(self, rich, fake_zfs):
+        """`tank/data` (recursive) and `tank/other` send to the stored unusable name `bad name`; the
+        fake pool holds what a real one can: no property of that name (it cannot exist)."""
+        fake_zfs.add("tank/data", {ANCHOR + "dc.two": "snapB"})
+        fake_zfs.add("tank/other", {})
+        plant_destination_name(rich, "offsite", self.BAD)
+        fake_zfs.clear_calls()
+        assert self.BAD in stored(rich).destinations
+        return generation(rich)
+
+    @staticmethod
+    def mentioning(fake_zfs, text="bad name"):
+        return [c for c in fake_zfs.calls if text in " ".join(c)]
+
+    def test_a_stored_unusable_name_a_dataset_sends_to_is_renamed_to_a_usable_one(self, run, rich, fake_zfs):
+        gen = self.planted(rich, fake_zfs)
+        result = run("rename", "destination", "bad name", "offsite", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert generation(rich) == gen + 1
+        config = stored(rich)
+        assert sorted(config.destinations) == ["dc.two", "offsite", "spare"]
+        assert [r.destination for d in config.datasets if d.name == "tank/other" for r in d.remote] == ["offsite"]
+        # nothing was copied: no anchor or pin of the new name appeared anywhere
+        for dataset in ("tank/data", "tank/other"):
+            props = fake_zfs.props(dataset)
+            assert ANCHOR + "offsite" not in props and INFLIGHT + "offsite" not in props
+        assert result.stdout.count(self.NOTE) == 1
+        # and no zfs get/set/inherit of any property containing the bad name was ever run
+        assert self.mentioning(fake_zfs) == []
+        assert fake_zfs.mutations == []
+
+    def test_the_note_follows_the_renamed_line_and_is_printed_once(self, run, rich, fake_zfs):
+        self.planted(rich, fake_zfs)
+        result = run("rename", "destination", "bad name", "offsite", "-c", rich)
+        lines = result.stdout.splitlines()
+        assert lines[0] == "Renamed destination 'bad name' -> 'offsite' in the configuration."
+        assert lines.index(self.NOTE) > 0
+        assert (result.stdout + result.stderr).count("could not hold anchors") == 1
+
+    def test_a_stored_unusable_name_makes_no_zfs_call_and_loads_no_backup_manager(
+        self, run, rich, fake_zfs, monkeypatch
+    ):
+        self.planted(rich, fake_zfs)
+        loaded = []
+        monkeypatch.setattr(rename, "_load_backup_manager", lambda: loaded.append(1) or (None, "spy"))
+        result = run("rename", "destination", "bad name", "offsite", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert loaded == []
+        assert fake_zfs.calls == []
+        assert "ZFS" not in result.stderr and "must be copied" not in result.stderr
+
+    def test_a_stored_unusable_name_is_renamed_with_zfs_unavailable(self, run, rich, fake_zfs, monkeypatch):
+        """Before the fix a dataset sending to the name made `rename` abort 'ZFS cannot be used here'."""
+        self.planted(rich, fake_zfs)
+        monkeypatch.setattr(rename, "_load_backup_manager", lambda: (None, "libzfseasy: no zfs binary here"))
+        result = run("rename", "destination", "bad name", "offsite", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert "cannot be used here" not in result.stderr
+        assert "offsite" in stored(rich).destinations and self.BAD not in stored(rich).destinations
+        assert result.stdout.count(self.NOTE) == 1
+        assert fake_zfs.calls == []
+
+    @pytest.mark.integration
+    def test_in_a_process_with_no_zfs_at_all_the_unusable_name_is_renamed_and_no_zfs_module_loads(
+        self, tmp_path, run, rich, fake_zfs
+    ):
+        self.planted(rich, fake_zfs)
+        env = {k: v for k, v in os.environ.items() if k not in ("ZFS_CMD", "ZPOOL_CMD")}
+        env["PATH"] = os.path.dirname(sys.executable)
+        env["PYTHONPATH"] = REPO
+        code = (
+            "import sys\n"
+            "from zfsbackup.cli.main import cli\n"
+            "try:\n"
+            f"    cli.main(args={['rename', 'destination', 'bad name', 'offsite', '-c', str(rich)]!r}, standalone_mode=False)\n"
+            "except SystemExit as exc:\n"
+            "    print('EXIT', exc.code)\n"
+            "bad = sorted(m for m in sys.modules if m.split('.')[0] == 'libzfseasy' "
+            "or m in ('zfsbackup.backup_manager', 'zfsbackup.daemon'))\n"
+            "print('LOADED', bad)\n"
+        )
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              env=env, cwd=str(tmp_path), timeout=120)
+        report = f"{done.stdout}\n{done.stderr}"
+        assert done.returncode == 0, report
+        assert "LOADED []" in done.stdout and "EXIT" not in done.stdout, report
+        assert "could not hold anchors" in done.stdout, report
+        assert "offsite" in stored(rich).destinations and self.BAD not in stored(rich).destinations
+
+    def test_skip_missing_is_irrelevant_for_an_unusable_name(self, run, rich, fake_zfs):
+        """No existence check is made, so a dataset missing from ZFS neither blocks nor warns."""
+        gen = self.planted(rich, fake_zfs)
+        fake_zfs.state_path.write_text("{}")      # neither dataset exists in ZFS
+        for extra in ((), ("--skip-missing",)):
+            state = db_state(rich)
+            result = run("rename", "destination", "bad name", "offsite", *extra, "-d", "-c", rich)
+            assert result.exit_code == 0, result.stderr
+            assert "does not exist in ZFS" not in result.stderr and warnings_in(result) == []
+            assert db_state(rich) == state
+        result = run("rename", "destination", "bad name", "offsite", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert warnings_in(result) == [] and generation(rich) == gen + 1
+        assert fake_zfs.calls == []
+
+    def test_a_recursive_dataset_sending_to_an_unusable_name_is_not_expanded(self, run, rich, fake_zfs):
+        """`tank/data` is `recursive: true`: no descendant listing, no descendant anchor read or copy."""
+        self.planted(rich, fake_zfs)
+        fake_zfs.add("tank/data/child", {ANCHOR + "dc.two": "c1"})
+        fake_zfs.clear_calls()
+        result = run("rename", "destination", "bad name", "offsite", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert fake_zfs.calls == []
+        assert ANCHOR + "offsite" not in fake_zfs.props("tank/data/child")
+        assert warnings_in(result) == []
+
+    def test_dry_run_prints_the_prefixed_note_before_would_rename_and_writes_nothing(
+        self, run, rich, fake_zfs
+    ):
+        gen = self.planted(rich, fake_zfs)
+        state = db_state(rich)
+        result = run("rename", "destination", "bad name", "offsite", "--dry-run", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        lines = result.stdout.splitlines()
+        noted = [i for i, l in enumerate(lines) if l == "[dry run] " + self.NOTE]
+        would = [i for i, l in enumerate(lines) if l.startswith("[dry run] would rename destination 'bad name'")]
+        assert len(noted) == 1 and len(would) == 1 and noted[0] < would[0]
+        assert "tank/data" in lines[would[0]] and "tank/other" in lines[would[0]]
+        assert result.stdout.count("could not hold anchors") == 1
+        assert db_state(rich) == state and generation(rich) == gen
+        assert fake_zfs.calls == []
+
+    def test_a_generation_conflict_still_exits_75_and_prints_no_note(self, run, rich, fake_zfs, monkeypatch):
+        self.planted(rich, fake_zfs)
+        # another writer commits between the snapshot and the write. `write_config` would refuse (the
+        # stored name is unusable), so bump the generation with SQL, as that writer's commit would.
+        real = rename.commit_config
+        done = []
+
+        def commit(resolved, snapshot, config, **kwargs):
+            from sqlalchemy import text
+
+            from zfsbackup.config.store import db as store_db
+
+            try:
+                with store_db.session_scope(store_db.url_for_path(rich)) as session:
+                    session.execute(text("UPDATE global_settings SET generation = generation + 1"))
+            finally:
+                dispose_all()
+            done.append(True)
+            return real(resolved, snapshot, config, **kwargs)
+
+        monkeypatch.setattr(rename, "commit_config", commit)
+        result = run("rename", "destination", "bad name", "offsite", "-c", rich)
+        assert done == [True]
+        assert result.exit_code == 75
+        assert "config changed underneath you" in result.stderr
+        assert "could not hold anchors" not in result.stdout
+        assert self.BAD in stored(rich).destinations and "offsite" not in stored(rich).destinations
+        assert fake_zfs.calls == []
+
+    def test_a_usable_old_name_prints_no_note(self, run, rich, fake_zfs):
+        fake_zfs.add("tank/data", {})
+        fake_zfs.add("tank/other", {})
+        result = run("rename", "destination", "offsite", "offsite2", "-c", rich)
+        assert result.exit_code == 0, result.stderr
+        assert "could not hold anchors" not in result.stdout + result.stderr
+
+    def test_renaming_a_stored_unusable_name_to_another_unusable_one_is_refused(self, run, rich, fake_zfs):
+        plant_destination_name(rich, "offsite", "bad name")
+        state = db_state(rich)
+        result = run("rename", "destination", "bad name", "also bad", "-c", rich)
+        assert result.exit_code == 1 and "cannot be used as a destination name" in result.stderr
+        assert db_state(rich) == state
+
+    def test_another_edit_on_a_database_holding_an_unusable_name_is_refused_until_it_is_renamed(
+        self, run, rich
+    ):
+        plant_destination_name(rich, "offsite", "bad name")
+        state = db_state(rich)
+        result = run("rename", "destination", "spare", "spare2", "-c", rich)
+        assert result.exit_code == 1
+        assert "destinations[bad name]: the name cannot form the ZFS properties" in result.stderr
+        assert db_state(rich) == state
 
     # -- failures while copying -------------------------------------------
 

@@ -10,6 +10,7 @@ import shlex
 import sys
 import os
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -182,15 +183,18 @@ def _own_zfsbackup_rows(rows) -> Dict[str, Dict[str, str]]:
 def _read_own_properties_once(
     ds: Dataset, recursive: bool, also: Tuple[str, ...] = (),
     sources: Optional[Dict[str, Dict[str, str]]] = None,
+    prefix: Union[str, Tuple[str, ...]] = PROP_PREFIX,
 ) -> Dict[str, Dict[str, str]]:
     """One attempt of `_read_own_properties` (two execs). `also` (own read only)
     names properties that are asked for in phase 2 whether or not phase 1 saw
     them. `sources`, when given, is filled with `{object: {property: source}}`
-    (`local` or `received`) of the rows that were read."""
-    prefix = ds.name + '/'
+    (`local` or `received`) of the rows that were read. `prefix` narrows phase
+    1 to properties whose name starts with it (a string, or a tuple of them),
+    which must lie within `org.zfsbackup:`."""
+    below = ds.name + '/'
     if recursive:
         def in_scope(name: str) -> bool:
-            return name.startswith(prefix) and '@' not in name and '#' not in name
+            return name.startswith(below) and '@' not in name and '#' not in name
     else:
         def in_scope(name: str) -> bool:
             return name == ds.name
@@ -200,7 +204,7 @@ def _read_own_properties_once(
     found = [
         r for r in zfs.get.property_sources(
             ds, types='filesystem,volume', sources=list(_OWN_SOURCES),
-            recursive=recursive, prefix=PROP_PREFIX,
+            recursive=recursive, prefix=prefix if isinstance(prefix, str) else list(prefix),
         )
         if in_scope(r.name)
     ]
@@ -252,6 +256,7 @@ def _read_own_properties_once(
 def _read_own_properties(
     ds: Dataset, recursive: bool, also: Tuple[str, ...] = (),
     sources: Optional[Dict[str, Dict[str, str]]] = None,
+    prefix: Union[str, Tuple[str, ...]] = PROP_PREFIX,
 ) -> Dict[str, Dict[str, str]]:
     """`{object name: {org.zfsbackup:* property: value}}` for `ds` (or, with
     `recursive`, its descendants), local/received only. The two-phase read
@@ -269,12 +274,12 @@ def _read_own_properties(
         raise ValueError("`also` is for the own read only")
     also = tuple(dict.fromkeys(also))
     try:
-        return _read_own_properties_once(ds, recursive, also, sources)
+        return _read_own_properties_once(ds, recursive, also, sources, prefix)
     except _PropertiesChanged as e:
         logger.debug(f"{e}; reading again")
     if sources is not None:
         sources.clear()
-    return _read_own_properties_once(ds, recursive, also, sources)
+    return _read_own_properties_once(ds, recursive, also, sources, prefix)
 
 
 def read_zfsbackup_properties(ds: Dataset, also: Iterable[str] = ()) -> Dict[str, str]:
@@ -309,7 +314,11 @@ def read_zfsbackup_properties(ds: Dataset, also: Iterable[str] = ()) -> Dict[str
     return _read_own_properties(ds, False, tuple(also)).get(ds.name, {})
 
 
-def read_descendant_zfsbackup_properties(ds: Dataset) -> Dict[str, Dict[str, str]]:
+def read_descendant_zfsbackup_properties(
+    ds: Dataset,
+    sources: Optional[Dict[str, Dict[str, str]]] = None,
+    prefix: Union[str, Tuple[str, ...]] = PROP_PREFIX,
+) -> Dict[str, Dict[str, str]]:
     """`read_zfsbackup_properties` for every DESCENDANT of `ds` (not `ds`
     itself), recursively: `{descendant name: {property: value}}`, only
     descendants that have at least one local/received `org.zfsbackup:*`
@@ -323,8 +332,15 @@ def read_descendant_zfsbackup_properties(ds: Dataset) -> Dict[str, Dict[str, str
     pruner must not prune on an unknown protect-set, so the ancestor is
     skipped this cycle. (A bad value INHERITED by `ds` itself from above can
     still break `ds`'s own group in phase 2, but only when a descendant sets
-    that same property name locally.)"""
-    return _read_own_properties(ds, True)
+    that same property name locally.)
+
+    `sources`, when given, is filled with `{descendant: {property: source}}`
+    (`local` or `received`) of the values returned, for a caller that counts
+    only LOCAL ones (the health check). `prefix` (a string or a tuple of
+    them) narrows the read to properties whose name starts with it, so an
+    unrelated `org.zfsbackup:*` value (a newline in a `config`) cannot break
+    it; the default is every `org.zfsbackup:*` property."""
+    return _read_own_properties(ds, True, sources=sources, prefix=prefix)
 
 
 def copy_anchor_property(
@@ -491,8 +507,9 @@ def clear_zfsbackup_properties(
 
 
 class LocalAnchorUnreadable(Exception):
-    """`DatasetManager.get_local_anchor` could not read the property because
-    zfs failed (not because it is unset). The text is zfs's own message."""
+    """`DatasetManager.get_local_anchor` or `get_local_inflight` (the anchor
+    or the send pin) could not read the property because zfs failed (not
+    because it is unset). The text is zfs's own message."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -570,14 +587,27 @@ class DatasetInfo:
         return f"DatasetInfo({self.name})"
 
 
+#: `Expansion.skipped`'s default: an empty mapping nobody can mutate (a
+#: NamedTuple default is shared by every instance).
+_NO_SKIPPED: Mapping[str, List[Tuple[str, str]]] = types.MappingProxyType({})
+
+
 class Expansion(NamedTuple):
     """What `DatasetManager.expand_recursive` found: the `children` (one
     `DatasetInfo` per descendant to send, parents' order, each with
-    `expanded_from` set) and `failed`, which maps a recursive parent whose
+    `expanded_from` set), `failed`, which maps a recursive parent whose
     discovery failed this time to the error (its children are unknown, not
-    gone)."""
+    gone), and `skipped`: for each recursive parent, the `(name, why)` of every
+    backup copy or receive target found at or below it that was left out
+    (`name` is the topmost one of each subtree, a copy root or a receive
+    target, or the parent itself when it sits inside a copy or a target; `why`
+    is a short phrase), in listing order, one entry per name. Additive and
+    read-only (the daemon logs them once per episode; `check` reports them); a
+    parent with none has no key, and a parent whose discovery failed has none
+    either. The default is an empty read-only mapping."""
     children: List['DatasetInfo']
     failed: Dict[str, str]
+    skipped: Mapping[str, List[Tuple[str, str]]] = _NO_SKIPPED
 
 
 #: The start of the error `zfs.list(strict=True)` raises for output it cannot trust.
@@ -783,7 +813,11 @@ class DatasetManager:
                     targets.append(target)
         return targets
 
-    def expand_recursive(self, should_stop: Optional[Callable[[], bool]] = None) -> Expansion:
+    def expand_recursive(
+        self, should_stop: Optional[Callable[[], bool]] = None,
+        *, scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
+        quiet: bool = False,
+    ) -> Expansion:
         """The descendants of the enabled `recursive: true` datasets that have
         `remote:` entries, each as its own sending pair (never `send -R`, `-p`
         or `-I`: every child is an ordinary `-i` chain into its own copy).
@@ -843,7 +877,14 @@ class DatasetManager:
         are then unknown (not gone), the parent itself is unaffected. ERROR once
         per parent while it persists, INFO when it works again. `should_stop`
         is checked before each parent; once it is true the result is partial
-        and only fit for leaving. Never raises."""
+        and only fit for leaving. `Expansion.skipped` lists every backup copy and
+        receive target left out, per parent (the ERRORs above say the same, once
+        per episode); `quiet=True` (the health check, which reports `skipped`
+        itself) logs those two ERRORs at DEBUG instead and does not mark the
+        episode as announced. `scope()` (the health check passes one)
+        returns a context manager every `zfs` call of the discovery runs in
+        (its timeouts); a `ZFSTimeoutError` from it or from a call is that
+        parent's failure, like any other. Never raises."""
         children: List[DatasetInfo] = []
         failed: Dict[str, str] = {}
         configured = {c.name: c for c in self.config.datasets}
@@ -852,9 +893,11 @@ class DatasetManager:
             self._expand_error_noted.clear()
             self._expand_target_noted.clear()
             self._expand_copy_noted.clear()
-            return Expansion(children, failed)
+            return Expansion(children, failed, {})
+        scope = scope or _no_scope
         targets = self._receive_targets()
         seen: Set[str] = set()
+        skipped: Dict[str, Dict[str, str]] = {}
         blocked_now: Set[Tuple[str, str]] = set()
         copies_now: Set[Tuple[str, str]] = set()
         listed_ok: Set[str] = set()
@@ -864,12 +907,13 @@ class DatasetManager:
                 stopped = True
                 break
             try:
-                listing = [
-                    d.name for d in zfs.list(
-                        roots=Dataset(root.name), recursive=True, types='filesystem,volume'
-                    )
-                ]
-                copy_roots = self._copy_roots(root.name)
+                with scope():
+                    listing = [
+                        d.name for d in zfs.list(
+                            roots=Dataset(root.name), recursive=True, types='filesystem,volume'
+                        )
+                    ]
+                copy_roots = self._copy_roots(root.name, scope=scope)
             except Exception as e:
                 failed[root.name] = f"{type(e).__name__}: {e}"
                 if root.name not in self._expand_error_noted:
@@ -899,7 +943,10 @@ class DatasetManager:
                 if hit is not None:
                     key = (root.name, hit)
                     blocked_now.add(key)
-                    if key not in self._expand_target_noted:
+                    skipped.setdefault(root.name, {}).setdefault(hit, 'a receive target, which holds copies')
+                    if quiet:
+                        logger.debug("%s is at or below the receive target %s: not sent", name, hit)
+                    elif key not in self._expand_target_noted:
                         self._expand_target_noted.add(key)
                         logger.error(
                             "%s is at or below %s, which receives copies: it and its descendants "
@@ -911,7 +958,11 @@ class DatasetManager:
                 if copy_root is not None:
                     key = (root.name, copy_root)
                     copies_now.add(key)
-                    if key not in self._expand_copy_noted:
+                    skipped.setdefault(root.name, {}).setdefault(
+                        copy_root, self._copy_why(copy_roots[copy_root]))
+                    if quiet:
+                        logger.debug("%s is a backup copy: not sent", copy_root)
+                    elif key not in self._expand_copy_noted:
                         self._expand_copy_noted.add(key)
                         logger.error(self._copy_root_message(
                             root.name, copy_root, copy_roots[copy_root],
@@ -945,10 +996,25 @@ class DatasetManager:
                 k for k in self._expand_copy_noted
                 if k in copies_now or k[0] not in listed_ok
             }
-        return Expansion(children, failed)
+        return Expansion(
+            children, failed,
+            {parent: list(names.items()) for parent, names in skipped.items()},
+        )
 
     @staticmethod
-    def _copy_roots(parent: str) -> Dict[str, str]:
+    def _copy_why(source: str) -> str:
+        """`Expansion.skipped`'s short phrase for a copy root whose marker comes
+        from `source` (what zfs printed: `local`, `received`, `inherited from X`)."""
+        props = f"{PROP_CLIENT_ID} or {PROP_SOURCE_DATASET}"
+        if source.startswith('inherited'):
+            origin = source[len('inherited from '):] or 'an ancestor'
+            return f"inherits {props} from {origin}"
+        return f"carries a {'received' if source == 'received' else 'local'} {props}"
+
+    @staticmethod
+    def _copy_roots(
+        parent: str, scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
+    ) -> Dict[str, str]:
         """The datasets at or below `parent` that carry a LOCAL, RECEIVED or
         INHERITED `org.zfsbackup:client_id` or `org.zfsbackup:source_dataset`:
         backup copies (a server's, a local destination's, or a replica of
@@ -966,12 +1032,13 @@ class DatasetManager:
         `ZFSTimeoutError` unchanged, anything else as a `RuntimeError` that
         names `parent` and chains the cause."""
         try:
-            rows = zfs.get.property_sources(
-                Dataset(parent), types='filesystem,volume',
-                sources=['local', 'received', 'inherited'], recursive=True,
-                prefix=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
-                properties=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
-            )
+            with (scope or _no_scope)():
+                rows = zfs.get.property_sources(
+                    Dataset(parent), types='filesystem,volume',
+                    sources=['local', 'received', 'inherited'], recursive=True,
+                    prefix=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
+                    properties=[PROP_CLIENT_ID, PROP_SOURCE_DATASET],
+                )
         except ZFSTimeoutError:
             raise
         except Exception as e:
@@ -1115,9 +1182,11 @@ class DatasetManager:
         to widen the protect-set (it never reads an inherited pin: its pin
         readers take local/received values), and `sync_config_property`
         compares the value as it stands. Evidence about THIS dataset's own
-        send history (the due check, health, the anchor-never-backwards rule,
-        settling) must read only a LOCAL value -- `get_own_anchor` /
-        `get_own_inflight` / `get_local_anchor` -- or a child without one is
+        send history (the due check, the anchor-never-backwards rule,
+        settling; health reads local values too, through `get_local_anchor` /
+        `get_local_inflight` or its batched equivalent) must read only a LOCAL
+        value -- `get_own_anchor` / `get_own_inflight` / `get_local_anchor` --
+        or a child without one is
         credited with its parent's progress.
 
         While a local copy is being pruned (`_prune_timed`) a `ZFSTimeoutError`
@@ -1171,8 +1240,10 @@ class DatasetManager:
         when unset, inherited or received. Any failure is ALSO `None` (with a
         DEBUG line, as for `_get_prop`), so this read must only feed
         decisions where "unknown" is safe as "no history": the due check
-        (due, and negotiate decides), health reporting, and a pin read that
-        merely over-protects. NEVER use it where the result leads to writing
+        (due, and negotiate decides) and a pin read that merely
+        over-protects. NEVER use it for health (`health_collect` reads with
+        the raising `get_local_anchor` / `get_local_inflight`: an unreadable
+        value is a CRIT there) or where the result leads to writing
         or clearing an anchor or pin: those use `get_local_anchor`, which
         raises. While a
         local copy is being pruned a `ZFSTimeoutError` propagates instead (as
@@ -1189,8 +1260,9 @@ class DatasetManager:
     def get_own_anchor(self, dsi: DatasetInfo, destination: str) -> Optional[str]:
         """The anchor snapshot name for a destination as a LOCAL value of
         this dataset, or `None` (unset, inherited, received OR UNREADABLE --
-        the failure is swallowed). Use it only for the "due" check and for
-        health, where an unreadable anchor safely reads as "no history".
+        the failure is swallowed). Use it only for the "due" check, where an
+        unreadable anchor safely reads as "no history" (health does not: it
+        reads with `get_local_anchor`, and an unreadable anchor is a CRIT).
         Anything that writes or clears an anchor, or decides from the anchor
         whether something may be sent or destroyed (`_record_step`,
         `_settle_up_to_date`, `_rollback_permit`), must use
@@ -1204,7 +1276,7 @@ class DatasetManager:
         anchor or decides from it: the anchor snapshot name for a destination
         as a LOCAL value of this very dataset, or `None` (unset, inherited or
         received). `get_own_anchor` is the swallowing variant, for the "due"
-        check and health only.
+        check only.
         `get_anchor` also reports an inherited value, which must not
         count where the anchor is evidence about this dataset's own history
         (`RemoteBackupManager._rollback_permit`): a dataset restored under a
@@ -1212,11 +1284,18 @@ class DatasetManager:
 
         Raises `LocalAnchorUnreadable` when zfs fails: "unset" and "could not
         be read" are different evidence and the caller must tell them apart."""
-        prop = f"{PROP_ANCHOR_PREFIX}{destination}"
+        return self._get_local_prop(dsi.dataset, f"{PROP_ANCHOR_PREFIX}{destination}")
+
+    @staticmethod
+    def _get_local_prop(ds: Dataset, prop: str) -> Optional[str]:
+        """`prop` as a LOCAL value of `ds` (`zfs get -s local`), `None` when
+        unset, inherited or received; RAISES `LocalAnchorUnreadable` when zfs
+        fails (a `ZFSTimeoutError` included), so "could not read" is never
+        "unset"."""
         try:
-            return zfs.get.value(dsi.dataset, prop, sources='local')
+            return zfs.get.value(ds, prop, sources='local')
         except Exception as e:
-            logger.debug(f"Failed to read local property {prop} from {dsi.name}: {e!r}")
+            logger.debug(f"Failed to read local property {prop} from {ds.name}: {e!r}")
             raise LocalAnchorUnreadable(str(e) or repr(e)) from e
 
     def set_anchor(self, dsi: DatasetInfo, destination: str, snapshot_name: str) -> bool:
@@ -1247,9 +1326,10 @@ class DatasetManager:
         (`from` is `''` for a full send): the pin of this dataset's own send,
         never a parent's inherited one. `None` when unset, inherited,
         received, malformed or unreadable. A failed read means "not pinned",
-        which is safe only where that merely over-protects (settling then does not
-        clear a pin it could not read; health just reports none); the pruner reads pins
-        through `read_zfsbackup_properties`, not here."""
+        which is safe only where that merely over-protects (settling then does
+        not clear a pin it could not read); health uses `get_local_inflight`,
+        and the pruner reads pins through `read_zfsbackup_properties`, not
+        here."""
         return _parse_inflight(
             self._get_own_prop(dsi.dataset, f"{PROP_INFLIGHT_PREFIX}{destination}")
         )
@@ -1259,15 +1339,11 @@ class DatasetManager:
         dataset's LOCAL `inflight.<destination>`, `None` when unset, inherited,
         received or malformed, and `LocalAnchorUnreadable` when zfs fails (so
         "could not read" is never reported as "not pinned"). For health
-        reporting (`health_collect`), where an unreadable value must be an
-        error, not a silent "no pin"."""
-        prop = f"{PROP_INFLIGHT_PREFIX}{destination}"
-        try:
-            value = zfs.get.value(dsi.dataset, prop, sources='local')
-        except Exception as e:
-            logger.debug(f"Failed to read local property {prop} from {dsi.name}: {e!r}")
-            raise LocalAnchorUnreadable(str(e) or repr(e)) from e
-        return _parse_inflight(value)
+        reporting (`health_collect`), where an unreadable value must be
+        reported, not a silent "no pin"."""
+        return _parse_inflight(
+            self._get_local_prop(dsi.dataset, f"{PROP_INFLIGHT_PREFIX}{destination}")
+        )
 
     def set_inflight(
         self, dsi: DatasetInfo, destination: str, from_name: Optional[str], to_name: str
@@ -1384,7 +1460,8 @@ class DatasetManager:
         return anchors
 
     def received_datasets(
-        self, should_stop: Optional[Callable[[], bool]] = None
+        self, should_stop: Optional[Callable[[], bool]] = None,
+        *, scope: Optional[Callable[[], 'contextlib.AbstractContextManager']] = None,
     ) -> List[DatasetInfo]:
         """Discover datasets received from remote clients under the configured target.
 
@@ -1442,6 +1519,11 @@ class DatasetManager:
         Cost: one `zfs list` and one `zfs get -r` per pruning cycle; if the
         batch is incomplete or fails, plus two or three `zfs get` executions
         for EVERY dataset, else for each dataset the batch dropped.
+
+        `scope()` (the health check passes one) returns a context manager
+        every `zfs` call of the discovery runs in (as for `local_copies`); it
+        may raise to refuse a call. A failure, a timeout included, is then
+        what it always is: `[]` and `last_received_error`.
         """
         self.last_received_error = None
         rb = self.config.remote_backup
@@ -1449,7 +1531,7 @@ class DatasetManager:
             return []
         target = rb.target_dataset.rstrip('/')
         result, failure = self._discover_under(
-            target, should_stop=should_stop, noted=self._received_skip_noted
+            target, should_stop=should_stop, noted=self._received_skip_noted, scope=scope
         )
         if failure is not None:
             self.last_received_error = f"{type(failure).__name__}: {failure}"
@@ -1764,8 +1846,11 @@ class DatasetManager:
 
         `only_client_id` (the local discovery) additionally refuses a dataset
         whose local `client_id` is any other id, whatever its name. `scope`
-        wraps the `zfs` reads (timeouts); with `only_client_id`, a
-        `ZFSTimeoutError` propagates instead of becoming a problem."""
+        wraps the `zfs` reads (timeouts); with `only_client_id` or a caller's `scope`
+        (the health check's budget; the internal `_no_scope` default is not one), a `ZFSTimeoutError` -- a per-call timeout
+        or the scope's refusal after the deadline -- propagates instead of
+        becoming a problem, so the dataset is never silently dropped. The
+        server's pruner passes neither and keeps the skip-with-WARNING."""
         if props is None:
             try:
                 with (scope or _no_scope)():
@@ -1775,7 +1860,7 @@ class DatasetManager:
                     if client_id is None and config_value is None:
                         only_received = zfs.get.value(ds, PROP_CONFIG, sources='received') is not None
             except Exception as e:
-                if only_client_id is not None and isinstance(e, ZFSTimeoutError):
+                if (only_client_id is not None or (scope is not None and scope is not _no_scope)) and isinstance(e, ZFSTimeoutError):
                     raise
                 return None, f"cannot read its properties ({e!r})"
         else:
@@ -2087,6 +2172,39 @@ class DatasetManager:
         dsi.snapshots = result
         dsi.listed_names = names
         return dsi.snapshots
+
+    def _list_snapshot_tree_strict(self, ds: Dataset) -> Dict[str, List['SnapshotInfo']]:
+        """The managed snapshots of `ds` AND every descendant, in ONE recursive
+        `zfs list` (`SNAPSHOT_LIST_PROPERTIES`), as `{dataset name: [newest
+        first by createtxg, ...]}` (the order of `_list_snapshots_strict`). A
+        dataset with no managed snapshot has no key. For the health check,
+        which asks once per recursive parent instead of once per child.
+
+        STRICT: raises (`Exception`) when any row of the listing cannot be
+        trusted (`zfs.list(strict=True)`), because a dropped row may be a
+        child's newest snapshot and the answer would then be wrong, not
+        smaller; and whatever `zfs list` raises. Read-only: unlike
+        `_list_snapshots_strict` it sets no `DatasetInfo.snapshots` and logs
+        no WARNING for a managed snapshot without `createtxg` (it is left out,
+        as there, so it is never "newest")."""
+        listed = zfs.list(
+            roots=ds, types='snapshot', recursive=True,
+            properties=list(SNAPSHOT_LIST_PROPERTIES), strict=True,
+        )
+        tree: Dict[str, List[SnapshotInfo]] = {}
+        for snap in listed:
+            if not isinstance(snap, ZFSSnapshot):
+                continue
+            info = SnapshotInfo(snap, self.prefix)
+            if not info.is_managed:
+                continue
+            if info.createtxg is None:
+                logger.debug(f"{info.full_name} has no createtxg and is ignored")
+                continue
+            tree.setdefault(snap.dataset.name, []).append(info)
+        for group in tree.values():
+            group.sort(key=snapshot_order_key, reverse=True)
+        return tree
 
     def list_snapshots(self, dsi: DatasetInfo, recursive: bool = False) -> List['SnapshotInfo']:
         """List all managed snapshots for a dataset."""

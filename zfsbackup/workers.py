@@ -687,11 +687,18 @@ class BaseWorker(_SupervisorWatch, Process):
     def _record(
         self, kind: str, dataset: str, destination: Optional[str] = None, *,
         ok: bool, error: Optional[str] = None, detail: Optional[str] = None,
+        warning: Optional[str] = None,
     ) -> None:
         """One attempt finished (S-7): remembered for the status file, which
-        `_flush_status` writes. A no-op without a status directory."""
+        `_flush_status` writes. `warning` is a standing warning about a
+        success (`health.OutcomeRecord.warning`); it is passed on only when
+        there is one. A no-op without a status directory."""
         if self._status is not None:
-            self._status.record(kind, dataset, destination, ok=ok, error=error, detail=detail)
+            if warning:
+                self._status.record(
+                    kind, dataset, destination, ok=ok, error=error, detail=detail, warning=warning)
+            else:
+                self._status.record(kind, dataset, destination, ok=ok, error=error, detail=detail)
 
     def _flush_status(self, force: bool = False, heartbeat: bool = False) -> None:
         if self._status is not None:
@@ -885,12 +892,16 @@ class SnapshotWorker(BaseWorker):
             if created is not None:
                 detail = str(getattr(created, 'name', '') or '')
                 # A standing warning (backup copies below a recursive dataset
-                # left out of the snapshot, or not told apart): on the record,
-                # so `check` shows it long after the journal line.
+                # left out of the snapshot, or not told apart): in the record's
+                # own `warning` field, so `check` shows it long after the
+                # journal line and `detail` stays the snapshot's name. It
+                # belongs to THIS snapshot: the next one replaces it (a due
+                # snapshot is the only thing that rewrites this record, so it
+                # stays until the next period's). A ride (above) and a failure
+                # carry none.
                 note = getattr(manager, 'last_snapshot_note', None)
-                if isinstance(note, str) and note:
-                    detail = f"{detail}; WARNING: {note}" if detail else f"WARNING: {note}"
-                self._record(health.KIND_SNAPSHOT, dsi.name, ok=True, detail=detail)
+                extra = {'warning': note} if isinstance(note, str) and note else {}
+                self._record(health.KIND_SNAPSHOT, dsi.name, ok=True, detail=detail, **extra)
             else:
                 reason = getattr(manager, 'last_snapshot_error', None)
                 self._record(

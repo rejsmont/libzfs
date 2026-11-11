@@ -757,13 +757,97 @@ class TestDescendantsEntry:
 
     def test_a_child_error_observation_is_crit_cannot_read_in_json_and_prometheus(self):
         entries = evaluate([obs(SOURCE_ANCHOR, subject='pool/data/c', peer='d',
-                                error='the anchor or send pin could not be read: boom')], NOW)
+                                error='the anchor could not be read: boom')], NOW)
         (entry,) = json.loads(to_json(entries, NOW))['entries']
-        assert entry['state'] == 'CRIT' and entry['reason'].startswith('cannot read: the anchor or send pin')
+        assert entry['state'] == 'CRIT' and entry['reason'] == 'cannot read: the anchor could not be read: boom'
         assert entry['age_seconds'] is None
         text = prom(entries)
         assert text.one('zfsbackup_anchor_check_state', dataset='pool/data/c', destination='d') == 2
         assert text.values('zfsbackup_anchor_age_seconds') == []
+
+
+class TestTimeLimitEntry:
+    """The collector's time limit: a part of the check that ran out of time is ONE `check` `CheckEntry`
+    (WARN, subject `(time limit)`), never a CRIT and never silence. Like `descendants`, it is not a lag
+    source: `evaluate` passes it through and it is serialised as a plain entry."""
+
+    REASON = 'not checked within the time limit (60 s): pool/a, pool/b and 3 more'
+
+    def entry(self):
+        return CheckEntry('check', '(time limit)', STATE_WARN, self.REASON)
+
+    def test_evaluate_passes_it_through_unchanged_and_last(self):
+        warn = self.entry()
+        out = evaluate([obs(SOURCE_SNAPSHOT, age=10), warn], NOW)
+        assert out[-1] is warn and not isinstance(warn, LagEntry)
+        assert (warn.source, warn.subject, warn.state, warn.reason) == ('check', '(time limit)', STATE_WARN, self.REASON)
+
+    def test_alone_it_makes_the_verdict_warn_and_a_crit_still_wins(self):
+        assert overall_state(evaluate([obs(SOURCE_SNAPSHOT, age=10), self.entry()], NOW)) == STATE_WARN
+        assert overall_state(evaluate([self.entry(), obs(SOURCE_SNAPSHOT)], NOW)) == STATE_CRIT
+
+    def test_json_has_no_lag_numbers(self):
+        (entry,) = json.loads(to_json([self.entry()], NOW))['entries']
+        assert entry == {'source': 'check', 'subject': '(time limit)', 'state': 'WARN', 'reason': self.REASON}
+
+    def test_prometheus_is_a_check_state_sample_and_the_text_is_not_exported(self):
+        text = to_prometheus([self.entry()], NOW)
+        parsed = Exposition(text)
+        assert parsed.one('zfsbackup_check_state', source='check', subject='(time limit)') == 1
+        assert parsed.one('zfsbackup_check_success') == 0
+        assert 'pool/a' not in text and 'time limit)' in text           # only the label carries the words
+
+    def test_a_timed_out_read_is_crit_not_a_time_limit_warning(self):
+        """A read that timed out is an ordinary error observation: CRIT `cannot read`."""
+        entry = one(obs(SOURCE_SNAPSHOT, error='zfs list timed out after 10 s'))
+        assert entry.state == STATE_CRIT and entry.reason == 'cannot read: zfs list timed out after 10 s'
+
+
+class TestCopiesEntries:
+    """`copies`: a backup copy (or receive target) left out of a recursive parent is one WARN `CheckEntry`
+    each; plain entries, WARN only."""
+
+    def entries(self):
+        return [
+            CheckEntry('copies', 'pool/data/copy', STATE_WARN, 'backup copy below the recursive dataset pool/data (...)'),
+            CheckEntry('copies', 'pool/data', STATE_WARN, 'and 5 more backup copies below the recursive dataset pool/data'),
+        ]
+
+    def test_they_pass_through_evaluate_in_order(self):
+        items = self.entries()
+        out = evaluate([obs(SOURCE_SNAPSHOT, age=10), *items], NOW)
+        assert out[1] is items[0] and out[2] is items[1]
+
+    def test_the_verdict_is_warn(self):
+        assert overall_state(evaluate([obs(SOURCE_SNAPSHOT, age=10), *self.entries()], NOW)) == STATE_WARN
+
+    def test_json_and_prometheus_carry_one_sample_per_subject(self):
+        doc = json.loads(to_json(self.entries(), NOW))
+        assert [(e['source'], e['subject']) for e in doc['entries']] == [
+            ('copies', 'pool/data/copy'), ('copies', 'pool/data')]
+        parsed = Exposition(to_prometheus(self.entries(), NOW))
+        assert parsed.one('zfsbackup_check_state', source='copies', subject='pool/data/copy') == 1
+        assert parsed.one('zfsbackup_check_state', source='copies', subject='pool/data') == 1
+
+
+    def test_prometheus_labels_stay_unique_for_a_parent_inside_a_copy_plus_an_overflow(self):
+        """The parent-inside-a-copy entry is about the parent (subject `pool/data`); the overflow entry
+        for the same parent is `pool/data (+N more)`, so the `(source, subject)` labels never collide
+        (a duplicated label set is an invalid exposition)."""
+        entries = [
+            CheckEntry('copies', 'pool/data', STATE_WARN, 'the recursive dataset pool/data is itself inside a copy'),
+            *[CheckEntry('copies', f'pool/data/t{i:02d}', STATE_WARN, 'a receive target') for i in range(19)],
+            CheckEntry('copies', 'pool/data (+5 more)', STATE_WARN, 'and 5 more backup copies below pool/data'),
+        ]
+        parsed = Exposition(to_prometheus(entries, NOW))
+        labels = [(lab['source'], lab['subject']) for n, lab, _ in parsed.samples
+                  if n == 'zfsbackup_check_state' and lab['source'] == 'copies']
+        assert len(labels) == len(set(labels)) == len(entries)
+        assert parsed.one('zfsbackup_check_state', source='copies', subject='pool/data') == 1
+        assert parsed.one('zfsbackup_check_state', source='copies', subject='pool/data (+5 more)') == 1
+        doc = json.loads(to_json(entries, NOW))
+        subjects = [e['subject'] for e in doc['entries']]
+        assert len(subjects) == len(set(subjects))
 
 
 class TestPrometheusEscaping:

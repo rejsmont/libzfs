@@ -80,6 +80,7 @@ from _cli_support import (
     generation,
     isolated,
     make_db,
+    plant_destination_name,
     run,
     scratch_tmp,
     stderr_lines,
@@ -1562,15 +1563,15 @@ class TestDotpathTempFiles:
         assert "in ASCII only" in result.stderr
         assert not db.exists()
 
-    def test_non_ascii_values_other_than_dataset_names_round_trip(self, run, db):
-        # Only dataset names reach `zfs`; a destination (name and URL) is free text.
-        make_db(run, db, 'destinations:\n  "d\u00e9p\u00f4t":\n    url: "https://127.0.0.1:9/caf\u00e9"\n'
+    def test_non_ascii_values_other_than_names_round_trip(self, run, db):
+        # Only names reach `zfs` (a destination name becomes part of a property name); a URL does not.
+        make_db(run, db, 'destinations:\n  "depot":\n    url: "https://127.0.0.1:9/caf\u00e9"\n'
                          'datasets:\n  - name: "tank/cafe"\n    frequency: "1h"\n')
         result = ok(run, db, "set", "datasets[tank/cafe].frequency", "30m")
         assert result.stdout.splitlines()[0] == "datasets[tank/cafe].frequency: 1h -> 30m"
         config = stored(db)
         assert config.datasets[0].name == "tank/cafe"
-        assert config.destinations["d\u00e9p\u00f4t"].url == "https://127.0.0.1:9/caf\u00e9"
+        assert config.destinations["depot"].url == "https://127.0.0.1:9/caf\u00e9"
 
     def test_a_dataset_name_with_an_inner_space_round_trips_through_set(self, run, db):
         make_db(run, db, 'datasets:\n  - name: "tank/my data"\n    frequency: "1h"\n')
@@ -1940,10 +1941,18 @@ class TestDotpathFingerprint:
     def test_the_removal_warning_quotes_a_hostile_name_for_the_shell(self, run, db):
         make_db(run, db, RICH_YAML.replace(
             '  spare:\n    url: "https://spare:8080"\n',
-            f'  "my dest":\n    url: "https://spare:8080"\n    server_fingerprint: "{FP}"\n',
+            f'  "spare":\n    url: "https://spare:8080"\n    server_fingerprint: "{FP}"\n',
         ))
-        result = ok(run, db, "unset", 'destinations[my dest].server_fingerprint')
+        # No import or write can store such a name any more; plant it (an older release).
+        plant_destination_name(db, "spare", "my dest")
+        state = db_state(db)
+        result = run("unset", "destinations[my dest].server_fingerprint", "-c", db)
+        # The pin-removal warning is built before the write and quotes the name...
         assert "enroll 'my dest'" in warnings_in(result)[0]
+        # ...and the write itself is refused: the stored name is unusable.
+        assert result.exit_code == 1
+        assert "destinations[my dest]: the name cannot form the ZFS properties" in result.stderr
+        assert db_state(db) == state
 
     def test_unset_when_not_enrolled_is_a_noop(self, run, rich):
         result = ok(run, rich, "unset", FP_PATH)
@@ -2154,6 +2163,133 @@ class TestPinChangeWarnings:
         old, new = _config(tmp_path, {"d": FP}), _config(tmp_path, {"d": None})
         dotpath.pin_change_warnings(old, new)
         assert old.destinations["d"].server_fingerprint == FP
+
+
+# ---------------------------------------------------------------------------
+# A destination name that cannot form the anchor and pin properties is refused
+# ---------------------------------------------------------------------------
+
+
+class TestUnusableDestinationName:
+    """No write stores such a name (`validate_config` raises); one already stored (an older
+    release, a hand-edited database; planted here with SQL) is readable but blocks every write."""
+
+    TOKEN = "zfsb1." + "ab" * 32 + "." + "A" * 43
+
+    @pytest.fixture
+    def planted(self, run, db):
+        make_db(run, db)
+        plant_destination_name(db, "spare", "bad name")
+        return db
+
+    def test_read_only_commands_still_work(self, run, planted):
+        assert "bad name" in ok(run, planted, "list", "destinations").stdout
+        assert got(run, planted, "destinations[bad name].url") == ["https://spare:8080"]
+        assert "bad name" in yaml.safe_load(ok(run, planted, "export").stdout)["destinations"]
+        assert ok(run, planted, "status").exit_code == 0
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("set", "datasets[tank/data].frequency", "30m"),
+            ("set", "destinations.offsite.url", "https://other:1"),
+            ("set", "destinations[bad name].url", "https://other:1"),
+            ("unset", "datasets[tank/data].retention"),
+        ],
+    )
+    def test_every_write_is_refused_while_the_name_is_stored(self, run, planted, args):
+        state, gen = db_state(planted), generation(planted)
+        result = run(*args, "-c", planted)
+        assert result.exit_code == 1
+        assert "destinations[bad name]: the name cannot form the ZFS properties" in result.stderr
+        assert "org.zfsbackup:anchor.<name> and org.zfsbackup:inflight.<name>" in result.stderr
+        assert db_state(planted) == state and generation(planted) == gen
+
+    def test_set_cannot_create_a_destination_by_name(self, run, db):
+        make_db(run, db)
+        state = db_state(db)
+        result = run("set", "destinations[bad name].url", "https://x:1", "-c", db)
+        assert result.exit_code == 1 and "no destination named 'bad name'" in result.stderr
+        assert db_state(db) == state
+
+    def test_import_of_such_a_name_is_refused_and_leaves_the_database_alone(self, run, db, tmp_path):
+        make_db(run, db)
+        state = db_state(db)
+        source = write_yaml(tmp_path, 'destinations:\n  "bad name":\n    url: "https://b:1"\n'
+                                      'datasets:\n  - name: "tank/x"\n', "bad.yaml")
+        result = run("import", source, "-c", db)
+        assert result.exit_code == 1
+        assert "destinations[bad name]: the name cannot form the ZFS properties" in result.stderr
+        assert db_state(db) == state
+
+    @pytest.mark.parametrize("name", ["bad name", "a/b", "a@b", "caf\u00e9"])
+    def test_enroll_of_a_new_bad_name_is_refused_before_anything_is_generated(
+        self, run, db, tmp_path, name
+    ):
+        make_db(run, db)
+        state = db_state(db)
+        token_file = write_yaml(tmp_path, self.TOKEN + "\n", "token")
+        token_file.chmod(0o600)
+        result = run("enroll", name, "--url", "https://h:1", "--token-file", token_file, "-c", db)
+        assert result.exit_code == 1
+        assert "the name cannot form the ZFS properties" in result.stderr
+        assert db_state(db) == state
+        assert not db.with_name(db.name + ".tls").exists()
+
+    def test_enroll_of_a_stored_bad_name_is_refused_too(self, run, planted, tmp_path):
+        state = db_state(planted)
+        token_file = write_yaml(tmp_path, self.TOKEN + "\n", "token")
+        token_file.chmod(0o600)
+        result = run("enroll", "bad name", "--token-file", token_file, "-c", planted)
+        assert result.exit_code == 1
+        assert "destinations[bad name]: the name cannot form the ZFS properties" in result.stderr
+        assert db_state(planted) == state
+        assert not planted.with_name(planted.name + ".tls").exists()
+
+    @pytest.fixture
+    def sending(self, run, db):
+        """`tank/data` (recursive) sends to the stored unusable name: it was `offsite`."""
+        make_db(run, db)
+        plant_destination_name(db, "offsite", "bad name")
+        return db
+
+    def test_a_url_change_of_a_stored_unusable_name_gives_no_stale_anchor_advice(self, run, sending):
+        """The advice would be `zfs inherit -S org.zfsbackup:anchor.bad name tank/data`: invalid, and
+        there is nothing to clear (no such property can exist). The write itself is still refused,
+        because the stored configuration is invalid."""
+        state, gen = db_state(sending), generation(sending)
+        result = run("set", "destinations[bad name].url", "https://other:1", "-c", sending)
+        assert result.exit_code == 1
+        assert "destinations[bad name]: the name cannot form the ZFS properties" in result.stderr
+        output = result.stdout + result.stderr
+        assert "now points to a different place" not in output
+        assert "zfs inherit" not in output
+        assert "anchor.bad name" not in output
+        assert warnings_in(result) == []
+        assert db_state(sending) == state and generation(sending) == gen
+
+    def test_stale_anchor_warnings_is_empty_for_an_unusable_name_with_senders(self, sending, tmp_path):
+        from zfsbackup.config import Destination
+
+        config = stored(sending)
+        assert any(r.destination == "bad name" for d in config.datasets for r in d.remote)
+        old, new = Destination(url="https://offsite:8080"), Destination(url="https://other:1")
+        assert dotpath.stale_anchor_warnings("bad name", old, new, config) == []
+        # control: the same call for a usable name that has senders warns
+        (message,) = dotpath.stale_anchor_warnings("dc.two", old, new, config)
+        assert "zfs inherit" in message and "anchor.dc.two" in message
+
+    def test_the_longest_usable_name_is_stored_by_import(self, run, db):
+        name = "d" * 232
+        make_db(run, db, f'destinations:\n  "{name}":\n    url: "https://h:1"\ndatasets:\n  - name: "tank/x"\n')
+        assert name in stored(db).destinations
+
+    def test_one_more_character_is_refused_by_import(self, run, db, tmp_path):
+        source = write_yaml(tmp_path, f'destinations:\n  "{"d" * 233}":\n    url: "https://h:1"\n'
+                                      'datasets:\n  - name: "tank/x"\n', "long.yaml")
+        result = run("import", source, "-c", db)
+        assert result.exit_code == 1 and "too long" in result.stderr
+        assert not db.exists()
 
 
 # ---------------------------------------------------------------------------

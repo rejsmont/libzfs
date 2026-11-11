@@ -1721,6 +1721,40 @@ class TestMapperSaveConfig:
         loaded = load_config(session)
         assert loaded.destinations["offsite"] == ConfigDestination(url="https://offsite/pool")
 
+    @pytest.mark.parametrize("name", ["bad name", "a/b", "caf\u00e9", "", "x" * 233])
+    def test_a_destination_name_that_cannot_form_the_anchor_properties_is_refused(self, session, name):
+        config = self._two_dest_config()
+        save_config(session, config)
+        session.commit()
+        generation = session.query(GlobalSettings).one().generation
+        bad = self._two_dest_config()
+        bad.destinations = {name: ConfigDestination(url="https://offsite/pool")}
+        bad.datasets[0].remote = [RemoteDatasetConfig(destination=name)]
+        with pytest.raises(ValueError, match="the name cannot form the ZFS properties"):
+            save_config(session, bad)
+        session.rollback()
+        assert session.query(GlobalSettings).one().generation == generation
+        assert [d.name for d in session.query(Destination)] == ["offsite"]
+        assert load_config(session) == config
+
+    def test_the_longest_usable_destination_name_round_trips(self, session):
+        name = "d" * 232
+        config = self._two_dest_config()
+        config.destinations = {name: ConfigDestination(url="https://offsite/pool")}
+        config.datasets[0].remote = [RemoteDatasetConfig(destination=name)]
+        save_config(session, config)
+        session.commit()
+        assert load_config(session) == config
+
+    def test_an_already_stored_unusable_name_still_loads(self, session):
+        """Read paths never validate the name, so `export`, `list` and the rename that fixes it work."""
+        save_config(session, self._two_dest_config())
+        session.commit()
+        session.execute(text("INSERT INTO destinations (name, url) VALUES ('bad name', 'https://x/pool')"))
+        session.commit()
+        loaded = load_config(session)
+        assert sorted(loaded.destinations) == ["bad name", "offsite"]
+
     def test_exact_duplicate_retention_rules_are_deduped(self, session):
         config = _minimal_backup_config(
             retention_rules=[

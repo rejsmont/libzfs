@@ -1055,6 +1055,21 @@ def rename_destination(
     referencing = [
         d.name for d in config.datasets if any(r.destination == old for r in d.remote)
     ]
+    # A stored name that cannot form `org.zfsbackup:anchor.<name>` /
+    # `inflight.<name>` (a database written before `validate_config` refused such
+    # names) never had an anchor or a pin: no property of that name exists, and
+    # libzfseasy refuses to even read one. The rename is the way out for exactly
+    # these names, so nothing is read, copied or cleared for `old`, and no ZFS
+    # access is needed at all.
+    old_problem = destination_name_problem(old)
+    unusable_note = (
+        f"note: the old name {old!r} could not hold anchors or send pins ({old_problem}), so "
+        f"there is nothing to copy; the first send to {new!r} negotiates its base"
+        if old_problem else ""
+    )
+    senders = referencing
+    if old_problem:
+        referencing = []
     new_config = _renamed_destination_config(config, old, new)
     # Pure and cheap: a configuration the store would refuse must be found
     # BEFORE any anchor is copied, so that the only failures left after a copy
@@ -1240,9 +1255,11 @@ def rename_destination(
     if dry_run:
         if to_copy:
             copy_anchors()
+        if unusable_note:
+            click.echo(f"{prefix}{unusable_note}")
         click.echo(
             f"{prefix}would rename destination {old!r} -> {new!r} in the configuration"
-            + (f" and in the remote: lists of {', '.join(referencing)}" if referencing else "")
+            + (f" and in the remote: lists of {', '.join(senders)}" if senders else "")
         )
         for parent in unlisted:
             warn(
@@ -1277,6 +1294,8 @@ def rename_destination(
     request = begin_reload(resolved, result.generation, result.store_id)
     try:
         click.echo(f"Renamed destination {old!r} -> {new!r} in the configuration.")
+        if unusable_note:
+            click.echo(unusable_note)
         for parent in unlisted:
             warn(
                 f"NOT handled: the anchors of the descendants of {parent!r} (its listing "

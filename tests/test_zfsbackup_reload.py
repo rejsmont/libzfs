@@ -599,6 +599,70 @@ class TestRejection:
         assert "remote_backup is disabled, but the target still counts" in error
         assert world.daemon._rejected == (STORE, 8)
 
+    @pytest.mark.parametrize(
+        "name, word",
+        [
+            ("bad name", "it contains ' '"),
+            ("a/b", "it contains '/'"),
+            ("", "it is empty"),
+            ("x" * 233, "too long"),
+        ],
+        ids=["space", "slash", "empty", "233"],
+    )
+    def test_a_destination_name_that_cannot_form_the_anchor_properties_is_rejected(
+        self, world, caplog, name, word
+    ):
+        """A destination name is part of `org.zfsbackup:anchor.<name>` and
+        `org.zfsbackup:inflight.<name>`: a candidate carrying one that cannot be (the real
+        `validate_config` runs) is a final rejection and the old workers keep running generation 0."""
+        before = world.start_workers()
+        bad = BackupConfig(
+            datasets=[DatasetConfig(name="pool/data", remote=[RemoteDatasetConfig(destination=name)])],
+            destinations={name: Destination(url="https://h/pool")},
+        )
+        world.write((STORE, 8), config=bad)
+        world.hup()
+        self._assert_nothing_changed(world, before)
+        (error,) = messages(caplog, logging.ERROR)
+        assert error.startswith(
+            "configuration generation 8 rejected (trigger: SIGHUP); still running generation 0:\n"
+        )
+        assert f"destinations[{name}]: the name cannot form the ZFS properties" in error
+        assert word in error
+        assert world.daemon._rejected == (STORE, 8)
+        assert world.lock.state["rejected"] == (STORE, 8)
+        assert world.lock.state["target"] is None       # refused before it was accepted
+        assert all(not r.exc_info for r in caplog.records if r.levelno == logging.ERROR)
+        world.poll()
+        assert world.daemon._rejected == (STORE, 8)     # the poll does not retry it
+        assert len(messages(caplog, logging.ERROR)) == 1
+        assert world.workers_made("snapshot") and len(world.made) == len(before)
+
+    def test_a_renamed_destination_in_the_next_generation_is_accepted(self, world, caplog):
+        world.start_workers()
+        for generation, name in ((8, "bad name"), (9, "good-name")):
+            world.write((STORE, generation), config=BackupConfig(
+                datasets=[DatasetConfig(name="pool/data", remote=[RemoteDatasetConfig(destination=name)])],
+                destinations={name: Destination(url="https://h/pool")},
+            ))
+            world.hup()
+            if generation == 8:
+                assert world.daemon._rejected == (STORE, 8)
+        assert world.daemon._rejected is None
+        assert world.lock.state["target"] == (STORE, 9)
+        assert messages(caplog, logging.INFO, "configuration generation 9 accepted")
+
+    def test_the_longest_usable_destination_name_is_accepted(self, world, caplog):
+        world.start_workers()
+        name = "x" * 232
+        world.write((STORE, 8), config=BackupConfig(
+            datasets=[DatasetConfig(name="pool/data", remote=[RemoteDatasetConfig(destination=name)])],
+            destinations={name: Destination(url="https://h/pool")},
+        ))
+        world.hup()
+        assert world.daemon._rejected is None
+        assert messages(caplog, logging.INFO, "configuration generation 8 accepted")
+
     def test_a_disabled_receiver_over_unrelated_datasets_is_accepted(self, world, caplog):
         world.start_workers()
         ok = BackupConfig(
@@ -2133,6 +2197,58 @@ class TestStartupValidation:
         assert not errors[0].exc_info
         daemon_cls.assert_not_called()
         assert not lock_spy[0].path.exists()              # lock released, pid file removed
+
+    def _plant_destination(self, db, name):
+        """A destination row an older release could have stored (SQL: nothing now writes one)."""
+        con = sqlite3.connect(str(db))
+        con.execute("INSERT INTO destinations (name, url) VALUES (?, 'https://h:1')", (name,))
+        con.commit()
+        con.close()
+
+    @pytest.mark.parametrize("name", ["bad name", "a/b", "a@b", "x" * 233])
+    def test_a_stored_unusable_destination_name_is_refused_at_startup(
+        self, sqlite_config_db, lock_spy, mocker, caplog, name
+    ):
+        self._plant_destination(sqlite_config_db.path, name)
+        daemon_cls = mocker.patch("zfsbackup.daemon.BackupDaemon")
+        args = _Args(config=str(sqlite_config_db.path), dry_run=False, test_config=False, verbose=False)
+        with caplog.at_level(logging.INFO):
+            assert daemon_module._run_startup(args, None, daemon_module._StartupHup()) == 1
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert message.startswith(
+            f"configuration generation 0 is invalid: destinations[{name}]: the name cannot form the ZFS "
+            "properties org.zfsbackup:anchor.<name> and org.zfsbackup:inflight.<name> ("
+        )
+        assert "anchors and send pins can never be stored for it" in message
+        assert not errors[0].exc_info                      # diagnosed, no traceback
+        daemon_cls.assert_not_called()                     # no worker was ever forked
+        assert len(lock_spy) == 1 and not lock_spy[0].path.exists()
+        assert daemonlock.probe(sqlite_config_db) is None
+
+    @pytest.mark.parametrize("name", ["bad name", "caf\u00e9"])
+    def test_the_same_refusal_under_test_config_for_an_unusable_destination_name(
+        self, sqlite_config_db, lock_spy, caplog, name
+    ):
+        self._plant_destination(sqlite_config_db.path, name)
+        with self._argv(sqlite_config_db.path, "--test-config"):
+            with caplog.at_level(logging.INFO):
+                assert main() == 1
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1 and "configuration generation 0 is invalid" in errors[0].getMessage()
+        assert f"destinations[{name}]" in errors[0].getMessage()
+        assert "Configuration is valid" not in caplog.text
+        assert lock_spy == []
+
+    def test_the_longest_usable_destination_name_passes_test_config(
+        self, sqlite_config_db, caplog
+    ):
+        self._plant_destination(sqlite_config_db.path, "x" * 232)
+        with self._argv(sqlite_config_db.path, "--test-config"):
+            with caplog.at_level(logging.INFO):
+                assert main() == 0
+        assert "Configuration is valid!" in caplog.text
 
     def test_a_dataset_list_no_worker_could_start_with_is_refused_cleanly(
         self, sqlite_config_db, lock_spy, mocker, caplog

@@ -66,8 +66,9 @@ class Rig:
         self.recorded = []
         mocker.patch.object(self.worker, '_record', side_effect=self._spy)
 
-    def _spy(self, kind, dataset, destination=None, *, ok, error=None, detail=None):
-        self.recorded.append(SimpleNamespace(kind=kind, dataset=dataset, ok=ok, error=error, detail=detail))
+    def _spy(self, kind, dataset, destination=None, *, ok, error=None, detail=None, warning=None):
+        self.recorded.append(SimpleNamespace(
+            kind=kind, dataset=dataset, ok=ok, error=error, detail=detail, warning=warning))
 
     def dsi(self, name):
         return next(d for d in self.manager.datasets if d.name == name)

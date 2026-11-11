@@ -429,42 +429,63 @@ class TestSnapshotWorkerRecords:
         assert (rec.kind, rec.dataset, rec.destination, rec.result) == ('snapshot', 'pool/a', None, 'ok')
         assert rec.detail == 'autosnap_20261025100000' and rec.last_success is not None
 
-    def test_a_mock_manager_adds_no_note_to_the_detail(self, run, sdir):
-        """`manager_for` is a MagicMock, whose `last_snapshot_note` is another MagicMock: not a string, so nothing
-        is appended."""
+    def test_a_mock_manager_adds_no_warning(self, run, sdir):
+        """`manager_for` is a MagicMock, whose `last_snapshot_note` is another MagicMock: not a string, so no
+        warning is recorded."""
         manager = manager_for(Dsi('pool/a'))
         manager.needs_snapshot.return_value = True
         manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
         assert not isinstance(manager.last_snapshot_note, str)
         run(snapshot_worker(sdir), manager)
-        assert status(sdir).records[0].detail == 'autosnap_20261025100000'
-
-    def test_the_managers_standing_warning_goes_on_the_record_after_the_snapshot_name(self, run, sdir):
-        manager = manager_for(
-            Dsi('pool/a'), last_snapshot_note='1 backup copy below was not snapshotted: pool/a/bk')
-        manager.needs_snapshot.return_value = True
-        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
-        run(snapshot_worker(sdir), manager)
         (rec,) = status(sdir).records
-        assert rec.detail == ('autosnap_20261025100000; WARNING: '
-                              '1 backup copy below was not snapshotted: pool/a/bk')
-        assert rec.result == 'ok' and rec.consecutive_failures == 0 and rec.last_error is None
-        assert rec.last_success is not None, 'a warning is not a failure'
+        assert rec.detail == 'autosnap_20261025100000' and rec.warning is None
 
-    def test_a_note_without_a_snapshot_name_is_the_whole_detail(self, run, sdir):
-        manager = manager_for(Dsi('pool/a'), last_snapshot_note='backup copies below could not be told apart')
-        manager.needs_snapshot.return_value = True
-        manager.create_snapshot.return_value = SimpleNamespace(name='')
-        run(snapshot_worker(sdir), manager)
-        assert status(sdir).records[0].detail == 'WARNING: backup copies below could not be told apart'
-
-    @pytest.mark.parametrize('note', [None, '', 5, b'bytes', ['x']], ids=['none', 'empty', 'int', 'bytes', 'list'])
-    def test_no_usable_note_leaves_the_detail_alone(self, run, sdir, note):
+    def test_the_managers_standing_warning_goes_in_the_warning_field_and_the_detail_stays_the_name(self, run, sdir):
+        note = '1 backup copy below was not snapshotted: pool/a/bk'
         manager = manager_for(Dsi('pool/a'), last_snapshot_note=note)
         manager.needs_snapshot.return_value = True
         manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
         run(snapshot_worker(sdir), manager)
-        assert status(sdir).records[0].detail == 'autosnap_20261025100000'
+        (rec,) = status(sdir).records
+        assert rec.detail == 'autosnap_20261025100000'              # the name only: no "; WARNING: ..." suffix
+        assert rec.warning == note
+        assert rec.result == 'ok' and rec.consecutive_failures == 0 and rec.last_error is None
+        assert rec.last_success is not None, 'a warning is not a failure'
+
+    def test_a_warning_without_a_snapshot_name_leaves_no_detail(self, run, sdir):
+        note = 'backup copies below could not be told apart'
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note=note)
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='')
+        run(snapshot_worker(sdir), manager)
+        (rec,) = status(sdir).records
+        assert rec.detail is None and rec.warning == note
+
+    @pytest.mark.parametrize('note', [None, '', 5, b'bytes', ['x']], ids=['none', 'empty', 'int', 'bytes', 'list'])
+    def test_no_usable_note_records_no_warning(self, run, sdir, note):
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note=note)
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
+        run(snapshot_worker(sdir), manager)
+        (rec,) = status(sdir).records
+        assert rec.detail == 'autosnap_20261025100000' and rec.warning is None
+
+    def test_the_warning_is_passed_to_the_writer_only_when_there_is_one(self, mocker, run, sdir):
+        """`_record` adds `warning=` only for a real note: a writer double without the keyword keeps working."""
+        calls = []
+        real = health.StatusWriter.record
+        mocker.patch.object(health.StatusWriter, 'record',
+                            lambda self, *a, **kw: (calls.append(kw), real(self, *a, **kw))[1])
+        manager = manager_for(Dsi('pool/a'))
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_1')
+        run(snapshot_worker(sdir), manager)
+        assert 'warning' not in calls[0]
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note='careful')
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_2')
+        run(snapshot_worker(sdir), manager)
+        assert calls[-1]['warning'] == 'careful'
 
     def test_a_failed_creation_never_carries_the_note(self, run, sdir):
         manager = manager_for(Dsi('pool/a'), last_snapshot_note='stale')
@@ -473,7 +494,59 @@ class TestSnapshotWorkerRecords:
         manager.last_snapshot_error = 'boom'
         run(snapshot_worker(sdir), manager)
         (rec,) = status(sdir).records
-        assert rec.result == 'error' and 'stale' not in (rec.detail or '') and rec.last_error == 'boom'
+        assert rec.result == 'error' and rec.warning is None and rec.last_error == 'boom'
+        assert 'stale' not in (rec.detail or '')
+
+    def test_a_ride_carries_no_warning(self, run, sdir):
+        """A configured child that rode its recursive ancestor's snapshot: a success with the snapshot's
+        name, never the warning (that belongs to the ancestor's own record)."""
+        from zfsbackup.backup_manager import SnapshotRide
+        manager = manager_for(Dsi('pool/a/c'), last_snapshot_note='something about the parent')
+        manager.ridden_snapshot.return_value = SnapshotRide('autosnap_20261025100000', 'pool/a')
+        run(snapshot_worker(sdir, config_for('pool/a/c')), manager)
+        (rec,) = status(sdir).records
+        assert rec.result == 'ok' and rec.detail == 'autosnap_20261025100000' and rec.warning is None
+        manager.create_snapshot.assert_not_called()
+
+    def test_the_next_clean_snapshot_clears_the_warning(self, run, sdir):
+        for note, expected in (('first', 'first'), ('second', 'second'), (None, None)):
+            manager = manager_for(Dsi('pool/a'), last_snapshot_note=note)
+            manager.needs_snapshot.return_value = True
+            manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_20261025100000')
+            run(snapshot_worker(sdir), manager)
+            assert status(sdir).records[0].warning == expected
+
+    def test_a_failure_after_a_warning_clears_it(self, run, sdir):
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note='careful')
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_1')
+        run(snapshot_worker(sdir), manager)
+        assert status(sdir).records[0].warning == 'careful'
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note='careful')
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = None
+        manager.last_snapshot_error = 'boom'
+        run(snapshot_worker(sdir), manager)
+        (rec,) = status(sdir).records
+        assert rec.result == 'error' and rec.warning is None
+
+    def test_a_cycle_where_nothing_is_due_keeps_the_last_warning(self, run, sdir):
+        """Only a due snapshot rewrites the record: the warning stays until the next period's."""
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note='careful')
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_1')
+        run(snapshot_worker(sdir), manager)
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note=None)            # not due now
+        run(snapshot_worker(sdir), manager)
+        assert status(sdir).records[0].warning == 'careful'
+
+    def test_the_warning_is_clipped_like_the_detail(self, run, sdir):
+        manager = manager_for(Dsi('pool/a'), last_snapshot_note='x' * 100_000)
+        manager.needs_snapshot.return_value = True
+        manager.create_snapshot.return_value = SimpleNamespace(name='autosnap_1')
+        run(snapshot_worker(sdir), manager)
+        (rec,) = status(sdir).records
+        assert 0 < len(rec.warning) < 100_000
 
     def test_a_dataset_that_is_not_due_records_nothing(self, run, sdir):
         manager = manager_for(Dsi('pool/a'))
@@ -540,7 +613,7 @@ class TestSnapshotWorkerInsideACopy:
         assert world.snapshots_below('bk') == {}, 'nothing in the copy, the dataset itself included'
         assert set(world.snapshots_below('pool/a')) == {'pool/a', 'pool/a/c'}
 
-    def test_a_copy_left_out_is_an_ok_record_with_the_warning_in_its_detail(
+    def test_a_copy_left_out_is_an_ok_record_with_the_warning_in_its_warning_field(
             self, run, sdir, mocker, mock_subprocess):
         """The real manager: `pool/a` has a backup copy below it; the snapshot is taken (an OK record), the copy is
         left out, and the detail says so, so `check` shows it long after the journal line."""
@@ -550,8 +623,8 @@ class TestSnapshotWorkerInsideACopy:
         run(worker, manager)
         rec = {r.dataset: r for r in status(sdir).records}['pool/a']
         assert rec.result == 'ok' and rec.consecutive_failures == 0 and rec.last_error is None
-        name, _, note = rec.detail.partition('; WARNING: ')
-        assert name.startswith('autosnap_') and note == '1 backup copy below was not snapshotted: pool/a/bk'
+        assert rec.detail.startswith('autosnap_') and 'WARNING' not in rec.detail      # the name only
+        assert rec.warning == '1 backup copy below was not snapshotted: pool/a/bk'
         assert world.snapshots_below('pool/a/bk') == {}
 
     def test_a_plain_recursive_dataset_has_no_note(self, run, sdir, mocker, mock_subprocess):
@@ -559,6 +632,7 @@ class TestSnapshotWorkerInsideACopy:
         run(worker, manager)
         rec = {r.dataset: r for r in status(sdir).records}['pool/a']
         assert rec.detail.startswith('autosnap_') and 'WARNING' not in rec.detail
+        assert rec.warning is None
 
     def test_it_counts_up_while_it_stays_true(self, run, sdir, mocker, mock_subprocess):
         world, worker, manager = self.worker_and_manager(mocker, mock_subprocess, sdir)

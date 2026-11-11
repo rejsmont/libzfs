@@ -1867,6 +1867,42 @@ class TestReceivedDatasetsForgedRows:
         (warning,) = self.warnings(caplog)
         assert 'cannot read its properties' in warning
 
+    # The internal `_no_scope` default is not a caller's scope: only `check`'s
+    # budget (or `only_client_id`) turns a timeout into a discovery failure.
+    @pytest.mark.parametrize('failing', ['client_id', 'config'])
+    def test_a_timeout_in_a_scope_less_discovery_still_skips_that_dataset_with_one_warning(
+            self, mocker, caplog, failing):
+        # The pruner's call passes neither `only_client_id` nor `scope`: a ZFSTimeoutError stays a
+        # per-dataset skip-with-WARNING there (the health check's scoped call re-raises it instead).
+        from libzfseasy.zfs import ZFSTimeoutError
+        from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
+        bad, good = 'pool/backups/client1/bad', 'pool/backups/client1/good'
+        prop = PROP_CLIENT_ID if failing == 'client_id' else PROP_CONFIG
+        manager = self.manager()
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            FakeReceived(mocker, [bad, good], local={bad: _client_props('client1'), good: _client_props('client1')},
+                         errors={(bad, prop): ZFSTimeoutError('zfs get timed out after 60 s')})
+            result = manager.received_datasets()
+            assert [d.name for d in result] == [good]
+            (warning,) = self.warnings(caplog)
+            assert bad in warning and 'cannot read its properties' in warning and 'timed out after 60 s' in warning
+            manager.received_datasets()
+        assert len(self.warnings(caplog)) == 1                 # once per episode, not per cycle
+        assert manager.last_received_error is None
+
+    def test_the_same_timeout_under_a_scope_is_a_discovery_failure_not_a_skip(self, mocker, caplog):
+        import contextlib
+        from libzfseasy.zfs import ZFSTimeoutError
+        from zfsbackup.backup_manager import PROP_CLIENT_ID
+        ds = 'pool/backups/client1/data'
+        FakeReceived(mocker, [ds], local={ds: _client_props('client1')},
+                     errors={(ds, PROP_CLIENT_ID): ZFSTimeoutError('zfs get timed out after 10 s')})
+        manager = self.manager()
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.backup_manager'):
+            assert manager.received_datasets(scope=contextlib.nullcontext) == []
+        assert 'timed out after 10 s' in (manager.last_received_error or '')
+        assert not [m for m in self.warnings(caplog) if 'Skipping' in m]
+
     # -- reads are local-only -------------------------------------------------------------------
     def test_client_id_and_config_are_read_with_sources_local(self, mocker):
         from zfsbackup.backup_manager import PROP_CLIENT_ID, PROP_CONFIG
@@ -4813,3 +4849,371 @@ class TestServerPrunerRefusesUnusableConfig:
                          listed_info(frozen_clock.stamp(-timedelta(minutes=20)), txg=1)]
         with pytest.raises(ZeroDivisionError):
             manager.needs_prunning(dsi)
+
+
+# ---------------------------------------------------------------------------------------------
+# The health check's batch reads (`check` reads a recursive parent's tree in O(1) execs)
+# ---------------------------------------------------------------------------------------------
+
+class TestGetLocalProp:
+    """`_get_local_prop`: the one raising local read behind `get_local_anchor` and `get_local_inflight`."""
+
+    PROP = 'org.zfsbackup:anchor.offsite'
+
+    def test_a_local_value(self, mocker):
+        value = mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value='autosnap_1')
+        ds = Filesystem('pool/data')
+        assert DatasetManager._get_local_prop(ds, self.PROP) == 'autosnap_1'
+        value.assert_called_once_with(ds, self.PROP, sources='local')
+
+    def test_unset_inherited_or_received_is_none(self, mocker):
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', return_value=None)
+        assert DatasetManager._get_local_prop(Filesystem('pool/data'), self.PROP) is None
+
+    def test_a_failure_is_unreadable_never_none(self, mocker):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError('pool suspended'))
+        with pytest.raises(LocalAnchorUnreadable, match='pool suspended') as caught:
+            DatasetManager._get_local_prop(Filesystem('pool/data'), self.PROP)
+        assert isinstance(caught.value.__cause__, RuntimeError)
+
+    def test_a_timeout_is_unreadable_too_and_keeps_its_text(self, mocker):
+        from libzfseasy.zfs import ZFSTimeoutError
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value',
+                     side_effect=ZFSTimeoutError('zfs get timed out after 10 s'))
+        with pytest.raises(LocalAnchorUnreadable) as caught:
+            DatasetManager._get_local_prop(Filesystem('pool/data'), self.PROP)
+        assert str(caught.value) == 'zfs get timed out after 10 s'
+
+    def test_a_failure_without_a_message_still_says_something(self, mocker):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError())
+        with pytest.raises(LocalAnchorUnreadable) as caught:
+            DatasetManager._get_local_prop(Filesystem('pool/data'), self.PROP)
+        assert str(caught.value) != ''
+
+    def test_the_failure_is_logged_at_debug_naming_the_dataset(self, mocker, caplog):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        mocker.patch('zfsbackup.backup_manager.zfs.get.value', side_effect=RuntimeError('boom'))
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            with pytest.raises(LocalAnchorUnreadable):
+                DatasetManager._get_local_prop(Filesystem('pool/data'), self.PROP)
+        assert [r.levelname for r in caplog.records if 'pool/data' in r.getMessage()] == ['DEBUG']
+
+    def test_the_anchor_and_the_pin_readers_go_through_it(self, mocker):
+        manager = DatasetManager(_make_config())
+        dsi = manager.datasets[0]
+        spy = mocker.patch.object(DatasetManager, '_get_local_prop', return_value='autosnap_1,autosnap_2')
+        manager.get_local_inflight(dsi, 'offsite')
+        manager.get_local_anchor(dsi, 'offsite')
+        assert [c.args for c in spy.call_args_list] == [
+            (dsi.dataset, 'org.zfsbackup:inflight.offsite'), (dsi.dataset, 'org.zfsbackup:anchor.offsite')]
+
+
+class TestListSnapshotTreeStrict:
+    """`_list_snapshot_tree_strict`: the managed snapshots of a dataset AND its descendants in ONE recursive
+    strict listing, `{dataset: [newest first by createtxg]}`."""
+
+    def manager(self):
+        return _hourly_manager()
+
+    def tree(self, manager, mock_subprocess, *rows):
+        mock_subprocess.setup(stdout=list(rows))
+        return manager._list_snapshot_tree_strict(Dataset('pool/data'))
+
+    def test_one_recursive_strict_exec_with_the_six_columns(self, mock_subprocess):
+        self.tree(self.manager(), mock_subprocess, list_row('autosnap_20240101120000', 'pool/data', txg=5))
+        assert mock_subprocess.call_count == 1
+        argv = list(mock_subprocess.call_args_list[0].args[0])
+        assert argv[1] == 'list' and '-r' in argv and argv[argv.index('-t') + 1] == 'snapshot'
+        assert argv[argv.index('-o') + 1] == 'name,type,createtxg,guid,userrefs,clones,encryption,keystatus'
+        assert argv[-1] == 'pool/data'
+
+    def test_snapshots_are_grouped_per_dataset_newest_first_by_createtxg(self, mock_subprocess):
+        a, b, c = 'autosnap_20240101120000', 'autosnap_20240102120000', 'autosnap_20240103120000'
+        tree = self.tree(
+            self.manager(), mock_subprocess,
+            list_row(a, 'pool/data', txg=10), list_row(c, 'pool/data', txg=30), list_row(b, 'pool/data', txg=20),
+            list_row(b, 'pool/data/x', txg=7), list_row(a, 'pool/data/x', txg=9),            # txg beats the name
+        )
+        assert {k: [s.name for s in v] for k, v in tree.items()} == {
+            'pool/data': [c, b, a], 'pool/data/x': [a, b]}
+        assert all(isinstance(s, SnapshotInfo) for v in tree.values() for s in v)
+        assert [s.createtxg for s in tree['pool/data']] == [30, 20, 10]
+
+    def test_unmanaged_snapshots_are_left_out_and_a_dataset_without_any_has_no_key(self, mock_subprocess):
+        tree = self.tree(
+            self.manager(), mock_subprocess,
+            list_row('manual', 'pool/data', txg=3), list_row('autosnap_notadate', 'pool/data/y', txg=4),
+            list_row('autosnap_20240101120000', 'pool/data/x', txg=5),
+            list_row('autosnap_20240101120000_extra', 'pool/data/z', txg=6),
+        )
+        assert list(tree) == ['pool/data/x']
+
+    def test_a_snapshot_without_a_createtxg_is_left_out_at_debug_only(self, mock_subprocess, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            tree = self.tree(
+                self.manager(), mock_subprocess,
+                list_row('autosnap_20240101120000', 'pool/data', txg=5),
+                list_row('autosnap_20240102120000', 'pool/data', txg=NO_TXG),
+            )
+        assert [s.name for s in tree['pool/data']] == ['autosnap_20240101120000']
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('no createtxg' in r.getMessage() for r in caplog.records)
+
+    def test_an_empty_listing_is_an_empty_tree(self, mock_subprocess):
+        assert self.tree(self.manager(), mock_subprocess) == {}
+
+    def test_a_zfs_failure_raises(self, mock_subprocess):
+        _fail_get(mock_subprocess, 'cannot open pool/data: pool I/O is currently suspended')
+        with pytest.raises(Exception, match='suspended'):
+            self.manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+
+    def test_a_row_that_cannot_be_trusted_raises_not_a_smaller_tree(self, mock_subprocess):
+        """strict: a dropped row may be a child's newest snapshot, and the answer would be wrong, not smaller."""
+        mock_subprocess.setup(stdout=[
+            list_row('autosnap_20240101120000', 'pool/data', txg=5),
+            'pool/data@autosnap_20240102120000\tsnapshot\t6\n',                # the wrong number of columns
+        ])
+        with pytest.raises(Exception, match='could not be trusted'):
+            self.manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+
+    def test_a_row_outside_the_requested_tree_raises(self, mock_subprocess):
+        mock_subprocess.setup(stdout=[list_row('autosnap_20240101120000', 'pool/other', txg=5)])
+        with pytest.raises(Exception, match='could not be trusted'):
+            self.manager()._list_snapshot_tree_strict(Dataset('pool/data'))
+
+    def test_it_is_read_only_and_sets_no_state(self, mock_subprocess):
+        manager = self.manager()
+        dsi = manager.datasets[0]
+        self.tree(manager, mock_subprocess, list_row('autosnap_20240101120000', 'pool/data', txg=5))
+        assert dsi.snapshots == [] and manager.last_list_error is None
+        assert getattr(dsi, 'listed_names', None) in (None, set())
+        assert all(c.args[0][1] == 'list' for c in mock_subprocess.call_args_list)
+
+    def test_the_configured_prefix_decides_what_is_managed(self, mock_subprocess):
+        manager = DatasetManager(_make_config(snapshot_prefix='mine'))
+        mock_subprocess.setup(stdout=[
+            list_row('mine_20240101120000', 'pool/data', txg=5), list_row('autosnap_20240101120000', 'pool/data', txg=6)])
+        tree = manager._list_snapshot_tree_strict(Dataset('pool/data'))
+        assert [s.name for s in tree['pool/data']] == ['mine_20240101120000']
+
+
+class TestReadDescendantPropertiesSourcesAndPrefix:
+    """`read_descendant_zfsbackup_properties(ds, sources=, prefix=)`, over the Popen-level `ZfsWorld`: `sources`
+    reports where each returned value comes from (the health check counts only LOCAL ones); `prefix` narrows
+    both phases to `anchor.*`/`inflight.*`."""
+
+    ANCHOR = PROP_ANCHOR_PREFIX + 'a'
+    PIN = PROP_INFLIGHT_PREFIX + 'a'
+    BOTH = (PROP_ANCHOR_PREFIX, PROP_INFLIGHT_PREFIX)
+
+    @pytest.fixture
+    def world(self, mock_subprocess):
+        w = ZfsWorld(mock_subprocess)
+        w.add('pool/data')
+        return w
+
+    def read(self, **kw):
+        from zfsbackup.backup_manager import read_descendant_zfsbackup_properties
+        return read_descendant_zfsbackup_properties(Filesystem('pool/data'), **kw)
+
+    def test_the_defaults_are_unchanged(self, world):
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (PROP_CONFIG, 'cfg', 'local')])
+        assert self.read() == {'pool/data/x': {self.ANCHOR: 's1', PROP_CONFIG: 'cfg'}}
+
+    def test_sources_say_where_each_value_comes_from(self, world):
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (self.PIN, 'a,b', 'received')])
+        world.add('pool/data/y', [(self.ANCHOR, 's2', 'received')])
+        sources = {}
+        got = self.read(sources=sources, prefix=self.BOTH)
+        assert got == {'pool/data/x': {self.ANCHOR: 's1', self.PIN: 'a,b'}, 'pool/data/y': {self.ANCHOR: 's2'}}
+        assert sources == {'pool/data/x': {self.ANCHOR: 'local', self.PIN: 'received'},
+                           'pool/data/y': {self.ANCHOR: 'received'}}
+
+    def test_sources_cover_descendants_only_never_the_root(self, world):
+        world.set_props('pool/data', [(self.ANCHOR, 'root', 'local')])
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local')])
+        sources = {}
+        got = self.read(sources=sources, prefix=self.BOTH)
+        assert list(got) == ['pool/data/x'] and list(sources) == ['pool/data/x']
+
+    def test_an_inherited_value_is_neither_returned_nor_in_sources(self, world):
+        world.set_props('pool/data', [(self.ANCHOR, 'root', 'local')])
+        world.add('pool/data/x', [(self.ANCHOR, 'root', 'inherited from pool/data')])
+        world.add('pool/data/y', [(self.PIN, 'a,b', 'local')])
+        sources = {}
+        assert self.read(sources=sources, prefix=self.BOTH) == {'pool/data/y': {self.PIN: 'a,b'}}
+        assert sources == {'pool/data/y': {self.PIN: 'local'}}
+
+    def test_sources_stay_empty_when_nothing_below_has_a_property(self, world, mock_subprocess):
+        world.add('pool/data/x', [('compression', 'lz4', 'local')])
+        sources = {}
+        assert self.read(sources=sources, prefix=self.BOTH) == {} and sources == {}
+        assert len(world.discoveries) == 1 and world.value_reads == []        # one exec, no phase 2
+
+    @pytest.mark.parametrize('prefix', [BOTH, list(BOTH), PROP_ANCHOR_PREFIX], ids=['tuple', 'list', 'string'])
+    def test_the_prefix_narrows_the_names_phase_two_asks_for(self, world, prefix):
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (PROP_CONFIG, 'cfg', 'local'),
+                                  (self.PIN, 'a,b', 'local')])
+        got = self.read(prefix=prefix)
+        (phase2,) = world.value_reads
+        wanted = [self.ANCHOR] if prefix == PROP_ANCHOR_PREFIX else [self.ANCHOR, self.PIN]
+        assert phase2[-2] == ','.join(['name', 'type'] + wanted)
+        assert got == {'pool/data/x': {p: v for p, v in
+                                       {self.ANCHOR: 's1', self.PIN: 'a,b'}.items() if p in wanted}}
+
+    def test_an_unrelated_value_with_a_newline_cannot_break_a_narrowed_read(self, world):
+        """The default prefix reads `config` too, so its forged rows are refused; the narrowed read never asks."""
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (PROP_CONFIG, 'first\npool/data/x\tname\tpool/data/x\t-', 'local')])
+        with pytest.raises(ZFSOutputError):
+            self.read()
+        assert self.read(prefix=self.BOTH) == {'pool/data/x': {self.ANCHOR: 's1'}}
+
+    def test_phase_one_still_asks_local_and_received_only(self, world):
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local')])
+        self.read(prefix=self.BOTH)
+        (phase1,) = world.discoveries
+        assert phase1[phase1.index('-s') + 1] == 'local,received' and '-r' in phase1
+
+    def test_a_race_between_the_phases_is_read_again_and_sources_come_from_the_second_read_only(self, world):
+        """The first attempt records an anchor source, then the pin it expected is gone (a mismatch); before the
+        second attempt the anchor is gone too. Nothing of the discarded first read may survive in `sources`."""
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (self.PIN, 'a,b', 'local')])
+        seen = {'phase1': 0, 'phase2': 0}
+
+        def race(argv):
+            if argv[:4] == ['get', '-H', '-o', 'name,property,value,source']:
+                seen['phase2'] += 1
+                if seen['phase2'] == 1:
+                    world.set_props('pool/data/x', [(self.ANCHOR, 's1', 'local')])        # the pin vanished
+            elif argv[:4] == ['get', '-H', '-o', 'name,property,source']:
+                seen['phase1'] += 1
+                if seen['phase1'] == 2:
+                    world.set_props('pool/data/x', [])                                    # and now the anchor
+
+        world.on_exec = race
+        sources = {}
+        assert self.read(sources=sources, prefix=self.BOTH) == {}
+        assert sources == {}
+        assert seen == {'phase1': 2, 'phase2': 1}
+
+    def test_a_race_between_the_phases_is_read_again_and_the_second_read_is_what_counts(self, world):
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (self.PIN, 'a,b', 'local')])
+        state = {'phase2': 0}
+
+        def clear_the_pin_after_phase_one(argv):
+            if argv[:4] == ['get', '-H', '-o', 'name,property,value,source']:
+                state['phase2'] += 1
+                if state['phase2'] == 1:
+                    world.set_props('pool/data/x', [(self.ANCHOR, 's1', 'received')])
+
+        world.on_exec = clear_the_pin_after_phase_one
+        sources = {}
+        got = self.read(sources=sources, prefix=self.BOTH)
+        assert got == {'pool/data/x': {self.ANCHOR: 's1'}}
+        assert sources == {'pool/data/x': {self.ANCHOR: 'received'}}
+        assert len(world.discoveries) == 2
+
+    def test_the_retry_keeps_the_prefix(self, world):
+        """An unrelated `config` with a newline in it must not break the SECOND attempt either."""
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local'), (self.PIN, 'a,b', 'local'),
+                                  (PROP_CONFIG, 'first\npool/data/x\tname\tpool/data/x\t-', 'local')])
+        state = {'phase2': 0}
+
+        def lose_the_pin_once(argv):
+            if argv[:4] == ['get', '-H', '-o', 'name,property,value,source']:
+                state['phase2'] += 1
+                if state['phase2'] == 1:
+                    world.set_props('pool/data/x', [
+                        (self.ANCHOR, 's1', 'local'),
+                        (PROP_CONFIG, 'first\npool/data/x\tname\tpool/data/x\t-', 'local')])
+
+        world.on_exec = lose_the_pin_once
+        assert self.read(prefix=self.BOTH) == {'pool/data/x': {self.ANCHOR: 's1'}}
+        assert len(world.discoveries) == 2
+        assert all(a[-2] == f'name,type,{self.ANCHOR}' for a in world.value_reads[1:])
+
+    def test_a_disagreement_that_persists_raises(self, world):
+        world.add('pool/data/x', [(self.ANCHOR, 's1', 'local')])
+
+        def flicker(argv):
+            # present for every discovery, gone for every value read: the two phases never agree
+            if argv[:4] == ['get', '-H', '-o', 'name,property,value,source']:
+                world.set_props('pool/data/x', [])
+            elif argv[:4] == ['get', '-H', '-o', 'name,property,source']:
+                world.set_props('pool/data/x', [(self.ANCHOR, 's1', 'local')])
+
+        world.on_exec = flicker
+        with pytest.raises(ZFSOutputError, match='changed while they were being read'):
+            self.read(prefix=self.BOTH)
+
+    def test_a_failed_read_raises(self, world):
+        world.fail(lambda argv: argv[:4] == ['get', '-H', '-o', 'name,property,source'],
+                   'cannot open: pool I/O is currently suspended')
+        with pytest.raises(Exception, match='suspended'):
+            self.read(prefix=self.BOTH)
+
+
+class TestReceivedDatasetsScope:
+    """`received_datasets(scope=)`: every zfs call of the discovery runs in the caller's scope (the health
+    check's timeouts); a failure, a timeout included, is `[]` and `last_received_error`."""
+
+    class Scope:
+        def __init__(self, error=None):
+            self.error, self.calls, self.entered = error, 0, 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            return self
+
+        def __enter__(self):
+            self.entered += 1
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    NAMES = ['pool/backups/c/a', 'pool/backups/c/b']
+
+    def local(self):
+        return {n: _client_props('c') for n in self.NAMES}
+
+    def test_the_listing_and_the_batch_run_in_the_scope(self, mocker):
+        FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        scope = self.Scope()
+        found = _remote_manager().received_datasets(scope=scope)
+        assert [d.name for d in found] == self.NAMES
+        assert scope.entered == scope.calls >= 2
+
+    def test_every_per_dataset_read_of_the_fallback_runs_in_the_scope_too(self, mocker):
+        FakeReceived(mocker, self.NAMES, local=self.local())                  # no batch: the exact path
+        scope = self.Scope()
+        found = _remote_manager().received_datasets(scope=scope)
+        assert [d.name for d in found] == self.NAMES
+        assert scope.entered == scope.calls > 2
+
+    def test_a_scope_that_refuses_is_a_failed_discovery_not_an_exception(self, mocker):
+        from libzfseasy.zfs import ZFSTimeoutError
+        FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        manager = _remote_manager()
+        assert manager.received_datasets(scope=self.Scope(error=ZFSTimeoutError('time limit spent'))) == []
+        assert manager.last_received_error == 'ZFSTimeoutError: time limit spent'
+
+    def test_a_good_call_after_a_failed_one_clears_the_error(self, mocker):
+        from libzfseasy.zfs import ZFSTimeoutError
+        FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        manager = _remote_manager()
+        manager.received_datasets(scope=self.Scope(error=ZFSTimeoutError('x')))
+        assert len(manager.received_datasets(scope=self.Scope())) == 2 and manager.last_received_error is None
+
+    def test_without_a_scope_nothing_changes(self, mocker):
+        FakeReceived(mocker, self.NAMES, local=self.local(), batch=True)
+        assert [d.name for d in _remote_manager().received_datasets()] == self.NAMES
+
+    def test_a_remote_backup_that_is_off_never_enters_it(self):
+        scope = self.Scope()
+        assert DatasetManager(_make_config()).received_datasets(scope=scope) == [] and scope.calls == 0

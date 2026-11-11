@@ -213,6 +213,34 @@ def host_client_id(database: Path):
         dispose_all()
 
 
+def plant_destination_name(database: Path, old: str, new: str) -> None:
+    """Rename the destination `old` to `new` with direct SQL, bypassing `validate_config`
+    (which now refuses a name that cannot form the ZFS anchor and pin properties), so a test can
+    exercise what the CLI and the daemon do with a bad name already STORED (an older release, a
+    hand-edited database). Through the store's own engine, so foreign keys are the real ones: the
+    new destination row is inserted, the dataset remotes repointed, the old row deleted. Does not
+    bump the generation."""
+    from sqlalchemy import text
+
+    from zfsbackup.config.store import db as store_db
+
+    url = store_db.url_for_path(database)
+    try:
+        with store_db.session_scope(url) as session:
+            session.execute(
+                text("INSERT INTO destinations (name, url, server_fingerprint) "
+                     "SELECT :new, url, server_fingerprint FROM destinations WHERE name = :old"),
+                {"new": new, "old": old},
+            )
+            session.execute(
+                text("UPDATE dataset_remotes SET destination_name = :new WHERE destination_name = :old"),
+                {"new": new, "old": old},
+            )
+            session.execute(text("DELETE FROM destinations WHERE name = :old"), {"old": old})
+    finally:
+        dispose_all()
+
+
 def write_yaml(directory: Path, text: str, name: str = "in.yaml") -> Path:
     path = directory / name
     path.write_text(text)
