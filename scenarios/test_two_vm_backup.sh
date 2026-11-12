@@ -497,7 +497,7 @@ put_config() { # put_config <vm> ; reads config text on stdin, installs it to $C
 # must be stopped first. Output suppressed in the guest.
 remove_config() {
     local vm="$1"
-    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; rm -rf '$TLS_DIR' '$TLS_DIR'.old-* /var/lib/zfsbackup-b /var/lib/zfsbackup-c; } >/dev/null 2>&1; true" || true
+    msh "$vm" "{ rm -f '$CFG' '$DB' '$DB-wal' '$DB-shm' '$DB.daemon.pid' '$DB.writer.lock' '$DB.workers.lock'; rm -rf '$DB.status'; rm -rf '$TLS_DIR' '$TLS_DIR'.old-* /var/lib/zfsbackup-b /var/lib/zfsbackup-c; } >/dev/null 2>&1; true" || true
 }
 
 write_server_config() {
