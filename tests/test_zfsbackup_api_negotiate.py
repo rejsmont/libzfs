@@ -1116,17 +1116,25 @@ class TestPendingMapBounds:
         assert all(value[1] == f"pool/{key.rsplit('/', 1)[1][0]}" for key, value in live.items())
 
     def test_concurrent_negotiates_of_one_dataset_leave_one_entry(self, authed, zfs):
+        """Negotiate claims the server dataset for its whole run, so a negotiate that overlaps
+        another of the same dataset gets the retryable busy 503 (see
+        `TestNegotiateClaim`). How many overlap is up to the scheduler (on a loaded CI runner,
+        some do), so only the outcomes are fixed: each one is 200 or busy, at least one is
+        200, and however they interleave the map ends with exactly one entry."""
         results = []
 
         def go():
-            results.append(negotiate(authed.client()).status_code)
+            reply = negotiate(authed.client())
+            results.append((reply.status_code, reply.get_json()))
 
         threads = [threading.Thread(target=go, daemon=True) for _ in range(8)]
         for t in threads:
             t.start()
         for t in threads:
             t.join(30)
-        assert results == [200] * 8
+        assert len(results) == 8
+        assert all(status == 200 or (status, body) == (503, BUSY) for status, body in results), results
+        assert any(status == 200 for status, _ in results), results
         assert list(pending_configs(authed.app)) == [SERVER_DS]
         assert authed.gate.active == 0
 

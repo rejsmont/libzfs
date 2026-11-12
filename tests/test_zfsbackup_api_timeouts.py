@@ -1468,7 +1468,10 @@ class TestHungPoolEndToEnd:
                 assert_zfs_timeout(negotiate(client))
                 assert_zfs_timeout(client.get(TOKEN_URL))
                 assert drive_stream(authed).send.call_count == 1
-                assert time.monotonic() - before < 0.5
+                # Failing fast means not waiting out the budget: three requests well inside
+                # one budget. (A tighter wall-clock bound, 0.5 s, flaked at 0.57 s on a loaded
+                # CI runner; that nothing is spawned is pinned by `kids.procs` below.)
+                assert time.monotonic() - before < self.HANG_BUDGET / 2
             assert len(kids.procs) == 1
 
             kids.on = False                                           # the pool wakes up: the child is gone

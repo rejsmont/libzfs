@@ -5165,9 +5165,18 @@ class TestDbGenerationRace:
         a_has_read = threading.Event()
         b_has_read = threading.Event()
 
+        # Each writer keeps a strong reference to the row it read. The
+        # session's identity map is weak: without one, the object can be
+        # collected and `save_config`'s own `session.get` re-SELECTs -- and,
+        # with no transaction open yet, sees whatever was committed by then.
+        # If the other writer had already committed (a slow wake-up on a
+        # loaded CI runner), that read is fresh and both increments land, so
+        # the race this control reproduces never happened. Holding the row
+        # makes `save_config` use exactly the stale value asserted below.
         def writer_a():
             with session_scope(file_db_url) as s:
-                a_read_generation["value"] = s.get(GlobalSettings, 1).generation
+                row = s.get(GlobalSettings, 1)
+                a_read_generation["value"] = row.generation
                 a_has_read.set()
                 # Wait for B to also read before either of us writes --
                 # this is the race window `BEGIN IMMEDIATE` exists to
@@ -5175,13 +5184,16 @@ class TestDbGenerationRace:
                 # snapshot, so both threads can freely interleave here.
                 b_has_read.wait(timeout=5)
                 save_config(s, _minimal_backup_config(name="tank/a"))
+                del row
 
         def writer_b():
             a_has_read.wait(timeout=5)
             with session_scope(file_db_url) as s:
-                b_read_generation["value"] = s.get(GlobalSettings, 1).generation
+                row = s.get(GlobalSettings, 1)
+                b_read_generation["value"] = row.generation
                 b_has_read.set()
                 save_config(s, _minimal_backup_config(name="tank/b"))
+                del row
 
         thread_a = _run_and_capture(writer_a)
         thread_b = _run_and_capture(writer_b)
