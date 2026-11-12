@@ -243,8 +243,9 @@ Order: B1.1 → B1.2 → B1.3 → B2 (they can run alongside A3–A6), then B3 a
 - **Clock steps back.** This deviates from "never re-run an attempted slot k".
   - Whenever `attempted > slot_index(now)`, the attempted index is clamped to `slot_index(now)`. The next regular run
     is then at most P away, whatever the pair's history.
-  - The cost is at most one extra run per step back, and the sender's anchor-age check turns it into a cheap
-    `NOT_DUE`.
+  - The cost is at most one extra run per step back, and the sender's anchor-age check usually turns it into a cheap
+    `NOT_DUE` (B4: the check goes to the pair's next dispatch, which may be a pending retry rather than the re-run, and
+    a step back seen only across a restart sets none; accepted: one cheap up-to-date attempt, a retry delayed ≤ P).
   - Pending catch-up, retry, R-2 confirmation and discovery times are capped by distance (`CATCH_UP_CAP`,
     `FAILURE_RETRY_CAP`, now, the discovery interval).
   - Why: the literal rule stalls every pair for the size of the step, which can be days on a host that boots before
@@ -270,6 +271,19 @@ B3 passed two rounds of `zfs-code-reviewer` + `concurrency-reviewer` and a final
   `_shares_memory`). Discovery runs per parent (`expand_recursive(parent=)`, scoped latch forgetting).
 - **Recording.** A DONE outcome is always recorded at once, including DONE+retryable (a chain cut between steps, a
   reload's drain), while its retry timing is kept. A retryable FAILED is recorded only when its retries are spent.
+  B4 (2026-11-12): DONE+retryable happens only when the worker is leaving (stop flag or `leave` between steps); it is
+  recorded with `incomplete: true` (additive, `STATUS_SCHEMA` stays 1), `SendLoop._last_attempts` leaves it out and the
+  successor seeds `PairSpec(resume=True)`, so the chain continues at start instead of at the next slot (up to a day for
+  a daily pair). A failure record seeds `PairSpec(failed=True)`: retried at `min(next slot, last_attempt + 1 h)`.
+- **The schedule decides (B4).** The sender's anchor-age due check runs only on the one re-run a backwards clock step
+  can cause (`_PairState.check_anchor`, set only by `_unstall`'s clamp; `wants_anchor_check`); every other dispatch
+  (on-time slot, catch-up, retry, overrun follow-up, continuation, confirmation) passes `force_confirm`. Reasons, from
+  the B4 reviews: with P > F a partly sent chain (a cut, a failure after acknowledged steps, an unclean exit that left no
+  record) or a late send (a retry at +1 h, a catch-up) leaves an anchor younger than P, and the old check answered
+  NOT_DUE for up to one more period (the gap between sends approaching 2P); a retry pending at a reload is not on disk,
+  so only forcing every catch-up covers it. A forced attempt with nothing pending settles as up to date; a forced
+  `send_pair` still reads the own anchor for the future-dated-anchor ERROR. `SendMemory.__getstate__` drops `CLAIMS`
+  (a claim belongs to a thread of this process).
 - **Latches per episode, shared by all senders:** `UNREACHABLE` and `WHOAMI_UNEXPECTED` (ERROR once per destination,
   DEBUG after, INFO when the server answers normally again); `IDENTITY_LOADED` by fingerprint (re-armed by a failed
   load). A call's own refusal message is kept on the instance, so a sibling's `_forget_refusal` cannot erase it.
@@ -280,6 +294,11 @@ B3 passed two rounds of `zfs-code-reviewer` + `concurrency-reviewer` and a final
   of the discovery and the failure comes first (`_link`, `finished`).
 - **Local negotiate claim.** `SendMemory.claim/release` (non-blocking, all-or-nothing over the missing containers,
   re-look under the claim, released in `finally`); a held name is a retryable `NegotiationFailed`.
+  B4 (bug B1, `docs/parallel_senders_report.md`): OpenZFS shows a dataset being created by `zfs create -o
+  client_id=…` to `zfs list` before `zfs get -s local` returns the property, so an existing container that looks
+  unowned is re-checked (`_recheck_unowned`): claimed by another sender → the retryable busy; otherwise re-read under
+  a non-blocking claim, and only a re-read that still shows no owner is the ownership refusal. The API worker cannot
+  race this on a shared target: it only creates under other clients' ids and reserves this host's own id.
 - **Exit paths.** Every exit sets `leave` and joins every sender (unbounded; a hung source pool holds the drain until
   STOP) with heartbeats; discoveries are abandoned after `DISCOVERY_JOIN` (5 s). A scheduler exception is logged
   with its traceback before the drain. A `Thread.start()` failure is a retryable FAILED.
@@ -289,6 +308,16 @@ B3 passed two rounds of `zfs-code-reviewer` + `concurrency-reviewer` and a final
   flap ERROR/INFO when two senders see a server that really alternates.
 - **libzfseasy.** `GetCommand._finish` decides "this listing warned" from a per-thread counter
   (`_thread_name_warnings()`), so concurrent listings no longer raise each other's summary to WARNING.
+
+## Follow-ups found during Track B (not yet scheduled)
+
+- **Remote throughput is bound by Python, not by the sender thread count** (`docs/parallel_senders_report.md`,
+  scenario 5): the server's API worker spends about 7.5–9 ms/MiB of Python per received stream and the sender about
+  5–6 ms/MiB, so one sender process tops out near 165–190 MiB/s and one API worker near 110–130 MiB/s whatever the
+  number of senders (local legs run at raw `zfs send | zfs receive` speed). Parallel senders buy overlap, not remote
+  bandwidth. Worth profiling the websocket relay (frame size, copies, TLS record size) before anything structural.
+- **Scenario gaps:** the 600 s pump stall path (the timed negotiate fires first at ~60 s), a hung SOURCE pool, and
+  saturation beyond 2 vCPUs.
 
 ## Follow-ups found during Track A (not yet scheduled)
 

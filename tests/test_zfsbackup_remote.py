@@ -459,7 +459,7 @@ class TestFetchResumeToken:
         h.rm.get(h.url, status_code=503, json={'error': 'server is reloading; retry later', 'retry': True})
         with caplog.at_level(logging.DEBUG):
             assert self.fetch(h) == ('skip', None)
-        assert [r.levelname for r in messages(caplog, 'is reloading; skipping pool/data this cycle')] == ['INFO']
+        assert [r.levelname for r in messages(caplog, 'is reloading; skipping pool/data this attempt')] == ['INFO']
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     @pytest.mark.parametrize('status, body', [
@@ -475,7 +475,7 @@ class TestFetchResumeToken:
             assert self.fetch(h) == ('skip', None)
         (rec,) = messages(caplog, f'HTTP {status}')
         assert rec.levelname == 'WARNING'
-        assert 'skipping this cycle' in rec.getMessage() and 'pool/data' in rec.getMessage()
+        assert 'skipping this attempt' in rec.getMessage() and 'pool/data' in rec.getMessage()
         assert 'is reloading' not in caplog.text
 
     @pytest.mark.parametrize('status, body, text', [
@@ -507,7 +507,7 @@ class TestFetchResumeToken:
         with caplog.at_level(logging.DEBUG):
             assert self.fetch(h) == ('skip', None)
         (rec,) = messages(caplog, 'cannot ask')
-        assert rec.levelname == 'WARNING' and 'skipping this cycle' in rec.getMessage()
+        assert rec.levelname == 'WARNING' and 'skipping this attempt' in rec.getMessage()
 
     def test_a_body_that_is_not_json_is_a_warning_skip(self, h, caplog):
         h.rm.get(h.url, text='<html>gateway</html>')
@@ -549,7 +549,7 @@ class TestBusyServer:
         with caplog.at_level(logging.DEBUG):
             assert h.start() is None
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert [r.levelname for r in messages(caplog, 'skipping pool/data this cycle')] == ['INFO']
+        assert [r.levelname for r in messages(caplog, 'skipping pool/data this attempt')] == ['INFO']
         h.nothing_started()
 
     def test_a_busy_negotiate_is_a_reloading_style_failure(self, h):
@@ -805,7 +805,7 @@ class TestUndecidableTokenSkipsTheCycle:
             assert h.start() is None
         (rec,) = messages(caplog, 'cannot check the resume token of pool/data')
         assert rec.levelname == 'WARNING'
-        assert 'skipping this cycle' in rec.getMessage() and reason in rec.getMessage()
+        assert 'skipping this attempt' in rec.getMessage() and reason in rec.getMessage()
         assert not messages(caplog, 'Not resuming')
         h.nothing_started()
 
@@ -864,7 +864,7 @@ class TestSnapshotWithoutAGuid:
         with caplog.at_level(logging.INFO):
             assert h.start(snaps=snaps) is None
         (rec,) = messages(caplog, 'cannot check the resume token')
-        assert rec.levelname == 'WARNING' and 'skipping this cycle' in rec.getMessage()
+        assert rec.levelname == 'WARNING' and 'skipping this attempt' in rec.getMessage()
         assert not messages(caplog, 'Not resuming')
         h.nothing_started()
         return rec.getMessage()
@@ -1338,7 +1338,7 @@ class TestAnchorWriteFailureStopsTheChain:
         chain.relist.assert_not_called()
 
     def test_a_failed_anchor_write_on_the_last_step_is_still_a_success(self, h5, mocker):
-        """The server has everything; only the local bookkeeping failed (the next cycle's
+        """The server has everything; only the local bookkeeping failed (the next attempt's
         negotiate finds the common snapshot and settles it)."""
         chain = Chain(h5, mocker, sessions=5)
         h5.set_anchor.return_value = False
@@ -1390,7 +1390,7 @@ class TestStopBetweenSteps:
         with caplog.at_level(logging.INFO):
             assert chain.run(common=S1, should_stop=stop) is True
         assert chain.sent() == [(S1, S2)]
-        assert f'stop requested; pool/data -> offsite continues to {S5} next cycle' in caplog.text
+        assert f'stop requested; pool/data -> offsite continues to {S5} next attempt' in caplog.text
         assert [c.args[1:] for c in h5.set_anchor.call_args_list] == [('offsite', S2)]   # step 1 is kept
         h5.clear_inflight.assert_called_once()
 
@@ -1588,7 +1588,7 @@ class TestResumeThenTheRestOfTheChain:
             assert chain.run(common=S1, should_stop=stop) is True
         assert chain.ws_cls.call_count == 1
         chain.negotiate.assert_not_called()
-        assert f'stop requested; pool/data -> offsite continues to {S5} next cycle' in caplog.text
+        assert f'stop requested; pool/data -> offsite continues to {S5} next attempt' in caplog.text
         assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S2]
 
     def test_a_failed_renegotiate_ends_it_after_the_resume_completed(self, resumed_s2, mocker):
@@ -1604,7 +1604,7 @@ class TestResumeThenTheRestOfTheChain:
                       negotiate=NegotiationFailed('server is reloading', reloading=True))
         with caplog.at_level(logging.INFO):
             assert chain.run(common=S1) is False
-        assert [r.levelname for r in messages(caplog, 'pool/data continues next cycle')] == ['INFO']
+        assert [r.levelname for r in messages(caplog, 'pool/data continues next attempt')] == ['INFO']
 
     def test_a_failed_resume_never_reaches_the_chain(self, resumed_s2, mocker):
         chain = Chain(resumed_s2, mocker, sessions=6, negotiate=S2)
@@ -2470,7 +2470,7 @@ class TestNegotiationFailedAndReload:
         with caplog.at_level(logging.INFO):
             assert rbm.backup_dataset(dsi, remote_cfg) is False
         infos = [r for r in caplog.records if r.levelno == logging.INFO
-                 and r.getMessage() == f'server {self.URL} is reloading; skipping {dsi.name} this cycle']
+                 and r.getMessage() == f'server {self.URL} is reloading; skipping {dsi.name} this attempt']
         assert len(infos) == 1
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
         self.assert_no_send(sends)
@@ -2515,7 +2515,7 @@ class TestNegotiationFailedAndReload:
         with caplog.at_level(logging.INFO):
             assert rbm.backup_dataset(dsi, remote_cfg) is False
         assert [r.levelname for r in caplog.records if r.getMessage() == (
-            f'server {self.URL} is reloading; destination offsite skipped this cycle')] == ['INFO']
+            f'server {self.URL} is reloading; destination offsite skipped this attempt')] == ['INFO']
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert negotiate.call_count == 0
         self.assert_no_send(sends)
@@ -2544,7 +2544,7 @@ class TestNegotiationFailedAndReload:
         latest = sinfo('autosnap_20240101120000')
         with caplog.at_level(logging.INFO):
             assert rbm._try_resume(tr(), 'client1', dsi, 'offsite', [latest], 'plain') == ('skip', None)
-        assert f'server {self.URL} is reloading; skipping {dsi.name} this cycle' in caplog.text
+        assert f'server {self.URL} is reloading; skipping {dsi.name} this attempt' in caplog.text
         send_snapshot.assert_not_called()
         send_resume.assert_not_called()
 
@@ -3665,7 +3665,7 @@ class TestMissingCommonSnapshot:
             assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is False
         (rec,) = messages(caplog, 'autosnap_20200101000000', 'ERROR')
         assert 'is not a managed local snapshot' in rec.getMessage()
-        assert 'skipping this cycle rather than sending a full stream' in rec.getMessage()
+        assert 'skipping this attempt rather than sending a full stream' in rec.getMessage()
         chain.ws_cls.assert_not_called()
         h5.nothing_started()                      # no pin, no `zfs send` (so no full send either)
         assert not h5.token_gets()
@@ -3678,7 +3678,7 @@ class TestMissingCommonSnapshot:
         with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
             assert h5.rbm.backup_dataset(h5.dsi, cfg_for(None)) is False
         (rec,) = messages(caplog, 'autosnap_20200101000000', 'ERROR')
-        assert 'skipping the rest of this cycle rather than sending a full stream' in rec.getMessage()
+        assert 'skipping the rest of this attempt rather than sending a full stream' in rec.getMessage()
         assert chain.ws_cls.call_count == 1                              # only the resume
         h5.send_snapshot.assert_not_called()                             # no full send, no chain
         assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S2]     # the resume is kept
@@ -4030,8 +4030,8 @@ class TestRetryableNegotiate503:
         ws_cls = mocker.patch('zfsbackup.remote.websocket.WebSocket')
         with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
             assert h.rbm.backup_dataset(h.dsi, cfg_for(None)) is False
-        (rec,) = [r for r in caplog.records if 'skipping pool/data this cycle' in r.getMessage()]
-        assert rec.levelname == 'INFO' and rec.getMessage() == f'server {BASE} is {word}; skipping pool/data this cycle'
+        (rec,) = [r for r in caplog.records if 'skipping pool/data this attempt' in r.getMessage()]
+        assert rec.levelname == 'INFO' and rec.getMessage() == f'server {BASE} is {word}; skipping pool/data this attempt'
         # (an unsettled ancestor is the one retryable case that also warns -- once: see
         # TestUnsettledAncestorWarnsOnce)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING and 'waiting for' not in r.getMessage()]
@@ -4051,7 +4051,7 @@ class TestRetryableNegotiate503:
         chain = Chain(h5, mocker, sessions=6, negotiate=error)
         with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
             assert chain.run(common=S1) is False
-        assert [r.levelname for r in messages(caplog, f'server {BASE} is {word}; pool/data continues next cycle')] == ['INFO']
+        assert [r.levelname for r in messages(caplog, f'server {BASE} is {word}; pool/data continues next attempt')] == ['INFO']
         assert chain.ws_cls.call_count == 1
         h5.send_snapshot.assert_not_called()
 
@@ -4300,7 +4300,7 @@ class TestBusyWording:
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
             assert h.rbm.backup_dataset(h.dsi, cfg_for(None)) is False
         assert 'busy: busy' not in caplog.text
-        assert f'server {BASE} is busy; skipping pool/data this cycle' in caplog.text
+        assert f'server {BASE} is busy; skipping pool/data this attempt' in caplog.text
 
     def test_the_real_busy_mid_chain_renegotiate_never_says_busy_busy(self, h5, mocker, caplog):
         h5.token(TOKEN_INCR)
@@ -4310,7 +4310,7 @@ class TestBusyWording:
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
             assert chain.run(common=S1) is False
         assert 'busy: busy' not in caplog.text
-        assert f'server {BASE} is busy; pool/data continues next cycle' in caplog.text
+        assert f'server {BASE} is busy; pool/data continues next attempt' in caplog.text
 
     def test_a_busy_final_ack_names_the_stream_and_never_says_busy_busy(self, h5, mocker, caplog):
         chain = Chain(h5, mocker, sessions=3)
@@ -4318,7 +4318,7 @@ class TestBusyWording:
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.remote'):
             assert chain.run(common=S1) is False
         assert 'busy: busy' not in caplog.text
-        assert f'server {BASE} is busy with another stream of pool/data; skipping this cycle' in caplog.text
+        assert f'server {BASE} is busy with another stream of pool/data; skipping this attempt' in caplog.text
 
     def test_retry_word_for_the_real_texts(self):
         assert _retry_word(NegotiationFailed('server is busy', reloading=True)) == 'busy'
@@ -4397,7 +4397,7 @@ class TestUnsettledAncestorWarnsOnce:
         ws_cls.assert_not_called()
         h.nothing_started()
         assert len(self.warnings(caplog)) == 1
-        assert f"server {BASE} is busy: {UNSETTLED_503['error']}; skipping pool/data this cycle" in caplog.text
+        assert f"server {BASE} is busy: {UNSETTLED_503['error']}; skipping pool/data this attempt" in caplog.text
 
     def test_the_wording_matches_what_the_server_sends(self):
         """The body the tests use is the shape `backup_negotiate` returns."""
@@ -4536,7 +4536,7 @@ def slept(sleeps):
 
 class TestConnectRetryAfterASuccessfulStep:
     NOT_ACCEPTING = (f'server {BASE} is not accepting connections right after a successful step '
-                     '(probably reloading); pool/data -> offsite continues next cycle')
+                     '(probably reloading); pool/data -> offsite continues next attempt')
 
     def test_the_constants(self):
         assert CONNECT_RETRY_DELAYS == (1.0, 2.0, 4.0) and CONNECT_RETRY_SLICE == 0.25
@@ -4674,7 +4674,7 @@ class TestConnectRetryAfterASuccessfulStep:
             assert chain.run(common=S1, should_stop=stop) is False
         sleeps.assert_not_called()
         assert len(fake_connect_pinned.calls) == 2
-        assert 'stop requested; pool/data -> offsite continues next cycle' in caplog.text
+        assert 'stop requested; pool/data -> offsite continues next attempt' in caplog.text
         assert 'not accepting connections' not in caplog.text
         assert [c.args[1:][1] for c in h5.set_anchor.call_args_list] == [S2]
         h5.clear_inflight.assert_not_called()
@@ -4688,7 +4688,7 @@ class TestConnectRetryAfterASuccessfulStep:
             assert chain.run(common=S1, should_stop=stop) is False
         assert len(sleeps.call_args_list) == 2
         assert len(fake_connect_pinned.calls) == 2                       # no further attempt
-        assert 'stop requested; pool/data -> offsite continues next cycle' in caplog.text
+        assert 'stop requested; pool/data -> offsite continues next attempt' in caplog.text
         h5.streams[1].close.assert_called_once()
         chain.relist.assert_not_called()
 
@@ -5137,7 +5137,7 @@ class TestRollbackPermit:
     ):
         """A rolled-back client whose newest snapshot is on the server: `_settle_up_to_date` would
         write `latest` as the anchor (the anchor named a snapshot that no longer exists) and the
-        next cycle would look exactly like a backstop. The check runs first."""
+        next attempt would look exactly like a backstop. The check runs first."""
         h5.get_own_inflight.return_value = (S4, S5)
         with caplog.at_level(logging.INFO, logger='zfsbackup.remote'):
             chain, ok = self.cycle(h5, mocker, common=S5, newer=[entry(GONE_NEWEST)], anchor=None)
@@ -5613,11 +5613,11 @@ class TestServerNewerUnknown:
     """`_rollback_permit` with a common snapshot and the marker: the server could not say what is
     newer, which is not "nothing newer". Nothing is sent, no anchor and no pin is written (an
     anchor written now could launder a rollback into the backstop later), one WARNING per
-    episode, and the next cycle retries."""
+    episode, and the next attempt retries."""
 
     TEXT = ('pool/data -> offsite: the server copy pool/b/client1/data could not list which of its '
-            f'snapshots are newer than {S2}, so nothing is sent and no anchor is written this cycle; '
-            'the next cycle retries')
+            f'snapshots are newer than {S2}, so nothing is sent and no anchor is written this attempt; '
+            'the next attempt retries')
 
     def cycle(self, h5, mocker, *, unknown=True, common=S2, newer=Harness.NOFIELD, anchor=S2,
               sessions=6, **kw):
@@ -5813,7 +5813,7 @@ class TestAnUnreadableLocalAnchorIsNotARollback:
     ERROR = 'cannot open pool/data: pool I/O is currently suspended'
     TEXT = ('pool/data -> offsite: cannot read the local anchor property org.zfsbackup:anchor.offsite '
             f'({ERROR}), which decides whether the server may discard its newer snapshot; '
-            'nothing is sent this cycle')
+            'nothing is sent this attempt')
 
     def cycle(self, h5, mocker, *, failing=True, newer=None, sessions=6):
         from zfsbackup.backup_manager import LocalAnchorUnreadable

@@ -63,6 +63,7 @@ from zfsbackup.health import STATE_CRIT, STATE_OK, STATE_WARN, evaluate
 from zfsbackup.health_collect import collect
 from _remote_support import snapshot_presence  # noqa: F401  (fixture)
 from test_zfsbackup_chain import DEST as CHAIN_DEST, DS as CHAIN_DS, S1, S2, S3, Rig as ChainRig, listing, sinfo
+from zfsbackup.sendpair import PAIR_DONE, PAIR_NOT_DUE, send_pair
 from zfsbackup.sendmemory import (
     COPY_CONFIRMED, DRY_RUN_SENT, EXPAND_ERROR, EXPAND_TARGET, WAITING, SendMemory,
 )
@@ -463,12 +464,24 @@ class TestInheritedAnchorInTheDueCheck:
         # the parent goes first (R-2); the child, released by its confirmation, has no anchor of its own
         assert (CHILD, DEST) in sender.attempts, 'the child has no anchor of its own: it is due'
 
-    def test_a_parent_with_a_fresh_local_anchor_is_not_due(self, zfs_world, monkeypatch):
-        # The control: the same fake, a LOCAL fresh anchor, nothing waiting on it -> not due.
+    def test_a_parent_with_a_fresh_local_anchor_is_sent_when_the_schedule_dispatches_it(self, zfs_world, monkeypatch):
+        """The schedule decides when a pair sends: every dispatch is forced past the anchor-age check (only the
+        re-run of a slot after a clock step back keeps it), so a LOCAL fresh anchor does not stop a dispatch. The
+        anchor is still READ (`-s local`), so a future-dated one is announced."""
         anchored_pair(zfs_world, stamp(timedelta(minutes=10)))
         sender = RecordingSender()
         make_rig(monkeypatch, config(dataset(PARENT)), sender).run()
-        assert sender.attempts == []
+        assert sender.attempts == [(PARENT, DEST)]
+
+    def test_the_anchor_age_check_itself_still_calls_that_parent_not_due(self, zfs_world):
+        """The control, `force_confirm=False` (what the clamp's re-run of a slot gets): the same fake, a LOCAL
+        fresh anchor, nothing waiting on it -> NOT_DUE and nothing sent."""
+        anchored_pair(zfs_world, stamp(timedelta(minutes=10)))
+        sender = RecordingSender()
+        manager = DatasetManager(config(dataset(PARENT)))
+        dsi = manager.datasets[0]
+        outcome = send_pair(manager, dsi, dsi.config.remote[0], sender, lambda: False, lambda: False)
+        assert outcome.kind == PAIR_NOT_DUE and sender.attempts == []
 
 
 @pytest.mark.unit
@@ -591,14 +604,33 @@ class TestA1MatrixDueCheck:
 
     @pytest.mark.parametrize('source', SOURCES)
     def test_only_a_local_fresh_anchor_makes_the_child_not_due(self, zfs_world, monkeypatch, caplog, source):
+        """The anchor-age check (`force_confirm=False`, the one a clock step back's re-run keeps): only the child's
+        OWN (local) anchor can say "not due"; an inherited or received one never does."""
+        old, new = two_snapshot_pair(zfs_world)
+        give(zfs_world, source, ANCHOR, new)
+        sender = RecordingSender()
+        manager = DatasetManager(config(dataset(CHILD)))
+        dsi = manager.datasets[0]
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
+            outcome = send_pair(manager, dsi, dsi.config.remote[0], sender, lambda: False, lambda: False)
+
+        assert outcome.kind == (PAIR_NOT_DUE if source == 'local' else PAIR_DONE)
+        assert sender.attempts == ([] if source == 'local' else [(CHILD, DEST)])
+        # one `-s local` read of the child's own anchor, and no effective read of it
+        assert [a for a in zfs_world.value_reads(CHILD) if a[-2] == ANCHOR] == [
+            ['get', '-H', '-o', 'value', '-s', 'local', ANCHOR, CHILD]]
+
+    @pytest.mark.parametrize('source', SOURCES)
+    def test_a_scheduled_dispatch_sends_whatever_the_source_of_the_anchor(
+            self, zfs_world, monkeypatch, caplog, source):
+        """Through the real loop every dispatch is forced: the child is sent for every source of its anchor, and
+        its own anchor is still read, once, as a `-s local` value."""
         old, new = two_snapshot_pair(zfs_world)
         give(zfs_world, source, ANCHOR, new)
         sender = RecordingSender()
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.backup_manager'):
             make_rig(monkeypatch, config(dataset(CHILD)), sender).run()
-
-        assert sender.attempts == ([] if source == 'local' else [(CHILD, DEST)])
-        # one `-s local` read of the child's own anchor, and no effective read of it
+        assert sender.attempts == [(CHILD, DEST)]
         assert [a for a in zfs_world.value_reads(CHILD) if a[-2] == ANCHOR] == [
             ['get', '-H', '-o', 'value', '-s', 'local', ANCHOR, CHILD]]
 
@@ -2026,33 +2058,33 @@ class TestA2ParentFirst:
         record = status_record(rig, PARENT, DEST)
         assert record.result == health.RESULT_OK and record.consecutive_failures == 0
 
-    def test_a_parent_without_dependents_is_not_forced(self, zfs_world, monkeypatch):
+    def test_a_parent_without_dependents_is_sent_on_its_schedule_whatever_its_anchor_says(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT)                                            # recursive, but no child
         zfs_world.set_prop(PARENT, ANCHOR, zfs_world.snaps[PARENT][-1])
         cfg = config(rdataset(PARENT, recursive=True))
         sender = ScriptedSender(zfs_world)
         make_rig(monkeypatch, cfg, sender).run()
-        assert sender.attempts == [], 'fresh anchor, nothing waiting on it: not due'
+        assert sender.attempts == [(PARENT, DEST)], 'the schedule decides: a fresh anchor does not stop it'
 
-    def test_a_configured_parent_of_a_configured_child_is_forced_too(self, zfs_world, monkeypatch):
-        """Changed by B: the schedule applies R-2 to EVERY child pair, so a configured parent with a
-        configured child waiting is negotiated once per incarnation like any other (before B only an
-        EXPANDED child waited, and this was never forced). The child, fresh by its own anchor, is not due."""
+    def test_a_configured_parent_goes_first_and_releases_a_configured_child(self, zfs_world, monkeypatch):
+        """The schedule applies R-2 to EVERY child pair, so a configured parent with a configured child is
+        negotiated first, and the child follows its confirmation; both carry a fresh anchor of their own, which
+        stops neither (every dispatch is forced)."""
         add_tree(zfs_world, PARENT, A)
         zfs_world.set_prop(A, ANCHOR, zfs_world.snaps[A][-1])
         zfs_world.set_prop(PARENT, ANCHOR, zfs_world.snaps[PARENT][-1])
         cfg = config(dataset(PARENT), dataset(A))
         sender = ScriptedSender(zfs_world)
         make_rig(monkeypatch, cfg, sender).run()
-        assert sender.attempts == [(PARENT, DEST)]
+        assert sender.attempts == [(PARENT, DEST), (A, DEST)]
 
-    def test_a_configured_pair_without_a_child_pair_is_not_forced(self, zfs_world, monkeypatch):
+    def test_unrelated_configured_pairs_are_each_sent_whatever_their_anchors_say(self, zfs_world, monkeypatch):
         add_tree(zfs_world, PARENT, 'pool/other')
         for name in (PARENT, 'pool/other'):
             zfs_world.set_prop(name, ANCHOR, zfs_world.snaps[name][-1])
         sender = ScriptedSender(zfs_world)
         make_rig(monkeypatch, config(dataset(PARENT), dataset('pool/other')), sender).run()
-        assert sender.attempts == []
+        assert sorted(sender.attempts) == sorted([(PARENT, DEST), ('pool/other', DEST)])
 
     def test_an_anchor_naming_a_vanished_snapshot_or_unreadable_changes_nothing(self, rig):
         rig.world.set_prop(PARENT, ANCHOR, stamp(timedelta(minutes=5)))

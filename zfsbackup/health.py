@@ -499,6 +499,10 @@ def write_text_atomic(path: Union[str, 'os.PathLike[str]'], text: str, mode: int
 #         "last_error": "resume token check failed: ...",
 #         "last_error_at": "2026-10-25T10:05:12Z", "consecutive_failures": 3}]}
 #
+# A record may also carry `"incomplete": true`: a success whose send chain was
+# cut with work left (see `OutcomeRecord.incomplete`); a reader that does not
+# know the key ignores it, and it never grades worse than OK.
+#
 # Keys with no value are left out. Timestamps are UTC, whole seconds. Free
 # text is clipped to `STATUS_TEXT_LIMIT` characters and carries no secrets
 # (destination *names*, never URLs or tokens, identify a destination).
@@ -595,7 +599,18 @@ class OutcomeRecord:
     recursive dataset that left backup copies below it out): a plain string,
     `None` when the last attempt had none (it is replaced by every attempt, so
     a later clean one clears it). It is a hint for `check`, never an error: it
-    does not touch `result` or the failure count."""
+    does not touch `result` or the failure count.
+
+    `incomplete` marks a success that left work behind: a send chain stopped
+    between steps, after at least one step was acknowledged, because the worker
+    is exiting (a reload, an upgrade drain or a stop). A transient refusal (a
+    busy or reloading server, a connect failure) is never this: it is a failed
+    attempt, recorded only when its retries are spent. It is progress, not a
+    failure (`result` stays `ok`, `check` grades it like any success), but the
+    attempt did not finish its job: the successor worker continues the chain.
+    It must NOT count the slot as attempted (or a reload would delay the rest
+    of the chain by a period). Like `warning`, every attempt replaces it (a failed attempt clears
+    it)."""
 
     kind: str
     dataset: str
@@ -608,6 +623,7 @@ class OutcomeRecord:
     consecutive_failures: int = 0
     detail: Optional[str] = None
     warning: Optional[str] = None
+    incomplete: bool = False
 
     @property
     def key(self) -> Tuple[str, str, Optional[str]]:
@@ -656,6 +672,8 @@ def _record_to_json(rec: OutcomeRecord) -> dict:
         data['detail'] = rec.detail
     if rec.warning is not None:
         data['warning'] = rec.warning
+    if rec.incomplete:
+        data['incomplete'] = True
     return data
 
 
@@ -688,6 +706,7 @@ def _record_from_json(obj: object) -> Optional[OutcomeRecord]:
         consecutive_failures=min(failures, 10**9),
         detail=_opt_text(obj.get('detail')),
         warning=_opt_text(obj.get('warning')),
+        incomplete=obj.get('incomplete') is True,
     )
 
 
@@ -1195,12 +1214,15 @@ class StatusWriter:
         error: Optional[str] = None,
         detail: Optional[str] = None,
         warning: Optional[str] = None,
+        incomplete: bool = False,
     ) -> None:
         """One attempt finished. Success: `last_success` moves, the failure
         count goes to 0. Failure: the count goes up and `error` (clipped)
         becomes `last_error`. Either way `last_attempt` moves. `detail` and
         `warning` (clipped) describe THIS attempt: each replaces the previous
-        one, so an attempt without them clears them."""
+        one, so an attempt without them clears them. `incomplete` (a success
+        whose chain was cut with work left; `OutcomeRecord.incomplete`) is
+        replaced the same way."""
         if not self.enabled:
             return
         now = self._clock()
@@ -1214,6 +1236,7 @@ class StatusWriter:
         # that is blank after it is "none", not an empty string.
         rec.detail = clip_text(detail) or None if detail else None
         rec.warning = clip_text(warning) or None if warning else None
+        rec.incomplete = bool(incomplete) and ok
         if ok:
             rec.result = RESULT_OK
             rec.last_success = now

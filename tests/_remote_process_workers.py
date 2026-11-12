@@ -9,6 +9,8 @@ status writer, the real exit protocol) over scripted senders: `<plan_path>` is J
 
 * `ok`: notes `done:<dataset>`, returns True;
 * `fail`: returns False (the account is `scripted failure`);
+* `cut`: notes `done:<dataset>`, returns True and reports the attempt RETRYABLE (`last_retryable`): a chain
+  cut between steps with work left, which the worker records as an `incomplete` success;
 * `gate`: blocks until the file `release_path` exists, IGNORING `should_stop` (a stream in hand does not end
   at a stop: only its next chain step would), then notes `done:<dataset>` and returns True.
 
@@ -98,7 +100,7 @@ class ScriptedRemoteWorker(_StartMethod, RemoteBackupWorker):
                 return 'scripted failure'
 
             def last_retryable(self, dataset, destination):
-                return False
+                return worker._plan()[dataset] == 'cut'
 
         return SenderKit(manager, dsi, Sender)
 

@@ -42,6 +42,7 @@ import pytest
 from _sendloop_support import bound, stretch, wait_for
 from zfsbackup import health, sendloop
 from zfsbackup.sendloop import SenderKit, SendLoop, schedule_outcome
+from zfsbackup.sendpair import send_pair as real_send_pair
 from zfsbackup.sendmemory import COPY_CONFIRMED, ORPHAN_HOLD, WAITING, SendMemory
 from zfsbackup.sendpair import (
     PAIR_DONE, PAIR_FAILED, PAIR_NOT_DUE, PAIR_STOPPED, PAIR_WAITING, PairOutcome,
@@ -77,11 +78,15 @@ def failed(key, error='boom', **kw):
     return PairOutcome(key[0], key[1], PAIR_FAILED, error=error, **kw)
 
 
-def dsi_of(name, destinations=('d',), frequency=3600.0, recursive=False, expanded_from=None):
+def dsi_of(name, destinations=('d',), frequency=3600.0, recursive=False, expanded_from=None, period=None):
+    """`period`: the destinations' own frequency (P) in seconds; None: the dataset's (F)."""
     return SimpleNamespace(
         name=name, expanded_from=expanded_from,
         config=SimpleNamespace(
-            remote=[SimpleNamespace(destination=d, frequency=None) for d in destinations],
+            remote=[
+                SimpleNamespace(destination=d, frequency=None if period is None else timedelta(seconds=period))
+                for d in destinations
+            ],
             frequency=timedelta(seconds=frequency), recursive=recursive,
         ),
     )
@@ -103,7 +108,7 @@ class Harness:
         self, monkeypatch, pairs, *, parents=(), clock=None, expand=None, behaviour=None,
         status=None, discovery_join=0.2, heartbeat_every=None, memory=None, monotonic=None,
         remind=None, schedule_cls=SendSchedule, poll=0.01, caps=None, flush=True, record=True,
-        children_of=None, new_kit=None, fraction=None,
+        children_of=None, new_kit=None, fraction=None, period=None,
     ):
         """`pairs`: `{dataset: destinations}` of the configured datasets (`parents`: names of the recursive
         ones among them)."""
@@ -119,7 +124,7 @@ class Harness:
         self.error = None
         self.result = 'unset'
         self.returned_at = None
-        self.configured = [dsi_of(n, d, recursive=n in parents) for n, d in pairs.items()]
+        self.configured = [dsi_of(n, d, recursive=n in parents, period=period) for n, d in pairs.items()]
         config = SimpleNamespace(
             check_interval=timedelta(minutes=5),
             enabled_datasets=[
@@ -484,12 +489,12 @@ class TestOutcomes:
         assert h.sent() == [('p', 'd')]
         h.finish()
 
-    def test_the_first_negotiate_of_a_parent_with_children_is_forced(self, harness):
+    def test_every_dispatch_is_forced_the_first_negotiate_of_a_parent_with_children_included(self, harness):
         h = harness({'p': ('d',), 'p/c': ('d',)}).start()
         h.until(lambda: h.count(('p/c', 'd')) == 1, 'the child')
         h.finish()
         forced = {c.key: c.force_confirm for c in h.calls}
-        assert forced == {('p', 'd'): True, ('p/c', 'd'): False}
+        assert forced == {('p', 'd'): True, ('p/c', 'd'): True}, 'the schedule decides, not the anchor-age check'
 
     def test_a_done_and_a_failed_pair_are_recorded_the_rest_are_not(self, harness):
         kinds = {'a': PAIR_DONE, 'b': PAIR_FAILED, 'c': PAIR_NOT_DUE, 'd': PAIR_WAITING, 'e': PAIR_STOPPED}
@@ -1655,3 +1660,333 @@ class TestRuleWiring:
             h.finish()
         assert h.count(('zero', 'd')) == 0
         assert len([r for r in caplog.records if 'zero -> d is not scheduled' in r.getMessage()]) == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# forced sends: a retry and the continuation of a cut chain skip the anchor-age check
+# ---------------------------------------------------------------------------------------------
+
+
+def stub_records(*rows):
+    """`rows`: `(kind, dataset, destination, result, last_attempt, incomplete)`; -> a status stand-in that
+    holds `health.OutcomeRecord`s (the loop only reads `.records`)."""
+    return SimpleNamespace(records=[
+        health.OutcomeRecord(
+            kind=kind, dataset=ds, destination=dest, result=result, last_attempt=attempt, incomplete=incomplete,
+        )
+        for kind, ds, dest, result, attempt, incomplete in rows
+    ])
+
+
+T = FakeClock().now                  # the instant every `Harness` starts at
+SEND, SNAP = health.KIND_SEND, health.KIND_SNAPSHOT
+
+
+@pytest.mark.integration
+class TestStatusSeedsOfTheSchedule:
+    """`SendLoop._cut_pairs` / `_failed_pairs` read the previous incarnation's send records, and `_rebuild` hands the
+    two bits to the schedule as `PairSpec.resume` / `PairSpec.failed`."""
+
+    def loop_over(self, harness, *rows, pairs=None):
+        h = harness(pairs or {'a': ('d',)}, status=stub_records(*rows))
+        return h, h.loop
+
+    def test_no_status_means_no_seeds(self, harness):
+        h = harness({'a': ('d',)})
+        assert h.loop._cut_pairs() == set() and h.loop._failed_pairs() == set()
+
+    def test_an_incomplete_send_record_is_a_cut_pair(self, harness):
+        _, loop = self.loop_over(harness, (SEND, 'a', 'd', 'ok', T - 5, True))
+        assert loop._cut_pairs() == {('a', 'd')} and loop._failed_pairs() == set()
+
+    def test_a_plain_success_is_neither(self, harness):
+        _, loop = self.loop_over(harness, (SEND, 'a', 'd', 'ok', T - 5, False))
+        assert loop._cut_pairs() == set() and loop._failed_pairs() == set()
+
+    def test_an_error_record_with_a_last_attempt_is_a_failed_pair(self, harness):
+        _, loop = self.loop_over(harness, (SEND, 'a', 'd', 'error', T - 5, False))
+        assert loop._failed_pairs() == {('a', 'd')} and loop._cut_pairs() == set()
+
+    def test_an_error_record_without_a_last_attempt_is_ignored(self, harness):
+        _, loop = self.loop_over(harness, (SEND, 'a', 'd', 'error', None, False))
+        assert loop._failed_pairs() == set()
+
+    def test_other_kinds_of_record_are_ignored(self, harness):
+        _, loop = self.loop_over(
+            harness,
+            (SNAP, 'a', None, 'error', T - 5, False), (SNAP, 'b', None, 'ok', T - 5, True),
+            (health.KIND_PRUNE, 'c', None, 'error', T - 5, False),
+            (health.KIND_DISCOVER, 'bk', 'd', 'error', T - 5, False),
+        )
+        assert loop._cut_pairs() == set() and loop._failed_pairs() == set()
+
+    def test_last_attempts_leave_a_cut_record_out_and_keep_a_failure(self, harness):
+        _, loop = self.loop_over(
+            harness,
+            (SEND, 'cut', 'd', 'ok', T - 5, True), (SEND, 'bad', 'd', 'error', T - 6, False),
+            (SEND, 'good', 'd', 'ok', T - 7, False),
+        )
+        assert loop._last_attempts() == {('bad', 'd'): T - 6, ('good', 'd'): T - 7}
+
+    def test_rebuild_passes_the_flags_into_the_specs(self, harness):
+        h = harness(
+            {n: ('d',) for n in ('cut', 'bad', 'good', 'snapfail', 'nodate')},
+            status=stub_records(
+                (SEND, 'cut', 'd', 'ok', T - 5, True), (SEND, 'bad', 'd', 'error', T - 5, False),
+                (SEND, 'good', 'd', 'ok', T - 5, False), (SNAP, 'snapfail', None, 'error', T - 5, False),
+                (SEND, 'nodate', 'd', 'error', None, False),
+            ),
+        )
+        h.loop._rebuild(h.clock.now)
+        flags = {k.dataset: (h.schedule.spec(k).resume, h.schedule.spec(k).failed) for k in h.schedule.keys()}
+        assert flags == {
+            'cut': (True, False), 'bad': (False, True), 'good': (False, False),
+            'snapfail': (False, False), 'nodate': (False, False),
+        }
+        assert h.schedule.spec(('cut', 'd')).last_attempt is None, 'a cut record is not an attempt'
+        assert h.schedule.spec(('bad', 'd')).last_attempt == T - 5, 'a failure is'
+
+    def test_a_pair_that_appears_later_is_seeded_from_its_record_too(self, harness):
+        """A child found by a later discovery: `_rebuild` runs again and the new pair takes its seed."""
+        h = harness(
+            {'p': ('d',)}, parents=('p',),
+            status=stub_records((SEND, 'p/c', 'd', 'ok', T - 5, True), (SEND, 'p/e', 'd', 'error', T - 5, False)),
+        )
+        h.loop._children['p'] = [dsi_of('p/c', expanded_from='p'), dsi_of('p/e', expanded_from='p')]
+        h.loop._rebuild(h.clock.now)
+        assert h.schedule.spec(('p/c', 'd')).resume is True and h.schedule.spec(('p/e', 'd')).failed is True
+        assert (h.schedule.spec(('p', 'd')).resume, h.schedule.spec(('p', 'd')).failed) == (False, False)
+
+
+class RealDue:
+    """A `Harness` whose senders run the REAL `send_pair` (so the real due check runs) over a manager double
+    whose anchor `anchor_age` old is the destination's, for a pair with F = 1 h and P = 1 d. `answers` is the
+    script of `backup_dataset` results, `(done, retryable)` each (default: `(True, False)`, a settle). Records
+    in `sends` what every send_pair call was given (`force_confirm`) and what it came to; `backups` is every
+    call that got as far as the transport manager.
+
+    Fraction 0 and a FakeClock at 08:00 UTC: a new pair is due at once, and its daily slot is at 00:06."""
+
+    PERIOD, FREQUENCY = 86400.0, 3600.0
+    KEY = ('p', 'd')
+
+    def __init__(self, harness, monkeypatch, status=None, *, anchor_age=timedelta(days=2), answers=()):
+        self.anchor_age = anchor_age
+        self.answers = list(answers)
+        self.backups, self.sends = [], []
+        #: set by a test: `backup_dataset` waits for it (a send that is still running)
+        self.gate = None
+        manager = MagicMock(name='manager')
+        manager.get_own_anchor.side_effect = lambda dsi, destination: 'anchor'
+        manager.list_snapshots.side_effect = lambda dsi: [SimpleNamespace(name='anchor', age=self.anchor_age)]
+        manager.clock_behind.return_value = False
+        sender = MagicMock(name='sender')
+        sender.last_problem.return_value = 'the copy is not ours'
+
+        def backup(dsi, remote_cfg, should_stop=None):
+            self.backups.append((dsi.name, remote_cfg.destination))
+            if self.gate is not None:
+                self.gate.wait(bound())
+            done, retryable = self.answers.pop(0) if self.answers else (True, False)
+            sender.last_retryable.return_value = retryable
+            return done
+
+        sender.backup_dataset.side_effect = backup
+
+        def new_kit(template, remote_cfg):
+            return SenderKit(manager, template, lambda: sender)
+
+        self.h = harness(
+            {'p': ('d',)}, period=self.PERIOD, new_kit=new_kit, schedule_cls=SpySchedule, status=status,
+        )
+        self.h.configured[0].config.frequency = timedelta(seconds=self.FREQUENCY)
+
+        def spy(manager, dsi, remote_cfg, sender, should_stop, exit_pending, **kw):
+            outcome = real_send_pair(manager, dsi, remote_cfg, sender, should_stop, exit_pending, **kw)
+            self.sends.append((kw.get('force_confirm'), outcome.kind))
+            return outcome
+
+        monkeypatch.setattr(sendloop, 'send_pair', spy)
+
+    def finished(self):
+        return [(c[2], c[3]) for c in self.h.schedule.calls if c[0] == 'finished']
+
+    def settle(self, count):
+        self.h.until_sender_done(self.KEY, count, f'{count} outcome(s)')
+
+
+@pytest.fixture
+def due(harness, monkeypatch):
+    def build(*, status=None, **kw):
+        return RealDue(harness, monkeypatch, status, **kw)
+    return build
+
+
+@pytest.mark.integration
+class TestForcedThroughTheRealDueCheck:
+    """P = 1 d, F = 1 h, and the anchor is younger than P. The schedule decides when a pair sends: every dispatch
+    it makes (on-time and late slots, catch-ups, retries, continuations) is FORCED past the sender's anchor-age
+    check, which would call it NOT_DUE. The one dispatch that keeps the check is the re-run of an attempted slot
+    that a clock step back causes, where NOT_DUE is exactly the point."""
+
+    YOUNG = timedelta(hours=1)
+    DAY = 86400.0
+    #: the daily slot (fraction 0: offset 360 s) at or before the harness clock (08:00 UTC)
+    SLOT = T - T % 86400 + 360
+
+    def seeded(self, tmp_path, *rows):
+        """A real status file: `rows` `(result, age_seconds, incomplete)` of the one pair, newest last."""
+        (tmp_path / 'config.db').write_bytes(b'')
+        directory = tmp_path / 'config.db.status'
+        health.ensure_status_dir(directory)
+        box = [T]
+        writer = health.StatusWriter(directory, 'remote-backup-worker', clock=lambda: box[0])
+        for result, age, incomplete in rows:
+            box[0] = T - age
+            writer.record(SEND, 'p', 'd', ok=result == 'ok', error=None if result == 'ok' else 'earlier', incomplete=incomplete)
+        return writer
+
+    def test_a_cut_chain_is_continued_past_a_young_anchor_and_ends_ok(self, due, tmp_path):
+        r = due(status=self.seeded(tmp_path, ('ok', 2 * 86400, True)), anchor_age=self.YOUNG)
+        r.h.start()
+        r.settle(1)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_DONE)] and r.backups == [r.KEY], 'it reached backup_dataset'
+        assert r.finished() == [('ok', False)]
+
+    def test_an_ordinary_catch_up_is_forced_too(self, due, tmp_path):
+        """An ordinary success two days old is a missed slot: the catch-up reaches the transport (and settles as
+        up to date) instead of being called NOT_DUE by the young anchor."""
+        r = due(status=self.seeded(tmp_path, ('ok', 2 * 86400, False)), anchor_age=self.YOUNG)
+        r.h.start()
+        r.settle(1)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_DONE)] and r.backups == [r.KEY]
+
+    def test_a_new_pair_with_no_record_is_forced_too(self, due):
+        r = due(anchor_age=self.YOUNG)
+        r.h.start()
+        r.settle(1)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_DONE)] and r.backups == [r.KEY]
+
+    def test_a_forced_attempt_with_nothing_pending_is_done_and_not_retryable(self, due, tmp_path):
+        r = due(status=self.seeded(tmp_path, ('ok', 60, True)), anchor_age=self.YOUNG, answers=[(True, False)])
+        r.h.start()
+        r.settle(1)
+        r.h.finish()
+        (outcome,) = r.h.recorded
+        assert outcome.kind == PAIR_DONE and outcome.retryable is False, 'so its record is not marked incomplete'
+        assert r.finished() == [('ok', False)]
+        assert r.h.schedule.wants_anchor_check(r.KEY) is False
+
+    def test_a_forced_attempt_cut_again_stays_a_cut_chain(self, due, tmp_path):
+        r = due(status=self.seeded(tmp_path, ('ok', 60, True)), anchor_age=self.YOUNG, answers=[(True, True)])
+        r.h.start()
+        r.settle(1)
+        r.h.finish()
+        (outcome,) = r.h.recorded
+        assert outcome.kind == PAIR_DONE and outcome.retryable is True
+        assert r.h.schedule.wants_anchor_check(r.KEY) is False, 'its 60 s retry continues the chain, forced'
+
+    def test_after_a_failure_whose_attempt_moved_the_anchor_the_retry_reaches_the_transport(self, due):
+        """A non-retryable FAILED (some steps went before it failed, so the anchor is young now): the retry, an
+        hour later, must reach `backup_dataset` instead of being called NOT_DUE."""
+        r = due(answers=[(False, False), (True, False)])           # an old anchor: the first attempt is due
+        r.h.start()
+        r.settle(1)
+        assert r.sends == [(True, PAIR_FAILED)]
+        r.anchor_age = self.YOUNG                                   # what the failed chain left behind
+        r.h.clock.advance(3601)
+        r.settle(2)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_FAILED), (True, PAIR_DONE)]
+        assert r.backups == [r.KEY, r.KEY]
+        assert r.finished() == [('failed', False), ('ok', False)]
+
+    def test_an_on_time_slot_after_an_ok_is_forced_and_reaches_the_transport(self, due):
+        r = due(answers=[(True, False), (True, False)])
+        r.h.start()
+        r.settle(1)
+        r.anchor_age = self.YOUNG                                   # the OK's anchor: far younger than P
+        r.h.clock.now = self.SLOT + self.DAY                        # the next daily slot, exactly on time
+        r.settle(2)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_DONE), (True, PAIR_DONE)]
+        assert r.backups == [r.KEY, r.KEY], 'the young anchor did not turn the slot into a NOT_DUE'
+
+    def test_a_late_slot_is_forced_too(self, due):
+        r = due(answers=[(True, False), (True, False)])
+        r.h.start()
+        r.settle(1)
+        r.anchor_age = self.YOUNG
+        r.h.clock.advance(self.DAY)                                 # 8 h after the slot: a catch-up
+        r.settle(2)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_DONE), (True, PAIR_DONE)]
+
+    def test_the_rerun_of_a_slot_after_a_clock_step_back_keeps_the_check_and_is_not_due(self, due):
+        """The one unforced dispatch: the attempted slot runs again after the clock went back past it."""
+        r = due(answers=[(True, False), (True, False)])
+        r.h.start()
+        r.settle(1)
+        r.anchor_age = self.YOUNG
+        assert r.sends == [(True, PAIR_DONE)]
+        r.h.clock.now = self.SLOT - 4 * 3600                        # back before the slot that was served
+        r.h.until(lambda: r.h.schedule.wants_anchor_check(r.KEY), 'the schedule to notice the step back')
+        r.h.clock.now = self.SLOT                                   # the clock reaches the slot again
+        r.settle(2)
+        assert r.sends == [(True, PAIR_DONE), (False, PAIR_NOT_DUE)], 'unforced, and a cheap NOT_DUE'
+        assert r.backups == [r.KEY], 'the transport was not asked again'
+        assert r.h.schedule.wants_anchor_check(r.KEY) is False
+        # and the next ordinary slot is forced again
+        r.h.clock.now = self.SLOT + self.DAY
+        r.settle(3)
+        r.h.finish()
+        assert r.sends[-1] == (True, PAIR_DONE) and r.backups == [r.KEY, r.KEY]
+
+    def test_a_step_back_during_a_send_is_not_erased_by_that_sends_outcome(self, due):
+        """The clock goes back past the slot being served while its send runs: when the send finishes, the next
+        dispatch of that slot is the checked re-run (NOT_DUE for a young anchor)."""
+        r = due(answers=[(True, False), (True, False)])
+        r.gate = r.h.on_release(threading.Event())
+        r.h.start()
+        r.h.until(lambda: r.backups, 'the send to be running')
+        r.anchor_age = self.YOUNG
+        r.h.clock.now = self.SLOT - 4 * 3600                        # back before the slot the running send serves
+        r.gate.set()
+        r.settle(1)
+        r.h.until(lambda: r.h.schedule.wants_anchor_check(r.KEY), 'the re-armed check')
+        r.h.clock.now = self.SLOT
+        r.settle(2)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_DONE), (False, PAIR_NOT_DUE)]
+        assert r.backups == [r.KEY]
+
+    def test_a_late_catch_up_and_a_retry_leave_a_young_anchor_and_the_next_on_time_slot_still_sends(self, due):
+        """The gap the anchor-age check used to cause: a catch-up 8 h late (or a retry an hour after a failure)
+        leaves an anchor taken AFTER its slot, which the next on-time slot would have found "too young" and
+        skipped, a gap approaching 2 P. Every dispatch is forced, so it sends."""
+        r = due(answers=[(False, False), (True, False), (True, False)])
+        r.h.start()
+        r.settle(1)                                                  # the catch-up (8 h late) fails
+        r.anchor_age = self.YOUNG
+        r.h.clock.advance(3601)                                      # the retry an hour on
+        r.settle(2)
+        r.h.clock.now = self.SLOT + self.DAY                         # and the next on-time slot
+        r.settle(3)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_FAILED), (True, PAIR_DONE), (True, PAIR_DONE)]
+        assert r.backups == [r.KEY] * 3
+
+    def test_a_retryable_failure_burst_is_forced_too(self, due):
+        """The 60 s retry of a busy server follows an attempt that may have moved the anchor: forced as well."""
+        r = due(answers=[(False, True), (True, False)])
+        r.h.start()
+        r.settle(1)
+        r.anchor_age = self.YOUNG
+        r.h.clock.advance(61)
+        r.settle(2)
+        r.h.finish()
+        assert r.sends == [(True, PAIR_FAILED), (True, PAIR_DONE)]
+        assert r.finished() == [('failed', True), ('ok', False)]

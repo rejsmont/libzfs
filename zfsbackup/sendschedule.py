@@ -50,6 +50,31 @@ Each is cited in the docstring of the method that implements it.
   ``LATE_SLACK`` behind the slot it has just reached (`SendSchedule._arm`): that
   is an outage of this scheduler (stopped process, suspended host, forward clock
   step), and it gets exactly one catch-up.
+  Two kinds of last record change the TIMING a NEW pair starts from
+  (`SendSchedule._init_state`; the table is in its docstring):
+  a chain cut between steps (``PairSpec.resume``) always gets the catch-up; a
+  recorded failure (``PairSpec.failed``) is scheduled as the live scheduler
+  would have, due ``min(next slot, last_attempt + 1 h)``.
+* **The schedule decides, the sender's anchor-age check does not.**  The sender
+  (`sendpair.send_pair`) ends a dispatch as NOT_DUE when the pair's own anchor
+  is younger than ``P``.  That measures from the anchor snapshot's NAME time, so
+  a send that ran late (a retry at +1 h, a catch-up at +5 h) leaves an anchor
+  taken after its slot, and the next slot would find it "too young" and skip,
+  a gap approaching ``2P``; a partly sent chain, a failed attempt or an unclean
+  exit (SIGKILL, OOM, a stop budget that ran out) leave the same trace.  So every
+  dispatch the schedule makes is FORCED: the sender skips the check and sends
+  whatever is pending (a pair with nothing pending settles as up to date, a
+  DONE that is not retryable, for the price of one negotiate).  This covers
+  on-time and late slots, catch-ups, retries, the overrun follow-up, the
+  continuation of a cut chain and confirmations.  **The one dispatch that is
+  NOT forced is the re-run of an already-attempted slot that a clock step back
+  causes** (`SendSchedule._unstall`, `wants_anchor_check`): the check is what
+  usually makes that "at most one extra run" a cheap NOT_DUE.  It goes to the
+  pair's NEXT dispatch, which may be a pending retry or confirmation rather
+  than the re-run (that retry may then end NOT_DUE and wait for the slot, and
+  the re-run is a forced, cheap up-to-date attempt); a step back seen only
+  across a restart (a status record dated in the future) sets no check.
+  Accepted: at most one cheap attempt and a retry delayed by at most P.
 * **Overrun** (plan "Overrun: one coalesced follow-up").  A send that is still
   running when later slots pass owes ONE follow-up, due as soon as it finishes
   (`SendSchedule.finished`, OK and NOT_DUE).  A failed attempt covers the slots
@@ -66,8 +91,8 @@ Each is cited in the docstring of the method that implements it.
   pair runs at the next slot, so "next regular due <= now + P" holds
   unconditionally.  A small step back across a slot boundary therefore re-runs
   the attempted slot once, when the clock reaches it again: at most one extra
-  run per back-step, and the sender's own anchor-age check makes it a cheap
-  ``NOT_DUE``.  A pending catch-up, retry, confirmation or discovery time lying
+  run per back-step, and the sender's own anchor-age check usually makes it a
+  cheap ``NOT_DUE`` (see "The schedule decides" above for when it does not).  A pending catch-up, retry, confirmation or discovery time lying
   further ahead than the longest delay it is ever given is pulled back the same
   way; those caps can only fire after a step back, because the delays are never
   longer than their caps.
@@ -200,8 +225,18 @@ class PairSpec:
     ``/`` in the dataset name. Ancestor links are not passed: they are the
     pairs of the same destination whose dataset name is a ``/``-prefix of this
     one's, and the nearest one is the R-2 parent. ``last_attempt`` (epoch
-    seconds, from the status record's ``last_attempt``) is read only when the
-    pair is NEW to the schedule.
+    seconds, from the status record's ``last_attempt``), ``resume`` and
+    ``failed`` are read only when the pair is NEW to the schedule, and only for
+    TIMING (they do not decide whether the send is forced: every dispatch is,
+    `SendSchedule.wants_anchor_check`):
+
+    * ``resume``: the pair's last record is a success that left work behind (a
+      chain cut between steps by an exit, ``OutcomeRecord.incomplete``). The pair
+      gets the catch-up whatever ``last_attempt`` says (the send continues the
+      chain). ``last_attempt`` is ignored.
+    * ``failed``: the pair's last record is a failure (``result == 'error'``;
+      its ``last_attempt`` is the failure's time). The pair is scheduled as the
+      live scheduler would have after that failure (`SendSchedule._init_state`).
     """
     dataset: str
     destination: str
@@ -210,6 +245,8 @@ class PairSpec:
     config_order: int = 0
     depth: Optional[int] = None
     last_attempt: Optional[float] = None
+    resume: bool = False
+    failed: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'frequency', _secs(self.frequency))
@@ -291,7 +328,7 @@ class _PairState:
     __slots__ = (
         'spec', 'frac', 'offset', 'attempted', 'armed', 'catchup_at', 'retry_at',
         'retries_used', 'confirmed', 'confirm_due', 'confirm_at', 'confirm_used', 'last_start',
-        'parent', 'children', 'was_held',
+        'parent', 'children', 'was_held', 'check_anchor',
     )
 
     def __init__(self, spec: PairSpec, frac: float, offset: float) -> None:
@@ -321,6 +358,12 @@ class _PairState:
         #: R-2: the pair was held by an unconfirmed ancestor when last looked
         #: at (`SendSchedule._note_hold`), so its release is noticed.
         self.was_held = False
+        #: The next dispatch is the re-run of an already-attempted slot that a
+        #: clock step back causes (`_unstall`), so the sender keeps its
+        #: anchor-age check for it (a cheap NOT_DUE). Every other dispatch is
+        #: forced. Cleared by `finished` of any kind but STOPPED/WAITING; kept
+        #: through those, R-2 holds and a regrid.
+        self.check_anchor = False
 
 
 class _DiscoveryState:
@@ -358,8 +401,12 @@ class SendSchedule:
             for key in sched.dispatch():
                 # The sender reads `force_confirm` once, at its start: its
                 # `send_pair(..., force_confirm=sched.wants_confirmation(key))`
-                # skips the anchor-age check while children wait for this pair.
-                sched.started(key); spawn_sender(key, force=sched.wants_confirmation(key))
+                # skips the anchor-age check: always, but for the one re-run of an
+                # attempted slot that a clock step back causes.
+                sched.started(key)
+                spawn_sender(
+                    key, force=sched.wants_confirmation(key) or not sched.wants_anchor_check(key),
+                )
             wake = sched.next_wakeup()                  # sleep <= STOP_POLL, or until a
             ...                                         # queue item arrives
             # on a sender outcome (`PairOutcome`):
@@ -434,7 +481,9 @@ class SendSchedule:
             old = self._states.get(key)
             if old is None:
                 st = _PairState(spec, frac, offset)
-                self._init_state(st, now, spec.last_attempt)
+                self._init_state(
+                    st, now, spec.last_attempt, resume=spec.resume, failed=spec.failed,
+                )
             else:
                 st = old
                 regrid = (
@@ -451,20 +500,59 @@ class SendSchedule:
         self._states = states
         self._link(now)
 
-    def _init_state(self, st: _PairState, now: float, last_attempt: Optional[float]) -> None:
-        """Catch-up (plan "Scheduling"): with ``last_attempt < s_prev`` the pair
-        is due ``frac * min(W, 300 s)`` from ``now``; otherwise the current slot
-        counts as attempted and the next regular slot is next."""
+    def _init_state(
+        self, st: _PairState, now: float, last_attempt: Optional[float], *,
+        resume: bool = False, failed: bool = False,
+    ) -> None:
+        """What a pair NEW to the schedule starts from (plan "Scheduling";
+        ``k`` = ``slot_index(now)``, ``L`` = ``last_attempt``, ``delay`` =
+        ``frac * min(W, 300 s)``):
+
+        ==========================  ==================================
+        last record                 first due time
+        ==========================  ==================================
+        none, or ``L < s_k``        ``now + delay`` (catch-up); the
+                                    slot counts as attempted once
+                                    started
+        ok, ``L >= s_k``            the next slot ``s_(k+1)`` (the
+                                    slot was served)
+        ``resume`` (ok, a chain     ``now + delay``, whatever ``L``
+        cut between steps)          is
+        failed, ``L >= s_k``        ``min(s_(k+1), L + 1 h)`` (what
+                                    `finished` set after that
+                                    failure), or ``now + delay``
+                                    when ``L + 1 h`` has passed
+        failed, ``L < s_k``         ``now + delay`` (the slot after
+                                    ``L`` has passed)
+        ==========================  ==================================
+
+        The send is forced in every row (`wants_anchor_check`): these flags
+        decide TIMING only. A started pair is never anchor-checked here; only
+        the clock-step-back re-run is (`_unstall`).
+
+        A failure is never dropped from the schedule's view (that would make every
+        restart a new attempt): its time is ``last_attempt``, and the retry the
+        live scheduler would have made (`finished`: ``now + FAILURE_RETRY_CAP``,
+        and the next slot preempts it) is rebuilt here. A retryable failure whose
+        retries were spent is recorded the same way, so it is treated the same."""
         p = st.spec.effective_period
         k = slot_index(now, p, st.offset)
         st.last_start = last_attempt
         st.retry_at = None
         st.retries_used = 0
-        if last_attempt is not None and last_attempt >= slot_time(k, p, st.offset):
+        catch_up = now + st.frac * min(st.spec.window, CATCH_UP_CAP)
+        if resume:
+            st.attempted, st.armed, st.catchup_at = k - 1, k, catch_up
+        elif last_attempt is not None and last_attempt >= slot_time(k, p, st.offset):
             st.attempted, st.armed, st.catchup_at = k, None, None
+            if failed:
+                # The next slot is after `now` (it is slot k+1), so the due time
+                # is `min(next slot, L + cap)`: the regular due time is the
+                # slot, the retry timer the cap.
+                retry = last_attempt + FAILURE_RETRY_CAP
+                st.retry_at = retry if retry > now else catch_up
         else:
-            st.attempted, st.armed = k - 1, k
-            st.catchup_at = now + st.frac * min(st.spec.window, CATCH_UP_CAP)
+            st.attempted, st.armed, st.catchup_at = k - 1, k, catch_up
 
     def _link(self, now: float) -> None:
         """Rebuild the nearest-ancestor links and the "waiting children" sets,
@@ -543,6 +631,20 @@ class SendSchedule:
         st = self._states.get(PairKey(*key))
         return st is not None and not st.confirmed and bool(st.children)
 
+    def wants_anchor_check(self, key: Tuple[str, str]) -> bool:
+        '''True only for the one dispatch that a clock step back re-arms: the
+        pair's slot was already attempted and `_unstall` clamped the attempted
+        index, so the slot runs a second time and the sender must keep its
+        anchor-age check, which turns that re-run into a cheap NOT_DUE ("at most
+        one extra run"). Every other dispatch is FORCED (the caller passes
+        ``force_confirm=True`` to `send_pair`): the schedule decides when a
+        pair sends, and the sender's check, measured from the anchor snapshot's
+        name time, would wrongly skip a slot after a send that ran late. Cleared
+        by `finished` of any kind but ``STOPPED``/``WAITING``; kept through those,
+        R-2 holds and a regrid. ``False`` for an unknown pair.'''
+        st = self._states.get(PairKey(*key))
+        return st is not None and st.check_anchor
+
     # -- due times -----------------------------------------------------------
 
     def _note_hold(self, key: PairKey, st: _PairState, now: float) -> bool:
@@ -590,7 +692,8 @@ class SendSchedule:
         * The attempted index is clamped to ``slot_index(now)`` whenever it is
           beyond it (only a step back can cause that): the pair then runs at
           the next slot, at most ``P`` after ``now``. This may re-run an
-          attempted slot once, deliberately.
+          attempted slot once, deliberately; that dispatch keeps the sender's
+          anchor-age check (`wants_anchor_check`), which makes it a NOT_DUE.
         * A catch-up, retry or confirmation time lying further ahead than the
           longest delay it is ever given (``CATCH_UP_CAP``, ``FAILURE_RETRY_CAP``;
           a confirmation is armed at ``now`` or, by `_rearm_confirmation`, no
@@ -606,6 +709,9 @@ class SendSchedule:
             st.attempted = k
             st.armed = None
             st.catchup_at = None
+            # The slot that now runs again was already attempted: the one
+            # dispatch whose anchor-age check is kept (a cheap NOT_DUE).
+            st.check_anchor = True
         if st.catchup_at is not None and st.catchup_at - now > CATCH_UP_CAP:
             st.catchup_at = now + CATCH_UP_CAP
         if st.retry_at is not None and st.retry_at - now > FAILURE_RETRY_CAP:
@@ -770,7 +876,8 @@ class SendSchedule:
         plan's "never re-run an attempted slot"), clears the retry/catch-up timers and the one-shot R-2
         confirmation, and counts the pair as running. ``KeyError`` for an
         unknown pair, ``ValueError`` if it is already running (never two
-        senders for one pair)."""
+        senders for one pair). The anchor-check flag is kept (`finished` ends
+        it)."""
         now = self._now(now)
         key = PairKey(*key)
         st = self._states[key]
@@ -808,6 +915,12 @@ class SendSchedule:
         ``WAITING``                False       asked again after ``WAIT_RECHECK``
         =========================  ==========  =====================================
 
+        Every outcome but ``STOPPED`` and ``WAITING`` ends the pair's
+        anchor-check flag (`wants_anchor_check`: the one clock-step-back re-run
+        has happened); those two keep it, since the re-run did not finish. A
+        step back that happens while the pair runs is clamped (`_unstall`)
+        AFTER that clearing, so it re-arms the flag for the next dispatch.
+
         Every outcome but a failure may have confirmed nothing (``NOT_DUE``,
         ``STOPPED`` and ``WAITING`` always; an ``OK`` when there was no snapshot
         yet): a pair that is still unconfirmed with children waiting has its
@@ -835,6 +948,8 @@ class SendSchedule:
         if st is None:
             return False
         p = st.spec.effective_period
+        if kind not in (Outcome.STOPPED, Outcome.WAITING):
+            st.check_anchor = False
         self._unstall(st, now)
         k = slot_index(now, p, st.offset)
         if kind in (Outcome.OK, Outcome.NOT_DUE):

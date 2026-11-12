@@ -191,12 +191,12 @@ def _log_refusal(base_url: str, ds_name: str, result: dict) -> None:
         if error == _BUSY_TEXT:
             logger.info(
                 f"server {base_url} is busy with another stream of {ds_name}; "
-                "skipping this cycle"
+                "skipping this attempt"
             )
         elif 'reloading' in error:
-            logger.info(f"server {base_url} is reloading; skipping {ds_name} this cycle")
+            logger.info(f"server {base_url} is reloading; skipping {ds_name} this attempt")
         else:
-            logger.info(f"server {base_url} asks to retry {ds_name} ({error}); skipping this cycle")
+            logger.info(f"server {base_url} asks to retry {ds_name} ({error}); skipping this attempt")
     else:
         logger.error(f"server refused {ds_name}: {result.get('error') or 'unknown error'}")
 
@@ -229,7 +229,7 @@ _STREAM_REFUSAL_HINTS = {
     ),
     'type_mismatch': (
         " (the server holds a dataset of the other kind under this name: on the server, "
-        "`zfs rename` it to a name outside the backup target; the next cycle sends a full "
+        "`zfs rename` it to a name outside the backup target; the next attempt sends a full "
         "stream)"
     ),
 }
@@ -547,13 +547,13 @@ class RemoteBackupManager(ChainSender):
         self._log_warning_once(
             (f"{dsi.name} [negotiate zfs_timeout]", destination),
             f"server {base_url} could not answer the negotiation of {dsi.name} in time "
-            "(its zfs did not answer); skipping this cycle",
+            "(its zfs did not answer); skipping this attempt",
         )
         count = self._memory.incr(NEGOTIATE_ZFS_SKIPS, key)
         if count >= RESUME_TOKEN_SKIP_ERROR_AFTER and self._memory.note(NEGOTIATE_ZFS_ERROR, key):
             logger.error(
                 f"{dsi.name} -> {destination}: the server's zfs has not answered the "
-                f"negotiation for the last {count} cycles in a row; nothing is sent for "
+                f"negotiation for the last {count} attempts in a row; nothing is sent for "
                 "this dataset until it does, so the destination is falling behind. Check "
                 "the server's pool (a hung pool leaves `zfs` processes in uninterruptible "
                 "sleep)"
@@ -915,7 +915,7 @@ class RemoteBackupManager(ChainSender):
             self._whoami_retryable = True
             logger.info(
                 f"server {transport.base_url} is reloading; destination {destination} "
-                "skipped this cycle"
+                "skipped this attempt"
             )
             return False
         refusal = self._auth_refusal(destination, transport, resp=resp)
@@ -1206,7 +1206,7 @@ class RemoteBackupManager(ChainSender):
                         logger.info(
                             f"server {base_url} is not accepting connections right after a "
                             f"successful step (probably reloading); {dsi.name} -> "
-                            f"{destination} continues next cycle"
+                            f"{destination} continues next attempt"
                         )
                         return _STOP
                     # Start the next attempt clean; the started `zfs send`
@@ -1222,14 +1222,14 @@ class RemoteBackupManager(ChainSender):
                         if should_stop is not None and should_stop():
                             self._mark_retryable(dsi.name, destination)
                             logger.info(
-                                f"stop requested; {dsi.name} -> {destination} continues next cycle"
+                                f"stop requested; {dsi.name} -> {destination} continues next attempt"
                             )
                             return _STOP
                         time.sleep(CONNECT_RETRY_SLICE)
                     if should_stop is not None and should_stop():
                         self._mark_retryable(dsi.name, destination)
                         logger.info(
-                            f"stop requested; {dsi.name} -> {destination} continues next cycle"
+                            f"stop requested; {dsi.name} -> {destination} continues next attempt"
                         )
                         return _STOP
                     attempt += 1
@@ -1375,7 +1375,7 @@ class RemoteBackupManager(ChainSender):
                     self._log_warning_once(
                         (f"{dsi.name} [zfs_timeout]", destination),
                         f"server {base_url} could not read the resume state of {dsi.name} "
-                        "in time (its zfs did not answer); skipping this cycle",
+                        "in time (its zfs did not answer); skipping this attempt",
                     )
                     self._token_skipped(dsi, destination, f"{base_url}'s zfs did not answer in time")
                     return 'skip', None
@@ -1383,7 +1383,7 @@ class RemoteBackupManager(ChainSender):
                 # problem, so not counted by `_token_skipped`, and worth retrying soon.
                 self._mark_retryable(dsi.name, destination)
                 logger.info(
-                    f"server {base_url} is reloading; skipping {dsi.name} this cycle"
+                    f"server {base_url} is reloading; skipping {dsi.name} this attempt"
                 )
                 return 'skip', None
             auth = self._auth_refusal(destination, transport, resp=resp)
@@ -1393,7 +1393,7 @@ class RemoteBackupManager(ChainSender):
             if not resp.ok:
                 logger.warning(
                     f"cannot ask {base_url} for the resume token of {dsi.name} "
-                    f"(HTTP {resp.status_code}); skipping this cycle rather than "
+                    f"(HTTP {resp.status_code}); skipping this attempt rather than "
                     "risk discarding its partial progress with a fresh send"
                 )
                 self._token_skipped(
@@ -1416,7 +1416,7 @@ class RemoteBackupManager(ChainSender):
                 return 'skip', None
             logger.warning(
                 f"cannot ask {base_url} for the resume token of {dsi.name}: {e}; "
-                "skipping this cycle rather than risk discarding its partial "
+                "skipping this attempt rather than risk discarding its partial "
                 "progress with a fresh send"
             )
             self._token_skipped(dsi, destination, f"cannot ask {base_url} for it: {e}")

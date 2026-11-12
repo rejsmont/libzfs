@@ -54,6 +54,7 @@ import libzfseasy as zfs
 from libzfseasy.types import Filesystem, Snapshot
 from libzfseasy.zfs import _zfs_cmd, _zpool_cmd
 
+from _sendloop_support import run_worker_until_sent
 from zfsbackup import local as local_module
 from zfsbackup.backup_manager import (
     PROP_CLIENT_ID,
@@ -702,14 +703,15 @@ class TestRealLocalPlain(_SharedTests):
 
     # -- the workers ----------------------------------------------------------------------------
     def test_a_remote_backup_worker_cycle_sends_to_the_local_destination_and_records_it(
-            self, rig, sdir, mocker):
+            self, rig, sdir, monkeypatch):
         """The real worker loop: `RemoteBackupWorker` dispatches a `zfs:` destination to the local
         manager and records the outcome under the destination's name."""
         old = self.snapshots(rig, [9, 7, 5])
         worker = RemoteBackupWorker(rig.config, StopFlag(), status_dir=sdir, client_id=CLIENT_ID)
-        mocker.patch.object(worker, '_wait', return_value=ExitReason.STOP)
 
-        worker.run()
+        # the loop is the parallel scheduler (`sendloop.SendLoop`): it returns only when its exit reason says
+        # stop, which `run_worker_until_sent` makes it once the pair has been sent
+        run_worker_until_sent(worker, monkeypatch, [(rig.src, DEST)])
 
         assert list(rig.copy_snaps()) == [old[-1]]
         assert rig.copy_snaps()[old[-1]] == rig.local_snaps()[old[-1]]

@@ -13,6 +13,7 @@ would shadow `BaseWorker._record`.
 import json
 import multiprocessing
 import os
+import time
 import threading
 
 from zfsbackup.sendmemory import (
@@ -90,6 +91,9 @@ class MemoryProbeWorker(_StartMethod, RemoteBackupWorker):
             'waiting_is_the_memorys_latch': self._waiting_noted is mem.latch_view(WAITING),
             'dry_run_is_the_memorys_latch': self._dry_run_sent is mem.latch_view(DRY_RUN_SENT),
             'waiting': sorted(map(list, self._waiting_noted)),
+            #: a claim is held by a thread of the PARENT: the child starts without it; PENDING is carried
+            'parents_claim_is_free': mem.claim(['held-in-parent']) is True,
+            'pending_carried': mem.pending_active('copy-in-parent', 1e12, time.monotonic()),
             'lock_was_free': lock_free,
             'manager_shares_it': manager._memory is mem,
             'manager_clock_alias': manager._clock_noted is mem.latch_view(CLOCK),

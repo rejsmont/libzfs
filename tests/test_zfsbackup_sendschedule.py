@@ -1873,6 +1873,273 @@ class TestRegridKeepsTheRetry:
 
 
 # ----------------------------------------------------------------------------
+# Seeded starts, and the anchor-age check that only a clock-step-back re-run keeps
+# ----------------------------------------------------------------------------
+
+def spf(dataset, dest='A', F=H, P=None, last=FRESH, order=0, resume=False, failed=False):
+    """A `PairSpec` with the two seeds (`resume`: the last record is an `incomplete` success; `failed`: it is an
+    error). They decide TIMING only."""
+    return PairSpec(dataset, dest, F, P, order, None, last, resume, failed)
+
+
+class TestSeededStart:
+    """What a pair NEW to the schedule starts from, per the table in `SendSchedule._init_state` (``k`` the
+    current slot, ``L`` the record's ``last_attempt``, ``delay = frac * min(W, 300 s)`` = 150 s here).
+
+    The F = P = 1 h grid has slots at `T0 + n*H + 1980`: at `T0` the current slot is `T0 - 1620` and the next
+    `T0 + 1980`. The F = P = 1 d grid (offset 43380) lets `L + 1 h` fall before the next slot.
+    The seeds change the TIMING only: no start asks for the sender's anchor-age check."""
+
+    @pytest.mark.parametrize('name, F, now, spec_kw, due_at', [
+        # none
+        ('none', H, T0, dict(last=None), T0 + 150),
+        # ok, L >= s_k: the slot was served
+        ('ok in the slot', H, T0, dict(last=FRESH), T0 + 1980),
+        ('ok exactly at the slot', H, T0, dict(last=T0 - 1620), T0 + 1980),
+        # ok, L < s_k
+        ('ok before the slot', H, T0, dict(last=T0 - 1621), T0 + 150),
+        ('ok long ago', H, T0, dict(last=T0 - 7 * D), T0 + 150),
+        # resume: always the catch-up, whatever L says
+        ('resume, L in the slot', H, T0, dict(last=FRESH, resume=True), T0 + 150),
+        ('resume, L before the slot', H, T0, dict(last=T0 - 7 * D, resume=True), T0 + 150),
+        ('resume, no L', H, T0, dict(last=None, resume=True), T0 + 150),
+        # failed, L >= s_k, L + 1 h > now: the next slot preempts the 1 h retry (1 h grid) ...
+        ('failed, slot first', H, T0, dict(last=FRESH, failed=True), T0 + 1980),
+        # ... and the 1 h retry comes first on the 1 d grid
+        ('failed, retry first', D, T0 + 46000, dict(last=T0 + 44000, failed=True), T0 + 47600),
+        # failed, L >= s_k, L + 1 h <= now: the retry has passed, the catch-up
+        ('failed, retry passed', D, T0 + 50000, dict(last=T0 + 44000, failed=True), T0 + 50150),
+        ('failed, retry exactly now', D, T0 + 47600, dict(last=T0 + 44000, failed=True), T0 + 47750),
+        ('failed, retry one second ahead', D, T0 + 47599, dict(last=T0 + 44000, failed=True), T0 + 47600),
+        # failed, L < s_k
+        ('failed before the slot', H, T0, dict(last=T0 - H, failed=True), T0 + 150),
+        ('failed long ago', H, T0, dict(last=T0 - 3 * D, failed=True), T0 + 150),
+        ('failed, no L', H, T0, dict(last=None, failed=True), T0 + 150),
+    ])
+    def test_the_table(self, name, F, now, spec_kw, due_at):
+        s = make()
+        s.update_pairs([spf('a', F=F, **spec_kw)], now=now)
+        assert s.due_time(('a', 'A'), now) == due_at, name
+        assert s.due(due_at - 1) == [], name
+        assert s.due(due_at) == [key('a')], name
+        assert s.wants_anchor_check(('a', 'A')) is False, name
+
+    def test_a_failed_pair_with_a_served_slot_makes_no_extra_attempt_at_start(self):
+        """The failure's slot counts as attempted: nothing is due at the start, and the retry is the one the live
+        scheduler would have made."""
+        s = make()
+        s.update_pairs([spf('a', last=FRESH, failed=True)], now=T0)
+        assert s.due(T0) == [] and s.dispatch(now=T0) == []
+        assert s.due(T0 + 1979) == [] and s.due(T0 + 1980) == [key('a')]
+
+    def test_the_catch_up_delay_uses_the_pairs_own_fraction(self):
+        s = make(fracs={('a', 'A'): 0.2, ('b', 'A'): 0.8})
+        s.update_pairs([spf('a', last=None, resume=True), spf('b', last=T0 - 9 * D, failed=True)], now=T0)
+        assert s.due_time(('a', 'A'), T0) == pytest.approx(T0 + 60)
+        assert s.due_time(('b', 'A'), T0) == pytest.approx(T0 + 240)
+
+    def test_the_seeds_are_read_only_for_a_new_pair(self):
+        """A pair that stays keeps its timing; a new one takes its seed's."""
+        s = make()
+        s.update_pairs([sp('a')], now=T0)
+        s.update_pairs([spf('a', failed=True), spf('b', last=None, resume=True, order=1)], now=T0 + 1)
+        assert s.due_time(('a', 'A'), T0 + 1) == T0 + OFFSET, 'unchanged by the seed'
+        assert s.due_time(('b', 'A'), T0 + 1) == T0 + 1 + 150, 'the resume seed: the catch-up'
+
+    def test_a_pair_that_left_and_came_back_is_new_again(self):
+        s = make()
+        s.update_pairs([spf('a', last=FRESH)], now=T0)
+        assert s.due_time(('a', 'A'), T0) == T0 + OFFSET
+        s.update_pairs([], now=T0 + 1)
+        s.update_pairs([spf('a', last=FRESH, resume=True)], now=T0 + 2)
+        assert s.due_time(('a', 'A'), T0 + 2) == T0 + 2 + 150
+
+    def test_a_failed_seed_whose_last_attempt_is_ahead_of_the_clock_is_capped(self):
+        """A clock stepped back: `L > now`, so `L + 1 h` lies ahead by more than the cap; `_unstall` pulls the
+        retry to `now + FAILURE_RETRY_CAP`."""
+        s = make()
+        now = T0 + 30000                       # the next slot of this grid is T0 + 43380
+        s.update_pairs([spf('a', F=D, last=T0 + 46000, failed=True)], now=now)
+        assert s.due_time(('a', 'A'), now) == now + FAILURE_RETRY_CAP
+        assert s.due(now + FAILURE_RETRY_CAP - 1) == []
+        assert s.due(now + FAILURE_RETRY_CAP) == [key('a')]
+
+
+class TestAnchorCheckFlag:
+    """`wants_anchor_check` (`_PairState.check_anchor`): True only for the ONE dispatch a clock step back re-arms
+    (an already-attempted slot run a second time, where the sender's own check makes it a cheap NOT_DUE). Every
+    other dispatch is forced. Set by `_unstall`'s clamp; cleared by a finished outcome of any kind but STOPPED
+    and WAITING (before the clamp `finished` itself runs); kept through those and a regrid.
+
+    Mutation-checked (scratch copy; failures over the schedule, loop, status-worker, worker, send-pair, recursive,
+    memory, local-destination and many-pairs test files): the clamp not setting it 8, set on a failure 38, not
+    cleared by `finished` 7, cleared by STOPPED/WAITING 2, cleared after the clamp instead of before 2, the regrid
+    dropping it 1; `_init_state` ignoring `failed` 7, ignoring `resume` 3; the failure-seed retry at the next slot
+    instead of `L + 1 h` 5; `_start_sender` never forcing 28, always forcing 2; `_send_pair` skipping the anchor
+    read when forced 16."""
+
+    K = ('a', 'A')
+    SLOT = T0 + OFFSET
+
+    def served(self):
+        """A pair that served the slot at `SLOT` (started and finished OK there)."""
+        s = make()
+        s.update_pairs([sp('a')], now=T0)
+        cycle(s, self.K, self.SLOT + 5, Outcome.OK)
+        return s
+
+    def stepped_back(self):
+        """... and then the clock went back before that slot: it runs again."""
+        s = self.served()
+        assert s.wants_anchor_check(self.K) is False
+        s.due(T0 + 100)                                    # the clamp happens when the pair is looked at
+        return s
+
+    def test_the_ordinary_lifecycle_never_asks_for_the_check(self):
+        s = make()
+        s.update_pairs([sp('a', last=None)], now=T0)
+        t = T0 + 150
+        for outcome, retryable in ((Outcome.FAILED, False), (Outcome.RETRYABLE, False), (Outcome.FAILED, True),
+                                   (Outcome.STOPPED, False), (Outcome.WAITING, False), (Outcome.OK, False),
+                                   (Outcome.NOT_DUE, False), (Outcome.FAILED, False), (Outcome.OK, False)):
+            assert s.wants_anchor_check(self.K) is False
+            s.dispatch(now=t)
+            s.started(self.K, now=t)
+            assert s.wants_anchor_check(self.K) is False
+            s.finished(self.K, outcome, retryable=retryable, now=t + 1)
+            assert s.wants_anchor_check(self.K) is False, outcome
+            t += H + 500
+
+    def test_the_slot_after_an_ok_and_a_late_one_and_a_retry_are_all_unchecked(self):
+        s = self.served()
+        assert s.dispatch(now=self.SLOT + H) == [key('a')]            # the next slot, on time
+        assert s.wants_anchor_check(self.K) is False
+        cycle(s, self.K, self.SLOT + H, Outcome.FAILED)
+        assert s.dispatch(now=self.SLOT + 2 * H) == [key('a')]       # the slot before the 1 h retry: a failure's
+        assert s.wants_anchor_check(self.K) is False
+        cycle(s, self.K, self.SLOT + 2 * H, Outcome.OK)
+        late = self.SLOT + 9 * H + 600                                 # a late slot: the catch-up
+        assert s.due(late) == [] and s.dispatch(now=late + 200) == [key('a')]
+        assert s.wants_anchor_check(self.K) is False
+
+    def test_a_clock_step_back_re_arms_one_checked_dispatch(self):
+        s = self.stepped_back()
+        assert s.wants_anchor_check(self.K) is True
+        assert s.due(self.SLOT - 1) == [] and s.due(self.SLOT) == [key('a')], 'the slot runs a second time'
+        assert s.dispatch(now=self.SLOT) == [key('a')]
+        assert s.wants_anchor_check(self.K) is True, 'still asked for at the dispatch'
+        s.started(self.K, now=self.SLOT)
+        assert s.wants_anchor_check(self.K) is True, 'and while it runs'
+
+    @pytest.mark.parametrize('outcome, retryable', [
+        (Outcome.OK, False), (Outcome.NOT_DUE, False), (Outcome.FAILED, False), (Outcome.FAILED, True),
+        (Outcome.RETRYABLE, False),
+    ])
+    def test_a_finished_outcome_ends_it(self, outcome, retryable):
+        s = self.stepped_back()
+        s.started(self.K, now=self.SLOT)
+        s.finished(self.K, outcome, retryable=retryable, now=self.SLOT + 1)
+        assert s.wants_anchor_check(self.K) is False
+
+    @pytest.mark.parametrize('outcome', [Outcome.STOPPED, Outcome.WAITING])
+    def test_stopped_and_waiting_keep_it_the_re_run_did_not_finish(self, outcome):
+        s = self.stepped_back()
+        s.started(self.K, now=self.SLOT)
+        s.finished(self.K, outcome, now=self.SLOT + 1)
+        assert s.wants_anchor_check(self.K) is True
+
+    def test_a_step_back_during_a_run_re_arms_it_for_the_next_dispatch(self):
+        """`finished` clears the flag first and clamps after, so a step back that happened while the pair ran
+        leaves the next dispatch checked."""
+        s = self.served()
+        s.dispatch(now=self.SLOT + H)
+        s.started(self.K, now=self.SLOT + H)
+        s.finished(self.K, Outcome.OK, now=self.SLOT - 100)           # the clock went back during the run
+        assert s.wants_anchor_check(self.K) is True
+
+    def test_a_regrid_keeps_it_and_the_ordinary_pair_stays_unchecked(self):
+        s = self.stepped_back()
+        s.update_pairs([sp('a', P=2 * H)], now=T0 + 101)
+        assert s.wants_anchor_check(self.K) is True
+        t = make()
+        t.update_pairs([sp('a')], now=T0)
+        t.update_pairs([sp('a', P=2 * H)], now=T0 + 101)
+        assert t.wants_anchor_check(self.K) is False
+
+    def test_a_pair_that_left_and_came_back_starts_unchecked(self):
+        s = self.stepped_back()
+        s.update_pairs([], now=T0 + 101)
+        s.update_pairs([sp('a')], now=T0 + 102)
+        assert s.wants_anchor_check(self.K) is False
+
+    def test_the_flag_is_per_pair(self):
+        s = make()
+        s.update_pairs([sp('a'), sp('b', order=1)], now=T0)
+        cycle(s, ('a', 'A'), self.SLOT + 5, Outcome.OK)
+        cycle(s, ('b', 'A'), self.SLOT + 5, Outcome.OK)
+        s.due(T0 + 100)
+        assert s.wants_anchor_check(('a', 'A')) and s.wants_anchor_check(('b', 'A'))
+        cycle(s, ('a', 'A'), self.SLOT, Outcome.NOT_DUE)
+        assert not s.wants_anchor_check(('a', 'A')) and s.wants_anchor_check(('b', 'A'))
+
+    def test_an_unknown_pair_is_never_checked(self):
+        assert make().wants_anchor_check(('nope', 'A')) is False
+
+    def test_a_removed_running_pair_reports_nothing(self):
+        s = make()
+        s.update_pairs([sp('a')], now=T0)
+        s.started(self.K, now=self.SLOT)
+        s.update_pairs([], now=self.SLOT + 1)
+        assert s.finished(self.K, 'failed', now=self.SLOT + 2) is False
+        assert s.wants_anchor_check(self.K) is False
+
+
+class TestSeedsWithR2:
+    """The seeds keep their TIMING through an R-2 hold."""
+
+    def test_a_held_failed_child_is_due_at_once_on_release(self):
+        s = make()
+        # p: a daily pair with a served slot; p/c: hourly, failed three hours ago
+        s.update_pairs([sp('p', F=D, last=T0 - 10), spf('p/c', last=T0 - 3 * H, failed=True, order=1)], now=T0)
+        child = ('p/c', 'A')
+        assert s.held_by(child) == key('p')
+        cycle(s, ('p', 'A'), T0, Outcome.OK)                    # p negotiates without confirming anything
+        for t in (T0 + 10, T0 + H, T0 + 2 * H):
+            assert key('p/c') not in s.due(t) and key('p/c') not in s.dispatch(now=t)    # held the whole time
+        late = T0 + 2 * H + 5
+        s.confirmed(('p', 'A'))
+        assert s.held_by(child) is None
+        assert s.dispatch(now=late) == [key('p/c')], 'released unstaggered: due at once, not a catch-up away'
+        assert s.wants_anchor_check(child) is False
+
+    def test_a_failed_ancestor_with_children_confirms_no_earlier_than_its_retry(self):
+        """`_link` arms the one-shot confirmation of a pair with children; a failure seed's pending retry
+        governs when."""
+        s = make()
+        s.update_pairs([spf('p', F=D, last=T0 + 44000, failed=True), sp('p/c', F=D, order=1)], now=T0 + 46000)
+        assert s.wants_confirmation(('p', 'A')) is True
+        assert s.due_time(('p', 'A'), T0 + 46000) == T0 + 47600
+        assert s.due(T0 + 47599) == []
+        assert s.due(T0 + 47600) == [key('p')]
+
+    def test_a_resumed_ancestor_with_children_is_due_at_once(self):
+        s = make()
+        s.update_pairs([spf('p', last=FRESH, resume=True), sp('p/c', order=1)], now=T0)
+        assert s.wants_confirmation(('p', 'A')) is True
+        assert s.due_time(('p', 'A'), T0) <= T0 + 150
+
+    def test_a_child_with_a_resume_seed_waits_for_its_ancestor(self):
+        s = make()
+        s.update_pairs([sp('p', last=FRESH), spf('p/c', last=FRESH, resume=True, order=1)], now=T0)
+        assert s.held_by(('p/c', 'A')) == key('p')
+        assert s.dispatch(now=T0 + 200) == [key('p')]          # the ancestor first (its confirmation)
+        s.started(('p', 'A'), now=T0 + 200)
+        s.finished(('p', 'A'), 'ok', now=T0 + 201)
+        s.confirmed(('p', 'A'))
+        assert s.dispatch(now=T0 + 201) == [key('p/c')], 'its catch-up is due: the resume seed'
+
+
+# ----------------------------------------------------------------------------
 # Discovery
 # ----------------------------------------------------------------------------
 
@@ -2325,7 +2592,10 @@ def _random_specs(rng, now):
                 f = rng.choice([300, 900, H, D])
                 p = rng.choice([None, 300, 900, H, D])
                 last = rng.choice([None, now - 100, now - 5000, now - 3 * D])
-                specs.append(PairSpec(ds, dest, f, p, len(specs), None, last))
+                seed = rng.choice(['none', 'none', 'none', 'resume', 'failed'])
+                specs.append(PairSpec(
+                    ds, dest, f, p, len(specs), None, last, resume=seed == 'resume', failed=seed == 'failed',
+                ))
     return specs
 
 
@@ -2345,6 +2615,14 @@ def _assert_running_invariants(running):
 class TestRandomizedInvariants:
     @pytest.mark.parametrize('seed', range(40))
     def test_caps_exclusion_and_single_flight_hold(self, seed):
+        self.run_random(seed, backwards=True)
+
+    @pytest.mark.parametrize('seed', range(20))
+    def test_a_clock_that_only_moves_forward_never_asks_for_the_anchor_check(self, seed):
+        self.run_random(seed, backwards=False)
+
+    def run_random(self, seed, backwards):
+        stepped_back = False
         rng = random.Random(seed)
         t = T0
         s = SendSchedule(f'client{seed}', rng.choice([60, 300]))
@@ -2361,6 +2639,8 @@ class TestRandomizedInvariants:
                 assert set(chosen) <= set(s.due(t))
                 assert all(s.held_by(c) is None for c in chosen)
                 for c in chosen:
+                    checked = s.wants_anchor_check(c)
+                    assert not checked or stepped_back, 'only a clock step back asks for the anchor-age check'
                     s.started(c, now=t)             # never raises: not already running
                     mirror.add(c)
                 _assert_running_invariants(mirror)
@@ -2370,7 +2650,11 @@ class TestRandomizedInvariants:
                 s.finished(k, kind, retryable=rng.random() < 0.5, now=t)
                 mirror.discard(k)
             elif roll < 0.72:
-                t += rng.choice([1, 30, 300, 1800, H, 6 * H, D, -1, -600, -H, -3 * D])
+                step = rng.choice([1, 30, 300, 1800, H, 6 * H, D, -1, -600, -H, -3 * D])
+                if step < 0 and not backwards:
+                    step = -step
+                stepped_back = stepped_back or step < 0
+                t += step
             elif roll < 0.8:
                 ks = s.keys()
                 if ks:
@@ -2387,6 +2671,7 @@ class TestRandomizedInvariants:
                     s.discovery_started(parent, now=t)
                     s.discovery_finished(parent, rng.random() < 0.5, now=t)
             assert s.running == mirror
+            assert not any(s.wants_anchor_check(k) for k in s.keys()) or stepped_back, 'no step back, no check'
             _assert_running_invariants(mirror)
             # the unstall rule: whatever the clock did, nothing waits longer than one period
             # (or a capped catch-up) from now

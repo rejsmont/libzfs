@@ -29,7 +29,8 @@ to one call or one manager and are NOT here.
 `counter_view` and `value_view` return the LIVE container for tests and
 diagnostics; production code must use the operations (a view is read without
 the lock). The object pickles (an empty memory is what a spawned worker
-starts with; the lock is recreated).
+starts with; the lock is recreated; `CLAIMS` is not carried, a claim belongs to
+a thread of the process that took it).
 
 Stdlib only: this module is imported by `backup_manager`, `chain`, `remote`,
 `local` and `workers` and must never import any of them.
@@ -109,9 +110,20 @@ class SendMemory:
     # a lock cannot be. The containers are handed over as they are, so an alias
     # of one (a test's `latch_view`) is still the same object after the round
     # trip (pickle memoizes by identity).
+    #
+    # `CLAIMS` is the one table that is NOT handed over: a claim means "held by
+    # a thread of THIS process", and no thread of the unpickling process holds
+    # it, so a claim that arrived with the state could never be released (a
+    # local copy's missing ancestors would be "busy" for ever). `PENDING` is
+    # carried: its entries are monotonic timestamps with a TTL (they expire by
+    # themselves, `pending_active`), not tied to a thread, and the clock is
+    # system-wide. Every other table is a log latch, a counter or a value
+    # that is about the incarnation, not about a thread, so it is carried too.
     def __getstate__(self) -> dict:
+        with self._lock:
+            latches = {k: v for k, v in self._latches.items() if k != CLAIMS}
         return {
-            'latches': self._latches,
+            'latches': latches,
             'counters': self._counters,
             'values': self._values,
             'expiry_checked_at': self._expiry_checked_at,
@@ -209,8 +221,10 @@ class SendMemory:
         """Claim every name of `names` (table `CLAIMS`), all or nothing. ->
         True when all were free and are now held by the caller, False (nothing
         taken) when any is held by someone else. The caller `release()`s the
-        same names, in a `finally`. Not reentrant: claiming a name the caller
-        already holds fails. Never blocks."""
+        same names, in a `finally`, after a successful claim only (see
+        `release`). Not reentrant: claiming a name the caller already holds
+        fails. Never blocks. A claim means "held by a thread of this process":
+        it is not pickled (`__getstate__`)."""
         names = list(names)
         with self._lock:
             table = self._set(CLAIMS)
@@ -220,7 +234,13 @@ class SendMemory:
             return True
 
     def release(self, names: Iterable[Hashable]) -> None:
-        """Release names taken by `claim()` (idempotent)."""
+        """Release names taken by `claim()`. **Contract:** release exactly the
+        names your own SUCCESSFUL `claim()` took, and never after a failed one:
+        a name is not owned by anyone in particular, so releasing a name another
+        thread holds (what a failed claim reports) frees THEIR claim. A name that
+        is not claimed is ignored, not an error (the call is idempotent, so a
+        `finally` that runs twice is harmless); it does not and cannot check who
+        holds a name (that would need a token, a change of signature)."""
         names = list(names)
         with self._lock:
             self._set(CLAIMS).difference_update(names)

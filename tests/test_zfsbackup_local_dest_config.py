@@ -761,13 +761,27 @@ class TestRemoteWorkerSendsToLocalDestinations:
         rig.run()
         assert ("send", "pool/a", "here") not in rig.records()
 
-    def test_the_interval_check_applies_to_a_local_destination(self, rig):
+    def test_a_scheduled_dispatch_to_a_local_destination_is_forced_past_the_interval_check(self, rig):
+        """The schedule decides when a pair sends; the anchor is still READ (a future-dated one is announced)."""
         rig.manager.get_own_anchor.return_value = "autosnap_20260101000000"
         young = SimpleNamespace(name="autosnap_20260101000000", age=timedelta(minutes=10))
         rig.manager.list_snapshots.return_value = [young]
         rig.run()
-        rig.lbm.backup_dataset.assert_not_called()
+        assert rig.sent_local() == [("pool/a", "here")]
         assert [c.args[1] for c in rig.manager.get_own_anchor.call_args_list] == ["here"]
+
+    def test_the_interval_check_of_the_unforced_rerun_applies_to_a_local_destination_too(self, rig):
+        """`force_confirm=False` (the re-run of a slot after a clock step back) keeps the anchor-age check."""
+        from zfsbackup.sendpair import PAIR_NOT_DUE, send_pair
+        rig.manager.get_own_anchor.return_value = "autosnap_20260101000000"
+        young = SimpleNamespace(name="autosnap_20260101000000", age=timedelta(minutes=10))
+        rig.manager.list_snapshots.return_value = [young]
+        rig.manager.clock_behind.return_value = False
+        dsi = SimpleNamespace(name="pool/a", config=SimpleNamespace(frequency=timedelta(hours=1)))
+        remote_cfg = SimpleNamespace(destination="here", frequency=None)
+        outcome = send_pair(rig.manager, dsi, remote_cfg, rig.lbm, lambda: False, lambda: False)
+        assert outcome.kind == PAIR_NOT_DUE
+        rig.lbm.backup_dataset.assert_not_called()
 
     def test_an_anchor_older_than_the_frequency_makes_it_due(self, rig):
         rig.manager.get_own_anchor.return_value = "autosnap_20260101000000"

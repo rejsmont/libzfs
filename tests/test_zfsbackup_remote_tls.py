@@ -1538,7 +1538,7 @@ class TestWhoamiAnswers:
         assert rig.cycle(0) is False
         assert own(caplog) and [lv for lv, m in own(caplog) if "reloading" in m] == ["INFO"]
         assert (
-            "INFO", "server https://backup.example.com is reloading; destination offsite skipped this cycle"
+            "INFO", "server https://backup.example.com is reloading; destination offsite skipped this attempt"
         ) in own(caplog)
         assert errors(caplog) == []
         count = rig.http_count
@@ -2016,7 +2016,7 @@ class TestReloadingAndBusyStaysPerDataset:
         rig.rm.post(NEGOTIATE, [{"status_code": 503, "json": self.RELOADING},
                                 {"json": {"common_snapshot": None}}])
         assert rig.cycle(0) is False
-        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this cycle") in own(caplog)
+        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this attempt") in own(caplog)
         assert errors(caplog) == []
         assert rig.run(1) is True                                       # the destination is still usable
         assert len(rig.requests("/negotiate")) == 2 and len(rig.requests("/whoami")) == 1
@@ -2026,7 +2026,7 @@ class TestReloadingAndBusyStaysPerDataset:
         rig.rm.get(RESUME_TOKEN, [{"status_code": 503, "json": self.RELOADING},
                                   {"json": {"resume_token": None}}])
         assert rig.cycle(0) is False
-        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this cycle") in own(caplog)
+        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this attempt") in own(caplog)
         assert errors(caplog) == [] and rig.sends == []
         assert rig.run(1) is True
         assert len(rig.sends) == 1
@@ -2043,7 +2043,7 @@ class TestReloadingAndBusyStaysPerDataset:
         rig = make_rig(datasets=("pool/a", "pool/b"))
         rig.ws.recv.side_effect = [json.dumps(self.RELOADING), json.dumps({"status": "ok"})]
         assert rig.cycle(0) is False
-        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this cycle") in own(caplog)
+        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this attempt") in own(caplog)
         assert errors(caplog) == []
         rig.set_anchor.assert_not_called()
         assert rig.run(1) is True

@@ -32,10 +32,10 @@ from unittest.mock import MagicMock
 import pytest
 
 import _status_workers
-from _sendloop_support import LoopRig, seed_status, wait_for
+from _sendloop_support import LoopRig, age_status, seed_status, wait_for
 from _prune_support import prune_manager, prune_pool, records  # noqa: F401  (fixture)
 from _snapshot_support import frozen_clock, listed_snapshot  # noqa: F401  (frozen_clock: fixture)
-from zfsbackup import daemonlock, health, workers as workers_module
+from zfsbackup import daemonlock, health, sendschedule as ss, workers as workers_module
 from zfsbackup.backup_manager import DatasetManager, PruneResult
 from zfsbackup.config import (
     BackupConfig,
@@ -977,14 +977,29 @@ class TestRemoteWorkerRecords:
         assert recs[('send', 'pool/a', 'two')].last_error == 'RuntimeError: boom'
 
     def test_a_send_that_is_not_due_records_nothing(self, monkeypatch, sdir):
+        """NOT_DUE (what `send_pair` answers for the re-run of a slot after a clock step back) is neither a
+        success nor a failure."""
+        from zfsbackup.sendpair import PAIR_NOT_DUE, PairOutcome
+        rig = RemoteRig(monkeypatch, sdir)
+        monkeypatch.setattr(
+            'zfsbackup.sendloop.send_pair',
+            lambda manager, dsi, remote_cfg, sender, should_stop, exit_pending, **kw: PairOutcome(
+                dsi.name, remote_cfg.destination, PAIR_NOT_DUE),
+        )
+        rig.go()
+        rig.rbm.backup_dataset.assert_not_called()
+        assert rig.records() == {}
+
+    def test_a_fresh_anchor_does_not_keep_a_scheduled_send_from_being_recorded(self, monkeypatch, sdir):
+        """The schedule decides when a pair sends: a young anchor does not turn a dispatch into a NOT_DUE."""
         rig = RemoteRig(monkeypatch, sdir)
         anchor = SimpleNamespace(name='autosnap_1', age=timedelta(minutes=5))
         rig.manager.get_own_anchor.return_value = 'autosnap_1'
         rig.manager.list_snapshots.return_value = [anchor]
         rig.manager.clock_behind.return_value = False
         rig.go()
-        rig.rbm.backup_dataset.assert_not_called()
-        assert rig.records() == {}
+        rig.rbm.backup_dataset.assert_called_once()
+        assert rig.records()[('send', 'pool/a', 'off')].result == 'ok'
 
     def test_a_pair_attempted_in_the_current_slot_is_not_sent_again_after_a_restart(self, monkeypatch, sdir):
         """The status file's `last_attempt` is what keeps a restart or a reload from re-sending every pair at once."""
@@ -1058,6 +1073,107 @@ class TestRemoteWorkerRecords:
         rig.rbm.backup_dataset.side_effect = backup
         rig.go()
         assert seen == [(os.getpid(), True)]
+
+
+@pytest.mark.unit
+class TestIncompleteSendRecords:
+    """A DONE pair that is retryable -- its chain was cut between steps by a reload, a drain, a stop or a
+    transient refusal, with work left -- is recorded as a success marked `incomplete` (`RemoteBackupWorker.
+    _record_outcome`); the next incarnation does not count that attempt as having served the pair's slot
+    (`SendLoop._last_attempts`) and sends it again at once, whereas a COMPLETE success is not sent again until
+    its next slot."""
+
+    @staticmethod
+    def rig(monkeypatch, sdir, *, done=True, retryable=False):
+        rig = RemoteRig(monkeypatch, sdir)
+        rig.rbm.backup_dataset.return_value = done
+        rig.rbm.last_retryable.return_value = retryable
+        return rig
+
+    def test_a_cut_chain_is_recorded_as_an_incomplete_success(self, monkeypatch, sdir):
+        rig = self.rig(monkeypatch, sdir, retryable=True)
+        rig.go()
+        rec = rig.records()[('send', 'pool/a', 'off')]
+        assert rec.result == 'ok' and rec.consecutive_failures == 0 and rec.last_success is not None
+        assert rec.incomplete is True
+
+    def test_a_complete_success_is_not_incomplete(self, monkeypatch, sdir):
+        rig = self.rig(monkeypatch, sdir, retryable=False)
+        rig.go()
+        assert rig.records()[('send', 'pool/a', 'off')].incomplete is False
+        import json
+        raw = json.loads((sdir / 'remote-backup-worker.json').read_text())['records'][0]
+        assert 'incomplete' not in raw
+
+    def test_the_flag_is_on_disk_at_once(self, monkeypatch, sdir):
+        import json
+        rig = self.rig(monkeypatch, sdir, retryable=True)
+        rig.go()
+        raw = json.loads((sdir / 'remote-backup-worker.json').read_text())['records'][0]
+        assert raw['incomplete'] is True and raw['result'] == 'ok'
+
+    def test_a_later_failure_clears_it(self, monkeypatch, sdir):
+        first = self.rig(monkeypatch, sdir, retryable=True)
+        first.go()
+        age_status(first.rig.worker)
+        second = self.rig(monkeypatch, sdir, done=False)
+        second.rbm.last_problem.return_value = 'down'
+        second.go()
+        rec = second.records()[('send', 'pool/a', 'off')]
+        assert rec.result == 'error' and rec.incomplete is False and rec.consecutive_failures == 1
+
+    def test_a_later_complete_success_clears_it(self, monkeypatch, sdir):
+        first = self.rig(monkeypatch, sdir, retryable=True)
+        first.go()
+        age_status(first.rig.worker)
+        second = self.rig(monkeypatch, sdir)
+        second.go()
+        assert second.records()[('send', 'pool/a', 'off')].incomplete is False
+
+    def test_the_successor_sends_an_incomplete_pair_again_at_once(self, monkeypatch, sdir):
+        """The pair was attempted a moment ago (in the current slot), yet the successor sends it: the
+        attempt was cut, so the slot is not served."""
+        first = self.rig(monkeypatch, sdir, retryable=True)
+        first.go()
+        assert first.rbm.backup_dataset.call_count == 1
+        second = self.rig(monkeypatch, sdir)
+        second.go()
+        assert second.rbm.backup_dataset.call_count == 1
+        assert second.records()[('send', 'pool/a', 'off')].incomplete is False
+
+    def test_the_successor_does_not_send_a_complete_pair_again(self, monkeypatch, sdir):
+        first = self.rig(monkeypatch, sdir)
+        first.go()
+        second = self.rig(monkeypatch, sdir)
+        second.go()
+        second.rbm.backup_dataset.assert_not_called()
+
+    def test_only_the_incomplete_pairs_are_caught_up(self, monkeypatch, sdir):
+        names = ('pool/a', 'pool/b', 'pool/c')
+        first = RemoteRig(monkeypatch, sdir, names=names)
+        first.rbm.backup_dataset.return_value = True
+        first.rbm.last_retryable.side_effect = lambda dataset, destination: dataset == 'pool/b'
+        first.go()
+        second = RemoteRig(monkeypatch, sdir, names=names)
+        second.rbm.backup_dataset.return_value = True
+        second.go()
+        assert [c.args[0].name for c in second.rbm.backup_dataset.call_args_list] == ['pool/b']
+
+    def test_last_attempts_leaves_out_the_incomplete_records(self):
+        from zfsbackup.health import OutcomeRecord
+        from zfsbackup.sendloop import SendLoop
+        records = [
+            OutcomeRecord(kind='send', dataset='a', destination='d', last_attempt=100.0),
+            OutcomeRecord(kind='send', dataset='b', destination='d', last_attempt=200.0, incomplete=True),
+            OutcomeRecord(kind='send', dataset='c', destination='d', last_attempt=None),
+            OutcomeRecord(kind='snapshot', dataset='e', last_attempt=300.0),
+        ]
+        stub = SimpleNamespace(_status=SimpleNamespace(records=records))
+        assert SendLoop._last_attempts(stub) == {('a', 'd'): 100.0}
+
+    def test_last_attempts_without_a_status_writer_is_empty(self):
+        from zfsbackup.sendloop import SendLoop
+        assert SendLoop._last_attempts(SimpleNamespace(_status=None)) == {}
 
 
 @pytest.mark.unit
@@ -1457,3 +1573,119 @@ class TestRealWorkerProcesses:
         stop.set()
         worker.join(30)
         assert worker.exitcode == 0 and list(sdir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# A cut chain across worker generations (reloads): continued, never re-attempted for nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestForcedAcrossWorkerGenerations:
+    """The REAL scheduler loop, the REAL `send_pair` and a REAL status file, three workers in a row on the same
+    status directory (what three reloads do), for one pair with F = 1 h and P = 1 d whose anchor is younger than P:
+
+    * A: a chain cut between steps is recorded `incomplete` (a success);
+    * B: starts at once (the catch-up; every dispatch is forced, so the young anchor does not end it as NOT_DUE)
+      and fails; the record becomes `error`, `incomplete` gone, one failure;
+    * C: the failure is seeded (`failed`): due at `min(next slot, L + 1 h)`, with NO extra attempt and no
+      `consecutive_failures` climb; with `L + 1 h` already past it retries at once."""
+
+    DS, DEST = 'pool/a', 'off'
+    KEY = ('pool/a', 'off')
+
+    class Generation:
+        def __init__(self, monkeypatch, sdir, anchor_age, answers):
+            self.answers, self.backups = list(answers), []
+            self.anchor_age = anchor_age
+            config = BackupConfig(
+                datasets=[DatasetConfig(
+                    name='pool/a', frequency=timedelta(hours=1),
+                    remote=[RemoteDatasetConfig(destination='off', frequency=timedelta(days=1))],
+                )],
+                destinations={'off': Destination(url='https://h')},
+            )
+            self.rig = LoopRig(config, monkeypatch, status_dir=sdir, client_id='client1')
+            manager, sender = self.rig.manager, self.rig.remote
+            manager.get_own_anchor.return_value = 'anchor'
+            manager.list_snapshots.side_effect = lambda dsi: [
+                SimpleNamespace(name='anchor', age=self.anchor_age)]
+            manager.clock_behind.return_value = False
+            sender.last_problem.return_value = 'the copy is not ours'
+
+            def backup(dsi, remote_cfg, should_stop=None):
+                self.backups.append(dsi.name)
+                done, retryable = self.answers.pop(0)
+                sender.last_retryable.return_value = retryable
+                return done
+
+            sender.backup_dataset.side_effect = backup
+
+        def run(self):
+            self.rig.run()
+            return self
+
+        @property
+        def schedule(self):
+            return self.rig.loop.schedule
+
+    def record(self, sdir):
+        return by_key(status(sdir, 'remote-backup-worker'))[('send', self.DS, self.DEST)]
+
+    def start_generation(self, monkeypatch, sdir, young, answers):
+        return self.Generation(monkeypatch, sdir, timedelta(hours=1) if young else timedelta(days=3), answers)
+
+    def cut_chain(self, monkeypatch, sdir):
+        """Generation A: a chain cut between steps (a reload's drain): DONE + retryable."""
+        a = self.start_generation(monkeypatch, sdir, young=False, answers=[(True, True)]).run()
+        assert a.backups == [self.DS]
+        rec = self.record(sdir)
+        assert rec.result == 'ok' and rec.incomplete is True
+        return a
+
+    def test_cut_then_failure_then_a_seeded_retry_that_is_not_an_extra_attempt(self, monkeypatch, sdir):
+        self.cut_chain(monkeypatch, sdir)
+
+        # B: the successor continues the chain at once, past the young anchor, and fails
+        b = self.start_generation(monkeypatch, sdir, young=True, answers=[(False, False)]).run()
+        assert b.backups == [self.DS], 'it reached backup_dataset: not NOT_DUE'
+        assert [f[:2] for f in b.rig.finished] == [(self.KEY, 'failed')]
+        rec = self.record(sdir)
+        assert rec.result == 'error' and rec.incomplete is False and rec.consecutive_failures == 1
+        failed_at = rec.last_attempt
+
+        # C: the failure is seeded: no attempt now, due at min(next slot, L + 1 h)
+        c = self.start_generation(monkeypatch, sdir, young=True, answers=[]).run()
+        assert c.backups == [], 'a restart is not an extra attempt'
+        rec = self.record(sdir)
+        assert rec.consecutive_failures == 1 and rec.last_attempt == failed_at and rec.result == 'error'
+        sched = c.schedule
+        slot = ss.slot_time(ss.slot_index(time.time(), 86400.0, sched.offset(self.KEY)) + 1, 86400.0,
+                            sched.offset(self.KEY))
+        assert sched.due_time(self.KEY, time.time()) == pytest.approx(min(slot, failed_at + 3600.0), abs=1e-3)
+
+        # and a generation after that one is the same again
+        d = self.start_generation(monkeypatch, sdir, young=True, answers=[]).run()
+        assert d.backups == [] and self.record(sdir).consecutive_failures == 1
+
+    def test_with_the_hour_already_past_the_retry_is_made_at_once(self, monkeypatch, sdir):
+        self.cut_chain(monkeypatch, sdir)
+        b = self.start_generation(monkeypatch, sdir, young=True, answers=[(False, False)]).run()
+        assert b.backups == [self.DS]
+        age_status(b.rig.worker, 2 * 3600.0)                 # the failure is two hours old now
+        c = self.start_generation(monkeypatch, sdir, young=True, answers=[(True, False)]).run()
+        assert c.backups == [self.DS], 'the retry went through the young anchor'
+        rec = self.record(sdir)
+        assert rec.result == 'ok' and rec.incomplete is False and rec.consecutive_failures == 0
+        assert c.schedule.wants_anchor_check(self.KEY) is False
+
+    def test_an_ordinary_missed_slot_is_caught_up_through_the_young_anchor_too(self, monkeypatch, sdir):
+        """No seed at all: an ordinary success two days old is a missed slot; its catch-up is a dispatch like any
+        other, so it is forced past the young anchor and reaches `backup_dataset` (it settles as up to date)."""
+        a = self.start_generation(monkeypatch, sdir, young=False, answers=[(True, False)]).run()
+        age_status(a.rig.worker, 2 * 86400.0)
+        b = self.start_generation(monkeypatch, sdir, young=True, answers=[(True, False)]).run()
+        assert b.backups == [self.DS]
+        assert [f[:2] for f in b.rig.finished] == [(self.KEY, 'ok')]
+        rec = self.record(sdir)
+        assert rec.result == 'ok' and rec.incomplete is False

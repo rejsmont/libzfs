@@ -768,7 +768,7 @@ from zfsbackup.remote import (  # noqa: E402
 
 REFUSAL = {"error": "server is reloading; retry later", "retry": True}
 REFUSAL_JSON = json.dumps(REFUSAL)
-RELOADING_MSG = "is reloading; skipping pool/data this cycle"
+RELOADING_MSG = "is reloading; skipping pool/data this attempt"
 
 
 def levels(caplog, text=None):
@@ -926,11 +926,11 @@ class TestLogRefusal:
 
     def test_busy_is_info_with_its_own_wording(self, caplog):
         assert self.logged(caplog, {"error": "busy", "retry": True}) == [
-            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this cycle")]
+            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this attempt")]
 
     def test_the_reload_refusal_is_info(self, caplog):
         assert self.logged(caplog, {"error": "server is reloading; retry later", "retry": True}) == [
-            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
+            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this attempt")]
 
     @pytest.mark.parametrize("result, shown", [
         ({"retry": True}, "unknown"),
@@ -944,17 +944,17 @@ class TestLogRefusal:
         got = self.logged(caplog, result)
         assert [lv for lv, _ in got] == ["INFO"]
         msg = got[0][1]
-        assert msg.startswith(f"server {self.URL_} asks to retry pool/data (") and msg.endswith("); skipping this cycle")
+        assert msg.startswith(f"server {self.URL_} asks to retry pool/data (") and msg.endswith("); skipping this attempt")
         assert expected in msg
         assert "is reloading" not in msg and "is busy" not in msg
 
     def test_the_real_busy_and_reloading_refusals_keep_their_own_wording(self, caplog):
         from zfsbackup import api
         assert self.logged(caplog, api.BUSY_ERROR) == [
-            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this cycle")]
+            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this attempt")]
         caplog.clear()
         assert self.logged(caplog, api.RELOADING_ERROR) == [
-            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
+            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this attempt")]
 
     def test_a_non_retryable_refusal_is_an_error_with_the_servers_text(self, caplog):
         assert self.logged(caplog, {"error": "pool/backups/c1/data is held for pool/other"}) == [
@@ -1004,7 +1004,7 @@ class TestRefusalAsTheFinalAck:
         assert result is False
         set_anchor.assert_not_called()
         assert "ERROR" not in levels(caplog)
-        assert f"server {URL} is busy with another stream of pool/data; skipping this cycle" in caplog.text
+        assert f"server {URL} is busy with another stream of pool/data; skipping this attempt" in caplog.text
 
     def test_a_non_retryable_final_ack_keeps_the_transfer_failed_wording(self, rbm, mocker, caplog):
         ws = ok_ws()
@@ -1194,7 +1194,7 @@ class TestRefusalDiscoveredAfterASendFailure:
         assert result is False
         set_anchor.assert_not_called()
         assert levels(caplog, "pool/data") == ["INFO"]
-        assert f"server {URL} is busy with another stream of pool/data; skipping this cycle" in caplog.text
+        assert f"server {URL} is busy with another stream of pool/data; skipping this attempt" in caplog.text
         assert "Transfer failed" not in caplog.text and "Broken pipe" not in caplog.text
         assert stream.closes == 1
         ws.recv.assert_called_once()
@@ -1781,7 +1781,7 @@ class TestRealResumeStreamUnderTimeouts:
         with caplog.at_level(logging.INFO):
             assert self.run(rbm) is False
         assert "ERROR" not in levels(caplog)
-        assert "is reloading; skipping pool/data this cycle" in caplog.text
+        assert "is reloading; skipping pool/data this attempt" in caplog.text
         self.set_anchor.assert_not_called()
         self.clear_inflight.assert_not_called()
 

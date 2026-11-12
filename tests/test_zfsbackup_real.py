@@ -2955,3 +2955,247 @@ class TestRealInheritDashS:
         from zfsbackup.backup_manager import clear_zfsbackup_properties
         assert clear_zfsbackup_properties(Filesystem(source_fs.name), config=True, anchors=False) == [PROP_CONFIG]
         assert _zfs_get_source(source_fs.name, PROP_CONFIG) == '-'
+
+
+# ---------------------------------------------------------------------------
+# Parallel senders (plan Track B, item B4): concurrent chains from one dataset to two local destinations
+#
+# The REAL `RemoteBackupWorker.run()` -- its scheduler, its sender threads (`sendloop.SendLoop`), the real
+# `LocalBackupManager` -- sends one source dataset to TWO `zfs:` destinations at the same time: real
+# `zfs send | zfs receive` into each, the chains of the two destinations interleaving on the same source
+# (anchors, pins and snapshots of one dataset written by two threads). Nothing is faked; the only addition
+# is an observer around `LocalBackupManager.backup_dataset` that makes the first two calls of a phase meet
+# at a barrier (both senders are inside the chain together, so the test cannot pass with a serial loop) and
+# records how many were in flight.
+#
+# Phase 1: the first full of one snapshot to each destination. Phase 2: three more snapshots, a chain of
+# three `-i` steps to each, concurrently. Then: both copies complete and guid-equal, both anchors on the
+# newest snapshot, no pin left, and the pruner protecting BOTH anchors (one is moved back, the pruner keeps
+# the snapshot it names as well as the newest). The recursive variant does the same for a parent, its
+# descendants (expanded into pairs of their own, behind their ancestor's confirmed copy) and both destinations.
+#
+# Needs the pool's mountpoints and the two `zfs` children of the pump on THIS machine: under `MULTIPASS_VM` the
+# stream would travel host -> `multipass exec` -> guest and the receive never sees its EOF (the run hangs), so
+# the tests skip there like the other local-destination tests; run pytest inside the VM
+# (`scenarios/test_openzfs_matrix.sh --extra tests/test_zfsbackup_real.py` does).
+# ---------------------------------------------------------------------------
+
+PAR_CLIENT = 'par-client'
+PAR_DESTS = ('one', 'two')
+
+
+def _par_write(dataset, name, mib=1):
+    """`mib` MiB of incompressible data into `dataset`'s mountpoint, so the incremental steps carry something.
+    Best effort: a pool whose mountpoint this account cannot write still sends (empty) snapshots."""
+    mountpoint = _zfs_get(dataset, 'mountpoint')
+    if not mountpoint or mountpoint in ('-', 'none', 'legacy'):
+        return
+    cmd = ['dd', 'if=/dev/urandom', f'of={mountpoint}/{name}', 'bs=1048576', f'count={mib}']
+    for argv in (cmd, ['sudo', '-n'] + cmd):
+        if subprocess.run(argv, capture_output=True).returncode == 0:
+            return
+
+
+class _ParWorld:
+    """One source tree, two target datasets, the config, and the loop."""
+
+    def __init__(self, src, children, dsts, recursive, tmp_path, monkeypatch, caplog):
+        self.src, self.children, self.dsts = src, children, dsts
+        self.tree = [src] + [f'{src}/{c}' for c in children]
+        self.recursive = recursive
+        self.tmp_path, self.monkeypatch, self.caplog = tmp_path, monkeypatch, caplog
+        (tmp_path / 'config.db').write_bytes(b'')
+        self.sdir = tmp_path / 'config.db.status'
+        from zfsbackup.health import ensure_status_dir
+        ensure_status_dir(self.sdir)
+        self.config = BackupConfig(
+            datasets=[DatasetConfig(
+                name=src, recursive=recursive, frequency=timedelta(hours=1),
+                # nothing older than an hour is kept but what an anchor or the newest protects
+                retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=1))],
+                remote=[RemoteDatasetConfig(destination=d) for d in PAR_DESTS],
+            )],
+            destinations={d: Destination(url=f'zfs:{dst}') for d, dst in zip(PAR_DESTS, dsts)},
+            snapshot_prefix='autosnap',
+        )
+        self.worker = None
+        self.observed = None
+
+    # -- the source's history ------------------------------------------------------------------
+    def history(self, hours_ago):
+        """One data file per dataset and one (recursive) snapshot per entry, oldest first; -> the names."""
+        names = []
+        for hours in hours_ago:
+            for ds in self.tree:
+                _par_write(ds, f'f{hours}.bin')
+            name = snap_name_at(hours)
+            _zfs_run('snapshot', '-r', f'{self.src}@{name}')
+            names.append(name)
+        return names
+
+    # -- the loop -----------------------------------------------------------------------------
+    def expected_pairs(self):
+        return {(ds, d) for ds in self.tree for d in PAR_DESTS}
+
+    def run(self, limit=900.0):
+        """One incarnation of the real remote worker (`run_worker_until_sent`), stopped once every pair has
+        been attempted successfully in THIS incarnation and nothing is running; a pair that fails stops it
+        at once. -> the observer (`max_inflight`, `broken`, `pairs`)."""
+        import threading
+
+        from _sendloop_support import run_worker_until_sent, stretch
+        from zfsbackup import local as local_module
+        from zfsbackup.stopflag import StopFlag
+        from zfsbackup.workers import RemoteBackupWorker
+
+        worker = RemoteBackupWorker(self.config, StopFlag(), status_dir=self.sdir, client_id=PAR_CLIENT)
+        self.worker = worker
+        obs = type('Observed', (), {})()
+        obs.lock, obs.inflight, obs.max_inflight, obs.calls, obs.pairs = threading.Lock(), 0, 0, 0, []
+        obs.broken = False
+        obs.barrier = threading.Barrier(2, timeout=30.0 * stretch())
+
+        real_backup = local_module.LocalBackupManager.backup_dataset
+
+        def observed_backup(manager, dsi, remote_cfg, should_stop=None):
+            with obs.lock:
+                obs.inflight += 1
+                obs.max_inflight = max(obs.max_inflight, obs.inflight)
+                number = obs.calls
+                obs.calls += 1
+                obs.pairs.append((dsi.name, remote_cfg.destination))
+            try:
+                if number < 2:
+                    # the first two sends of the phase are two destinations of one dataset: both must be
+                    # inside the chain at once, or the loop is not running them in parallel
+                    try:
+                        obs.barrier.wait()
+                    except threading.BrokenBarrierError:
+                        obs.broken = True
+                return real_backup(manager, dsi, remote_cfg, should_stop)
+            finally:
+                with obs.lock:
+                    obs.inflight -= 1
+
+        run_worker_until_sent(
+            worker, self.monkeypatch, self.expected_pairs(), limit=limit,
+            extra_patches=lambda mp: mp.setattr(local_module.LocalBackupManager, 'backup_dataset', observed_backup),
+        )
+        self.observed = obs
+        return obs
+
+    # -- what is where ------------------------------------------------------------------------
+    def copy_of(self, dst, ds):
+        return f'{dst}/{PAR_CLIENT}/{ds}'
+
+    def assert_complete(self, names):
+        """Every dataset of the tree, in both copies: the same snapshots with the same guids as the source;
+        both anchors on the newest, no pin."""
+        newest = names[-1]
+        for ds in self.tree:
+            local = _snapshot_guids(ds)
+            assert set(names) <= set(local)
+            for dst in self.dsts:
+                copy = _snapshot_guids(self.copy_of(dst, ds))
+                assert copy == local, f'{self.copy_of(dst, ds)}: {sorted(copy)} != {sorted(local)}'
+            for d in PAR_DESTS:
+                assert _zfs_get_local(ds, f'{PROP_ANCHOR_PREFIX}{d}') == newest, (ds, d)
+                assert _zfs_get_local(ds, f'{PROP_INFLIGHT_PREFIX}{d}') is None, f'a pin is left on {ds} ({d})'
+
+    def assert_recorded(self):
+        from zfsbackup.health import read_worker_status
+        records = {(r.dataset, r.destination): r for r in read_worker_status(self.sdir, 'remote-backup-worker').records
+                   if r.kind == 'send'}
+        assert set(records) == self.expected_pairs()
+        assert all(r.result == 'ok' and r.consecutive_failures == 0 and not r.incomplete for r in records.values())
+
+    def assert_no_errors(self):
+        bad = [r.getMessage() for r in self.caplog.records
+               if r.levelno >= logging.ERROR and r.name.startswith('zfsbackup')]
+        assert not bad, bad
+
+
+class _ParallelChains:
+    """Subclasses set `RECURSIVE` and `CHILDREN` (paths below the source, parents first)."""
+
+    RECURSIVE = False
+    CHILDREN = ()
+
+    @pytest.fixture
+    def par(self, auto_zfs_pool, tmp_path, monkeypatch, caplog):
+        import os
+
+        if auto_zfs_pool is None:
+            pytest.skip('ZFS pool not available — install ZFS and grant NOPASSWD sudo for zpool/zfs')
+        if os.environ.get('MULTIPASS_VM'):
+            pytest.skip('the local pump streams between two zfs children of THIS machine: run pytest inside '
+                        'the VM that owns the pool')
+        pool = auto_zfs_pool.name
+        src = f'{pool}/zfsbackup_psrc'
+        dsts = [f'{pool}/zfsbackup_pdst1', f'{pool}/zfsbackup_pdst2']
+        for name in [src, *dsts]:
+            _destroy_quietly(name)               # a leftover of a crashed run
+        caplog.set_level(logging.DEBUG, logger='zfsbackup')
+        try:
+            _zfs_run('create', src)
+            for child in self.CHILDREN:
+                _zfs_run('create', f'{src}/{child}')
+            for dst in dsts:
+                _zfs_run('create', '-o', 'canmount=off', dst)       # a target as the operator makes it
+            yield _ParWorld(src, self.CHILDREN, dsts, self.RECURSIVE, tmp_path, monkeypatch, caplog)
+        finally:
+            for name in [src, *dsts]:
+                _destroy_quietly(name)
+
+    def test_two_destinations_get_their_chains_at_the_same_time_and_both_copies_are_complete(self, par):
+        from _sendloop_support import age_status
+
+        first = par.history([8])
+        obs = par.run()
+        assert not obs.broken, 'the two senders were never inside the chain together'
+        assert obs.max_inflight >= 2
+        for dst in par.dsts:
+            assert set(_snapshot_guids(par.copy_of(dst, par.src))) == set(first), 'the first full is the newest only'
+        par.assert_complete(first)
+
+        more = par.history([6, 4, 2])
+        age_status(par.worker)                       # a later incarnation: its slot has come again
+        obs = par.run()
+        assert not obs.broken, 'the two chains were never run together'
+        assert obs.max_inflight >= 2
+        names = first + more
+        par.assert_complete(names)
+        par.assert_recorded()
+        par.assert_no_errors()
+        # each destination really got a chain of three incremental steps
+        lines = [r.getMessage() for r in par.caplog.records if r.name.startswith('zfsbackup.local')]
+        for d in PAR_DESTS:
+            assert any(f'Sending 3 snapshots of {par.src} to {d}' in m for m in lines), d
+
+        # the pruner: BOTH anchors protect. One destination is behind (its anchor is the second snapshot),
+        # the other is current; nothing but those two snapshots and the newest may survive.
+        behind = names[1]
+        target = par.children[0] if par.children else None
+        holder = par.src if target is None else f'{par.src}/{target}'
+        _zfs_run('set', f'{PROP_ANCHOR_PREFIX}{PAR_DESTS[1]}={behind}', holder)
+        from zfsbackup.backup_manager import DatasetManager
+        manager = DatasetManager(par.config)
+        manager.prune_snapshots(manager.datasets[0])
+        for ds in par.tree:
+            assert set(_snapshot_guids(ds)) == {behind, names[-1]}, ds
+        # and the copies are untouched by a prune of the source
+        for dst in par.dsts:
+            for ds in par.tree:
+                assert set(_snapshot_guids(par.copy_of(dst, ds))) == set(names), (dst, ds)
+
+
+class TestRealParallelChainsFlat(_ParallelChains):
+    """One dataset, two `zfs:` destinations: two senders at once."""
+
+
+class TestRealParallelChainsRecursive(_ParallelChains):
+    """A recursive parent with a tree below it, both destinations: the parent's two pairs first (concurrently),
+    then every descendant's pairs behind its ancestor's confirmed copy, up to four senders at once."""
+
+    RECURSIVE = True
+    CHILDREN = ('a', 'a/b', 'c')

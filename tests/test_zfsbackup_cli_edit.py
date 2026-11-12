@@ -729,6 +729,9 @@ class TestEditAnchorWarnings:
             warnings_in(result), "datasets[tank/data] no longer sends to 'offsite'"
         ) == 1
         assert "org.zfsbackup:anchor.offsite" in result.stderr
+        # the exact command: `-S` clears the local value and leaves a received one alone
+        assert "`zfs inherit -S org.zfsbackup:anchor.offsite tank/data`" in " ".join(result.stderr.split())
+        assert "zfs inherit org.zfsbackup:anchor.offsite" not in result.stderr
         # (the rest of the wording -- "stops protecting them from pruning" -- is
         # stale since the pruner protects every local anchor; deliberately not pinned)
 
@@ -738,6 +741,8 @@ class TestEditAnchorWarnings:
         assert result.exit_code == 0, result.stderr
         assert count_containing(warnings_in(result), "destination 'spare' is deleted") == 1
         assert sorted(stored(rich).destinations) == ["dc.two", "offsite"]
+        assert "`zfs inherit -S org.zfsbackup:anchor.spare <dataset>`" in " ".join(result.stderr.split())
+        assert "zfs inherit org.zfsbackup:anchor.spare" not in result.stderr
 
     def test_a_destination_dropped_from_a_dataset_and_deleted_warns_once(self, run, rich, stub, scratch_tmp):
         stub.plan([

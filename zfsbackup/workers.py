@@ -705,18 +705,22 @@ class BaseWorker(_SupervisorWatch, Process):
     def _record(
         self, kind: str, dataset: str, destination: Optional[str] = None, *,
         ok: bool, error: Optional[str] = None, detail: Optional[str] = None,
-        warning: Optional[str] = None,
+        warning: Optional[str] = None, incomplete: bool = False,
     ) -> None:
         """One attempt finished (S-7): remembered for the status file, which
         `_flush_status` writes. `warning` is a standing warning about a
-        success (`health.OutcomeRecord.warning`); it is passed on only when
-        there is one. A no-op without a status directory."""
+        success (`health.OutcomeRecord.warning`) and `incomplete` marks a
+        success that left work behind (`health.OutcomeRecord.incomplete`);
+        each is passed on only when there is one. A no-op without a status
+        directory."""
         if self._status is not None:
+            extra = {}
             if warning:
-                self._status.record(
-                    kind, dataset, destination, ok=ok, error=error, detail=detail, warning=warning)
-            else:
-                self._status.record(kind, dataset, destination, ok=ok, error=error, detail=detail)
+                extra['warning'] = warning
+            if incomplete:
+                extra['incomplete'] = True
+            self._status.record(
+                kind, dataset, destination, ok=ok, error=error, detail=detail, **extra)
 
     def _flush_status(self, force: bool = False, heartbeat: bool = False) -> None:
         if self._status is not None:
@@ -1433,14 +1437,22 @@ class RemoteBackupWorker(BaseWorker):
         owns the status writer): a DONE pair is a success, a FAILED one a
         failure with the sender's account of why; every other kind (not due,
         waiting, stopped) is neither a success nor a failure and records
-        nothing. A recorded outcome is written now: the next send may stream
-        for hours."""
+        nothing. A DONE pair that is `retryable` (a chain stopped between steps
+        by a reload, an upgrade drain or a stop, with work left: this worker is
+        exiting) is recorded as a success marked `incomplete`: the successor
+        worker continues it (`SendLoop._last_attempts` does not count that
+        attempt as having served its slot, so it is caught up at start; like
+        every dispatch the schedule makes, it skips the sender's anchor-age
+        check). A busy or reloading server, an
+        unsettled ancestor or a connect failure are FAILED, never DONE, and are
+        recorded only when their retries are spent. A recorded outcome is
+        written now: the next send may stream for hours."""
         if self._status is None:
             return
         if outcome.kind == PAIR_DONE:
             self._record(
                 health.KIND_SEND, outcome.dataset, outcome.destination, ok=True,
-                warning=outcome.warning,
+                warning=outcome.warning, incomplete=outcome.retryable is True,
             )
         elif outcome.kind == PAIR_FAILED:
             self._record(

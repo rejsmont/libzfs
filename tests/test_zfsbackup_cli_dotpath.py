@@ -2562,6 +2562,29 @@ class TestStaleAnchorWarningsPure:
             "Before using `-r`"
         ) in message
 
+    @pytest.mark.parametrize("old, new, name", [
+        ("https://offsite:8080", "https://other:1", "offsite"),
+        ("zfs:backup/two", "zfs:backup/three", "loc2"),
+    ], ids=["https", "local"])
+    def test_the_text_does_not_say_a_stale_anchor_skips_a_send(self, config, old, new, name):
+        """The anchor does not hold a send up (the schedule decides; the due check runs only on the re-run of a
+        slot after a clock step back), so the warning says so and never speaks of "not due" or a period."""
+        (message,) = dotpath.stale_anchor_warnings(name, self.dest(old), self.dest(new), config)
+        assert "not due" not in message and "one period" not in message
+        assert "They do not hold up the next send" in message
+        assert "what is sent is decided from what the destination reports it holds, never from the anchor" in message
+
+    def test_the_text_keeps_the_check_note_and_the_lone_snapshot_caveat(self, config):
+        (message,) = dotpath.stale_anchor_warnings(
+            "offsite", self.dest("https://offsite:8080"), self.dest("https://other:1"), config
+        )
+        assert "`check` grades this destination by it" in message
+        assert 'makes `check` say "not yet sent" at once' in message
+        assert (
+            "a stale anchor can then let that send discard a lone snapshot of the copy's that this host "
+            "does not have (with no anchor the send is refused instead)"
+        ) in message
+
     def test_an_unchanged_url_gives_nothing(self, config):
         same = self.dest("https://offsite:8080")
         assert dotpath.stale_anchor_warnings("offsite", same, self.dest("https://offsite:8080"), config) == []
@@ -2630,6 +2653,12 @@ class TestStaleAnchorAdviceIsConditional:
         commands = message.index("zfs inherit")
         assert message.index("ONLY if") < message.index("do NOT clear") < commands
 
+    def test_through_the_cli_the_text_makes_no_claim_about_a_skipped_send(self, run, anchored):
+        result = ok(run, anchored, "set", "destinations.offsite.url", "https://other:1")
+        (warned,) = stale_warnings(result)
+        assert "They do not hold up the next send" in " ".join(warned.split())
+        assert "not due" not in warned and "one period" not in warned
+
     def test_it_is_still_one_warning_through_the_cli(self, run, anchored):
         result = ok(run, anchored, "set", "destinations.offsite.url", "https://other:1")
         (warned,) = stale_warnings(result)
@@ -2683,6 +2712,14 @@ class TestStaleAnchorSameCertificateLead:
         (message,) = self.warn(config, old_fp, new_fp)
         assert message.startswith("destinations[offsite] now points to a different place")
         assert "the server certificate is the same" not in message
+
+    def test_the_lead_is_followed_by_the_current_wording(self, config):
+        (message,) = self.warn(config, FP, FP)
+        assert message.startswith(self.LEAD)
+        assert "They do not hold up the next send" in message
+        assert "not due" not in message and "one period" not in message
+        assert 'makes `check` say "not yet sent" at once' in message
+        assert "discard a lone snapshot of the copy's that this host does not have" in message
 
     def test_the_lead_still_leaves_the_do_not_clear_paragraph(self, config):
         (message,) = self.warn(config, FP, FP)

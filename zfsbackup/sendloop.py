@@ -84,9 +84,29 @@ Behaviours worth knowing
   slot), and no WARNING is logged for an ancestor the memory already knows to be
   confirmed (its outcome has not been handled yet).
 * **A DONE pair is always recorded as a success at once**, even when it is
-  retryable (a chain cut between steps, or by a drain): the steps that were
-  acknowledged are real progress. Only the retry TIMING is `RETRYABLE`; the final
-  outcome of the retries is recorded as usual.
+  retryable: a DONE that is retryable is a chain stopped BETWEEN STEPS (after at
+  least one acknowledged step) because the worker is exiting, by a reload, an
+  upgrade drain or a stop (`ChainSender.last_retryable`). Those steps are real
+  progress and are never lost, so it is recorded at once as a success marked
+  ``incomplete`` (`PairOutcome.retryable`, `health.OutcomeRecord.incomplete`),
+  whatever the schedule's retry timing says (a busy or reloading server, an
+  unsettled ancestor and a connect failure are retryable FAILED outcomes, not
+  DONE; they are recorded only when their retries are spent). The SUCCESSOR
+  worker continues the cut chain: `_last_attempts` leaves an incomplete record
+  out, so the pair gets the catch-up at start instead of waiting for its next
+  slot. A failure recorded in the current slot is retried as the live
+  scheduler would have (`SendSchedule`, ``PairSpec.failed``), not at the next
+  slot.
+* **The schedule decides when a pair sends; the sender's anchor-age check only
+  guards the one re-run a backwards clock step can cause.** `_start_sender`
+  passes ``force_confirm=True`` to `send_pair` for every dispatch except that
+  one (`SendSchedule.wants_anchor_check`): on-time and late slots, catch-ups,
+  retries, the overrun follow-up, continuations and confirmations. The check
+  measures the anchor's age from its snapshot's NAME time, so after a send that
+  ran late (a retry, a catch-up) it would find the anchor too young at the next
+  slot and skip it, and it would end a continuation of a partly sent chain as
+  NOT_DUE whenever the destination's period is longer than the dataset's. A
+  forced pair with nothing to send settles as up to date (one negotiate).
 
 This module imports neither ``zfsbackup.remote`` nor ``zfsbackup.local``
 (the worker imports those once, after the start-up version check) and builds
@@ -165,9 +185,11 @@ class _DiscoveryDone(NamedTuple):
 def schedule_outcome(outcome: PairOutcome) -> Tuple[Outcome, bool]:
     """`(sendschedule.Outcome, retryable)` for a `PairOutcome` (the mapping
     the schedule's docstring leaves to the loop). A DONE pair that
-    `ChainSender.last_retryable` calls transient (a chain cut between steps
-    with work left) is RETRYABLE: retried after 60, 120, 300 s, and recorded
-    (as a success) only once those are used up."""
+    `ChainSender.last_retryable` calls retryable (a chain stopped between steps
+    with work left: the worker is exiting) maps to RETRYABLE, which only sets
+    the schedule's retry timing; `_on_sender_done` records it as a success at
+    once all the same. A retryable FAILED is retried after 60, 120, 300 s and
+    recorded only once those are used up."""
     kind = outcome.kind
     if kind == PAIR_DONE:
         return (Outcome.RETRYABLE if outcome.retryable else Outcome.OK), outcome.retryable
@@ -412,10 +434,11 @@ class SendLoop:
         # `finished` BEFORE `confirmed`/`unconfirmed` (`SendSchedule` docstring).
         record_now = self._sched.finished(key, kind, retryable, self._clock())
         # A chain that completed steps (DONE, even with `retryable`: cut between
-        # steps, a reload's drain, a transient stop) made real progress: record
-        # it as a success NOW. Only the retry TIMING is the schedule's
-        # (`RETRYABLE`); a later retry that finds nothing due (NOT_DUE) must not
-        # lose this success, and the burst's final outcome is recorded as usual.
+        # steps by a reload, an upgrade drain or a stop) made real progress:
+        # record it as a success NOW (marked `incomplete`, see `_record_outcome`).
+        # Only the retry TIMING is the schedule's (`RETRYABLE`); a later retry
+        # that finds nothing due (NOT_DUE) must not lose this success, and the
+        # final outcome of a retryable FAILED burst is recorded as usual.
         if outcome.kind == PAIR_DONE:
             record_now = True
         if record_now and self._record is not None:
@@ -473,18 +496,52 @@ class SendLoop:
     # ------------------------------------------------------------------- pairs
 
     def _last_attempts(self) -> Dict[Tuple[str, Optional[str]], float]:
+        """Each send record's ``last_attempt``, for the schedule's catch-up. A
+        record marked ``incomplete`` (a success whose chain was stopped between
+        steps with work left, by a reload, an upgrade drain or a stop) is left
+        out: that attempt did not finish the pair's slot, so the pair has no
+        attempt and gets its one catch-up (a reload must never delay a backup
+        by a period); `_cut_pairs` tells the schedule to continue it.
+        A failure record IS included (its time is what the failure retry is rebuilt
+        from, `_failed_pairs`): dropping it would make every restart a new
+        attempt and climb ``consecutive_failures``."""
         if self._status is None:
             return {}
         return {
             (r.dataset, r.destination): r.last_attempt for r in self._status.records
             if r.kind == health.KIND_SEND and r.last_attempt is not None
+            and getattr(r, 'incomplete', False) is not True
+        }
+
+    def _cut_pairs(self) -> Set[Tuple[str, Optional[str]]]:
+        """The pairs whose last send record is ``incomplete`` (a chain cut
+        between steps by an exit): the successor continues them at its catch-up
+        (``PairSpec.resume``)."""
+        if self._status is None:
+            return set()
+        return {
+            (r.dataset, r.destination) for r in self._status.records
+            if r.kind == health.KIND_SEND and getattr(r, 'incomplete', False) is True
+        }
+
+    def _failed_pairs(self) -> Set[Tuple[str, Optional[str]]]:
+        """The pairs whose last send record is a failure (``result == 'error'``):
+        the schedule rebuilds the retry the previous worker would have made
+        (``PairSpec.failed``) instead of waiting for the next slot."""
+        if self._status is None:
+            return set()
+        return {
+            (r.dataset, r.destination) for r in self._status.records
+            if r.kind == health.KIND_SEND and r.last_attempt is not None
+            and r.result == health.RESULT_ERROR
         }
 
     def _rebuild(self, now: float) -> None:
         """The pair set: the configured pairs plus each parent's last known
         children (config order, children after the configured ones), handed to
-        the schedule. A new pair's catch-up reads its status record's
-        ``last_attempt``."""
+        the schedule. A new pair's start reads its status record: the
+        ``last_attempt`` for the catch-up, whether the record is a chain cut
+        between steps (``resume``) or a failure (``failed``)."""
         entries: List[Tuple[Any, Any]] = []
         for dsi in self._configured:
             entries.extend((dsi, rc) for rc in dsi.config.remote)
@@ -492,6 +549,7 @@ class SendLoop:
             for child in self._children.get(parent, ()):
                 entries.extend((child, rc) for rc in child.config.remote)
         last = self._last_attempts()
+        cut, failed = self._cut_pairs(), self._failed_pairs()
         specs: List[PairSpec] = []
         pairs: Dict[PairKey, Tuple[Any, Any]] = {}
         for order, (dsi, rc) in enumerate(entries):
@@ -502,6 +560,7 @@ class SendLoop:
                 spec = PairSpec(
                     dsi.name, rc.destination, frequency=dsi.config.frequency, period=rc.frequency,
                     config_order=order, last_attempt=last.get(key),
+                    resume=key in cut, failed=key in failed,
                 )
             except ValueError as e:
                 if key not in self._bad_noted:
@@ -580,9 +639,13 @@ class SendLoop:
 
     def _start_sender(self, key: PairKey, now: float) -> None:
         dsi, rc = self._pairs[key]
-        # Read once, here: the sender skips its anchor-age check while children
-        # wait for this pair (`SendSchedule.wants_confirmation`).
-        force = self._sched.wants_confirmation(key)
+        # Read once, here. The schedule decides when a pair sends, so the sender
+        # skips its anchor-age check (it measures from the anchor's name time and
+        # would skip the slot after a late send) for every dispatch but the one
+        # re-run of an attempted slot that a backwards clock step causes
+        # (`SendSchedule.wants_anchor_check`). Children waiting for this pair
+        # (`SendSchedule.wants_confirmation`) force it as well.
+        force = self._sched.wants_confirmation(key) or not self._sched.wants_anchor_check(key)
         self._sched.started(key, now)
         thread = threading.Thread(
             target=self._sender_main, args=(key, dsi, rc, force, self._rule),

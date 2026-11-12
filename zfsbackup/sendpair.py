@@ -315,12 +315,20 @@ def send_pair(
     frequency is NOT_DUE; one whose anchor is dated beyond the clock tolerance
     in the future is due (the anchor's age says nothing: `clock_behind` logs
     the ERROR once); an unreadable anchor is None, so the pair is due and the
-    negotiate decides. A nearest ancestor of waiting children whose copy is not
-    confirmed yet is due whatever its anchor says
-    (`AncestorRule.confirmation_due`, or `force_confirm=True` from a scheduler
-    that tracks the same fact: `SendSchedule.wants_confirmation`; the two are
-    OR-ed): one negotiate per incarnation, which settles an up-to-date copy
-    without a stream.
+    negotiate decides.
+
+    `force_confirm=True` skips the NOT_DUE decision: the negotiate decides, and
+    nothing left to send settles as up to date (DONE, not retryable, so the
+    record is not marked incomplete). The scheduler passes it for EVERY dispatch
+    but one (`SendSchedule.wants_anchor_check`): the schedule, not this check,
+    decides when a pair sends, and the anchor's age (measured from the snapshot's
+    name time) would wrongly skip the slot after a send that ran late (a retry,
+    a catch-up, a continuation). The check only guards the re-run of an
+    already-attempted slot that a backwards clock step causes. It is also OR-ed
+    with `AncestorRule.confirmation_due` (a nearest ancestor of waiting children
+    whose copy is not confirmed yet: one negotiate per incarnation). The anchor
+    is still READ when forced, so a future-dated one is announced (the ERROR
+    above) whatever the caller forces.
 
     A pair that comes back DONE is noted in the memory's dry-run set (what a
     dry run's R-2 reads, since a dry run confirms no copy).
@@ -416,18 +424,17 @@ def _send_pair(
             probe.read(_memory_of(sender), key)
     freq = (remote_cfg.frequency or dsi.config.frequency).total_seconds()
     confirm = force_confirm or (rule is not None and rule.confirmation_due(manager, dsi, destination))
-    anchor_name = None if confirm else manager.get_own_anchor(dsi, destination)
+    # Read even when forced: `clock_behind` announces a future-dated anchor
+    # (ERROR once), which a forced dispatch must not hide.
+    anchor_name = manager.get_own_anchor(dsi, destination)
     if anchor_name:
         snapshots = manager.list_snapshots(dsi)
         anchor = next((s for s in snapshots if s.name == anchor_name), None)
         # An anchor dated beyond the clock tolerance in the future means the
         # clock is behind it: its age says nothing, so the destination is due
         # (`clock_behind` logs the ERROR once).
-        if (
-            anchor
-            and not manager.clock_behind(dsi, anchor, f"anchor for {destination}")
-            and anchor.age.total_seconds() < freq
-        ):
+        behind = bool(anchor) and manager.clock_behind(dsi, anchor, f"anchor for {destination}")
+        if anchor and not behind and not confirm and anchor.age.total_seconds() < freq:
             logger.debug(f"Backup of {dsi.name} to {destination} not due yet")
             return PairOutcome(dsi.name, destination, PAIR_NOT_DUE)
     # `should_stop` is polled before every stream of the chain (never during

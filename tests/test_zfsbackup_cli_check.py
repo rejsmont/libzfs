@@ -1569,6 +1569,56 @@ class TestWorkerGrading:
         assert entries[("worker_send", "tank/a", "offsite")]["state"] == "CRIT"
 
 
+class TestIncompleteSuccess:
+    """A send record with `"incomplete": true` (a success whose chain was cut between steps by a reload, a
+    drain or a stop: `health.OutcomeRecord.incomplete`) is a success: graded OK, in every format, exit 0.
+    The flag only tells the NEXT worker incarnation to send the pair again at once; it is no verdict."""
+
+    def write(self, world, **kw):
+        record = rec("send", "tank/a", "offsite", **kw)
+        record["incomplete"] = True
+        write_worker(world.db, SEND, [record])
+
+    def test_json_grades_it_ok_with_no_failures(self, at_rest):
+        self.write(at_rest)
+        result = at_rest.check("--json")
+        assert result.exit_code == 0, result.stdout
+        entry = at_rest.entries()[("worker_send", "tank/a", "offsite")]
+        assert entry["state"] == "OK" and entry["consecutive_failures"] == 0
+        assert entry["reason"].startswith("last attempt succeeded")
+
+    def test_text_prometheus_and_nagios_agree(self, at_rest):
+        self.write(at_rest)
+        text = at_rest.check()
+        assert text.exit_code == 0 and "OK   worker_send: tank/a (offsite): last attempt succeeded" in text.stdout
+        assert text.stdout.splitlines()[-1].startswith("overall: OK")
+        prom = Exposition(at_rest.check("--prometheus").stdout)
+        assert prom.one("zfsbackup_worker_consecutive_failures", kind="send", dataset="tank/a",
+                        destination="offsite") == 0
+        nagios = at_rest.check("--nagios")
+        assert nagios.exit_code == 0 and nagios.stdout.startswith("ZFSBACKUP OK - ")
+        assert "'worker_send:tank/a@offsite'=0;2;4;0" in nagios.stdout
+
+    def test_it_is_graded_exactly_like_the_same_record_without_the_flag(self, at_rest):
+        attempt = time.time() - 60                     # the same instant in both files
+        self.write(at_rest, attempt=attempt)
+        flagged = at_rest.entries()[("worker_send", "tank/a", "offsite")]
+        write_worker(at_rest.db, SEND, [rec("send", "tank/a", "offsite", attempt=attempt)])
+        plain = at_rest.entries()[("worker_send", "tank/a", "offsite")]
+        assert flagged == plain
+
+    def test_a_flagged_failure_record_still_grades_as_a_failure(self, at_rest):
+        """Not something the worker writes (a failure is never incomplete), but a reader must grade by the
+        failure count whatever else the record says."""
+        self.write(at_rest, failures=4)
+        assert at_rest.entries()[("worker_send", "tank/a", "offsite")]["state"] == "CRIT"
+
+    def test_status_reports_it_as_not_failing(self, at_rest):
+        self.write(at_rest)
+        data = json.loads(at_rest.run("-c", at_rest.db, "status", "--json").stdout)["workers"]["files"][0]
+        assert data["records"] == 1 and data["failing"] == 0 and data["worst"] is None
+
+
 def _symlink(world, directory):
     target = directory / "elsewhere"
     target.write_text("{}")

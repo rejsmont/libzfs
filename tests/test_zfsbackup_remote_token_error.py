@@ -164,7 +164,7 @@ class TestErrorOnTheThirdSkip:
         assert rig.cycle() == 'skip'
         assert rig.cycle() == 'skip'
         assert token_errors(caplog) == []                        # two skips: WARNINGs only
-        assert [r.levelname for r in caplog.records if 'skipping this cycle' in r.getMessage()] == ['WARNING'] * 2
+        assert [r.levelname for r in caplog.records if 'skipping this attempt' in r.getMessage()] == ['WARNING'] * 2
         assert rig.cycle() == 'skip'
         (err,) = token_errors(caplog)
         assert rig.cycles(5) == ['skip'] * 5
@@ -177,7 +177,7 @@ class TestErrorOnTheThirdSkip:
         text = err.getMessage()
         assert err.name == 'zfsbackup.remote'
         assert f'{DS} -> {DEST}' in text
-        assert 'last 3 cycles in a row' in text
+        assert 'last 3 attempts in a row' in text
         assert 'HTTP 500' in text
         assert 'falling behind' in text
         assert 'zfs receive -A pool/b/client1/data' in text
@@ -422,7 +422,7 @@ class TestSeededSkipCounts:
         rig.http_500()
         rig.cycle()
         (err,) = token_errors(caplog)
-        assert 'last 3 cycles' in err.getMessage()
+        assert 'last 3 attempts' in err.getMessage()
 
     def test_a_seed_below_the_threshold_logs_nothing_by_itself(self, rig, caplog):
         rig.rbm.seed_token_skips({(DS, DEST): 2})
@@ -435,7 +435,7 @@ class TestSeededSkipCounts:
         rig.http_500()
         rig.cycles(3)
         (err,) = token_errors(caplog)
-        assert 'last 8 cycles' in err.getMessage()
+        assert 'last 8 attempts' in err.getMessage()
 
     def test_zero_and_negative_counts_are_ignored(self, rig):
         rig.rbm.seed_token_skips({(DS, DEST): 0, ('pool/x', DEST): -4})

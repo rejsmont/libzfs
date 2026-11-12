@@ -301,3 +301,79 @@ def age_status(worker, seconds=7200.0):
                 setattr(record, field, value - seconds)
     writer._dirty = True
     writer.flush(force=True)
+
+
+def run_worker_until_sent(worker, monkeypatch, pairs, *, limit=600.0, poll=0.1, extra_patches=None):
+    """Run the REAL `RemoteBackupWorker.run()` (real transports; for the real-ZFS tier, where `LoopRig`'s fake
+    senders are no use) until every `(dataset, destination)` in `pairs` has a send record that is `ok`, not
+    `incomplete` and attempted in THIS call, and nothing is running; then stop it (the scheduler's exit
+    reason). The parallel remote worker never returns by itself, and patching `_wait` (the old serial loop's
+    stop) does nothing to it. Every pair is due at once (`fraction` 0).
+
+    Fails fast: as soon as a wanted pair has a send record with `result == 'error'` whose attempt is after
+    this call's start (a retryable failure is recorded only when its retries are spent, so this is a final
+    answer), the worker is stopped and the call fails naming the pair and its `last_error`; an error record
+    of an earlier incarnation or of a pair not in `pairs` does not count. A watchdog stops it after `limit`
+    seconds (scaled by `timer_stretch()`) for everything else (a pair that is never due, a send that hangs)
+    and the call then fails.
+
+    `extra_patches(mp)`, when given, is called with the `monkeypatch` context the run happens in (so what it
+    patches is undone with the run): a driver that observes `backup_dataset` installs its wrapper there."""
+    started = time.time()
+    wanted = set(pairs)
+    timed_out = []
+    failures: List[str] = []
+
+    def send_records():
+        return {(r.dataset, r.destination): r for r in worker._status.records if r.kind == 'send'}
+
+    def done():
+        records = send_records()
+        return all(
+            k in records and records[k].result == 'ok' and not records[k].incomplete
+            and (records[k].last_attempt or 0) >= started for k in wanted
+        )
+
+    def failed() -> List[str]:
+        records = send_records()
+        return [
+            f"{k[0]} -> {k[1]}: {records[k].last_error or 'no error text'}"
+            for k in sorted(wanted)
+            if k in records and records[k].result == 'error' and (records[k].last_attempt or 0) >= started
+        ]
+
+    real_reason = worker._exit_reason
+
+    def exit_reason():
+        reason = real_reason()
+        if reason is None and worker._status is not None:
+            problems = failed()
+            if problems:
+                failures.extend(problems)
+                reason = ExitReason.STOP
+            elif done():
+                loop = getattr(worker, '_loop', None)
+                if loop is not None and not loop._senders and not loop._discoveries:
+                    reason = ExitReason.STOP
+        return reason
+
+    worker._exit_reason = exit_reason
+
+    def fire():
+        timed_out.append(True)
+        worker.stop_event.set()
+
+    timer = threading.Timer(limit * stretch(), fire)
+    timer.daemon = True
+    with monkeypatch.context() as mp:
+        mp.setattr('zfsbackup.sendloop.STOP_POLL', poll)
+        mp.setattr(workers_module, 'SendSchedule', lambda cid, check: SendSchedule(cid, check, fraction=lambda *a: 0.0))
+        if extra_patches is not None:
+            extra_patches(mp)
+        timer.start()
+        try:
+            worker.run()
+        finally:
+            timer.cancel()
+    assert not failures, 'a pair failed (the worker was stopped at once): ' + '; '.join(failures)
+    assert not timed_out, 'the worker did not send every pair within the bound (the watchdog stopped it)'

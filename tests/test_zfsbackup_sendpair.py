@@ -745,7 +745,7 @@ class TestConfirmationDue:
         manager = FakeManager(anchor='s', snapshots=[snap('s', 1)])
         outcome = run(manager, pair, sender=sender, rule=rule)
         assert outcome.kind == PAIR_DONE
-        assert manager.anchor_reads == [], "the anchor is not even read"
+        assert manager.anchor_reads == [('pool/p', DEST)], "still read: a future-dated anchor is announced"
         assert len(sender.calls) == 1
 
     def test_a_confirmed_ancestor_is_due_by_its_anchor_again(self):
@@ -1154,7 +1154,14 @@ class TestForceConfirm:
         sender = FakeSender(True)
         outcome = run(manager, sender=sender, force_confirm=True)
         assert outcome.kind == PAIR_DONE and len(sender.calls) == 1
-        assert manager.anchor_reads == [], 'the anchor is not even read'
+        assert manager.anchor_reads == [('pool/data', 'offsite')], (
+            'the anchor is still read when forced: a future-dated one is announced (`clock_behind`)')
+
+    def test_a_forced_dispatch_still_has_a_future_dated_anchor_announced(self):
+        manager = FakeManager(anchor='s1', snapshots=[snap('s1', 5)], clock_behind=True)
+        outcome = run(manager, sender=FakeSender(True), force_confirm=True)
+        assert outcome.kind == PAIR_DONE
+        assert len(manager.clock_checks) == 1, 'clock_behind ran (it logs the ERROR once)'
 
     def test_without_it_the_same_pair_is_not_due(self):
         manager = FakeManager(anchor='s1', snapshots=[snap('s1', 5)])

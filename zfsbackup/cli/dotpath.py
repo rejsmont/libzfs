@@ -927,10 +927,20 @@ def stale_anchor_warnings(name: str, old: Destination, new: Destination, config:
     surrounding blanks do not count) changed: its anchors are
     keyed by the destination's NAME, so `org.zfsbackup:anchor.<name>` stays on
     every dataset that sends to it (descendants of recursive datasets included)
-    and still describes the OLD copy. If the destination now points to a
-    DIFFERENT copy, a dataset whose anchor is fresh reads as "sent" and is
-    skipped as not due for up to one period, so the first send to the new copy
-    may wait. But the same server under a new name, address or port is the same
+    and still describes the OLD copy. Nothing needs clearing for the next send
+    to work: the send is decided from what the destination reports it holds
+    (negotiate's common snapshot), never from the anchor (the due check reads the
+    anchor only on the re-run a backwards clock step causes), and the next send
+    that brings the copy up to date replaces it (`_record_step` holds an anchor
+    only while the sent snapshot is older by `createtxg`; `_settle_up_to_date`
+    leaves one naming a snapshot this host lacks). What a stale anchor does until
+    then: the pruner keeps its snapshot (it protects every local or received
+    `anchor.*`), `check` grades the destination by it (so a recent one hides
+    "not yet sent"), and for a copy that already holds snapshots of the dataset
+    it can satisfy `_rollback_permit`'s local evidence and let the send
+    `discard` a lone snapshot the copy has and this host lacks (refused with no
+    anchor). Clearing is therefore optional tidying for a DIFFERENT copy. But
+    the same server under a new name, address or port is the same
     copy: its old anchor is the incremental base, and clearing it lets the
     pruner remove that snapshot, after which negotiate finds no common snapshot
     and sends stop until someone intervenes. So the advice is conditional and
@@ -968,14 +978,19 @@ def stale_anchor_warnings(name: str, old: Destination, new: Destination, config:
         + f"destinations[{name}] now points to a different place, but the anchors for it "
         f"({prop}, kept on the datasets that send to it"
         + (", and on every descendant of a recursive one" if recursive else "")
-        + ") stay in place and still describe the OLD copy: a dataset whose anchor is recent "
-        "counts as already sent and is skipped as not due for up to one period, so the first "
-        "send(s) to a new copy may be delayed. Clear them ONLY if this destination now points "
-        "to a DIFFERENT copy (another server or pool); if it is the same server under a new "
-        "name or address, do NOT clear anything: the old anchor is the incremental base, and "
-        "once it is gone the pruner may remove that snapshot, the next send finds no common "
-        "snapshot, and sends stop until you intervene. To make the datasets due at once for "
-        "a different copy, clear the anchors (this tool changes no ZFS property itself)"
+        + ") stay in place and still describe the OLD copy. They do not hold up the next "
+        "send: what is sent is decided from what the destination reports it holds, never from "
+        "the anchor, and the next send that brings the copy up to date replaces it. Until then "
+        "the old anchor keeps its snapshot from being pruned, and `check` grades this "
+        "destination by it. Clear them ONLY if this destination now points to a DIFFERENT copy "
+        "(another server or pool), and then only as tidying: it releases that snapshot and "
+        "makes `check` say \"not yet sent\" at once. Do it before the next send if the new copy "
+        "already holds snapshots of this dataset: a stale anchor can then let that send discard "
+        "a lone snapshot of the copy's that this host does not have (with no anchor the send is "
+        "refused instead); if it is the same server under a new name or address, do NOT clear "
+        "anything: the old anchor is the incremental base, and once it is gone the pruner may "
+        "remove that snapshot, the next send finds no common snapshot, and sends stop until you "
+        "intervene. To clear them (this tool changes no ZFS property itself)"
         + (", with `-r` reaching the descendants of a recursive dataset" if recursive else "")
         + f" (`-S` clears only local values; it does not touch received values):\n{commands}"
         + (

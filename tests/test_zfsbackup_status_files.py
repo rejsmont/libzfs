@@ -865,6 +865,23 @@ class TestReaderRecords:
                                      'consecutive_failures': 0})
         assert (rec.result, rec.consecutive_failures, rec.last_error) == (RESULT_OK, 0, None)
 
+    def test_an_incomplete_success_is_read_as_incomplete(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'send', 'dataset': 'a', 'destination': 'd', 'result': 'ok',
+                                     'incomplete': True})
+        assert rec.incomplete is True and rec.result == RESULT_OK
+
+    def test_an_old_file_without_the_key_reads_as_complete(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'send', 'dataset': 'a', 'destination': 'd', 'result': 'ok'})
+        assert rec.incomplete is False
+
+    @pytest.mark.parametrize('odd', [False, None, 'true', 'yes', 1, 1.0, 0, '', [], [True], {}, {'a': True}])
+    def test_a_malformed_incomplete_is_complete_and_the_record_survives(self, sdir, odd):
+        """Only the JSON `true` counts: a value another writer might mean differently never makes a record
+        look unfinished (which would make a successor re-send the pair), and never costs the record."""
+        (rec,) = self.records(sdir, {'kind': 'send', 'dataset': 'a', 'destination': 'd', 'result': 'ok',
+                                     'incomplete': odd, 'consecutive_failures': 0})
+        assert rec.incomplete is False and rec.result == RESULT_OK and rec.consecutive_failures == 0
+
     def test_only_the_first_2048_records_are_read(self, sdir):
         raw = [{'kind': 'snapshot', 'dataset': f'pool/{i}'} for i in range(STATUS_MAX_RECORDS + 50)]
         recs = self.records(sdir, *raw)
@@ -1029,6 +1046,57 @@ class TestWriterDocument:
         w.record(KIND_SNAPSHOT, 'pool/a', ok=True, warning=empty)
         w.flush(force=True)
         assert w.records[0].warning is None and 'warning' not in written(sdir)['records'][0]
+
+    def test_the_incomplete_field_defaults_to_false(self):
+        from zfsbackup.health import OutcomeRecord
+        assert OutcomeRecord(kind='send', dataset='pool/a').incomplete is False
+
+    def test_an_incomplete_success_is_in_the_file_only_when_set(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True)
+        w.record(KIND_SEND, 'pool/b', 'off', ok=True, incomplete=True)
+        w.flush(force=True)
+        a, b = written(sdir)['records']
+        assert 'incomplete' not in a
+        assert b['incomplete'] is True and b['result'] == 'ok'
+
+    def test_incomplete_is_replaced_by_each_attempt(self, make_writer):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        assert w.records[0].incomplete is True
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True)
+        assert w.records[0].incomplete is False
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        assert w.records[0].incomplete is True
+
+    def test_a_failure_is_never_incomplete(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        w.record(KIND_SEND, 'pool/a', 'off', ok=False, error='boom')
+        (rec,) = w.records
+        assert rec.incomplete is False and rec.result == 'error' and rec.consecutive_failures == 1
+        w.record(KIND_SEND, 'pool/b', 'off', ok=False, error='boom', incomplete=True)
+        assert [r.incomplete for r in w.records] == [False, False]
+        w.flush(force=True)
+        assert all('incomplete' not in r for r in written(sdir)['records'])
+
+    def test_incomplete_does_not_touch_the_grade_inputs(self, make_writer):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=False, error='boom')
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        (rec,) = w.records
+        assert (rec.result, rec.consecutive_failures, rec.last_success is not None) == ('ok', 0, True)
+
+    def test_incomplete_round_trips_through_the_reader(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        w.record(KIND_SEND, 'pool/b', 'off', ok=True)
+        w.flush(force=True)
+        res = read_status_dir(sdir)
+        assert res.problems == ()
+        a, b = res.statuses[0].records
+        assert (a.incomplete, b.incomplete) == (True, False)
 
     def test_a_warning_round_trips_through_the_reader(self, make_writer, sdir):
         w = make_writer()

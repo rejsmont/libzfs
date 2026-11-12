@@ -517,7 +517,7 @@ class TestTransportOutcomes:
                           common=[NegotiationFailed('server is reloading; retry later', reloading=True)])
         with caplog.at_level(logging.INFO, logger='zfsbackup.chain'):
             assert rig.run() is False
-        assert f'server fake://destination is reloading; skipping {DS} this cycle' in caplog.text
+        assert f'server fake://destination is reloading; skipping {DS} this attempt' in caplog.text
 
     def test_a_zfs_timeout_negotiate_is_not_logged_again(self, rig_factory, caplog):
         rig = rig_factory(listing(S1, S2), common=[
@@ -721,7 +721,7 @@ class TestUnreadableLocalAnchorFailsClosed:
         assert 'clear' not in rig.events and ('clear-anchor',) not in rig.events
         assert rig.send_snapshot.call_count == 0
         (rec,) = [r for r in caplog.records if 'cannot read the local anchor property' in r.getMessage()]
-        assert rec.levelno == logging.WARNING and 'the next cycle retries' in rec.getMessage()
+        assert rec.levelno == logging.WARNING and 'the next attempt retries' in rec.getMessage()
 
     def test_record_step_with_no_base_and_a_gone_snapshot_changes_nothing_and_says_why(
             self, seq, mocker, snapshot_presence, caplog):
@@ -756,7 +756,7 @@ class TestUnreadableLocalAnchorFailsClosed:
 
         def settle_warnings():
             return [r for r in caplog.records if r.levelno == logging.WARNING
-                    and 'the next cycle retries' in r.getMessage()]
+                    and 'the next attempt retries' in r.getMessage()]
 
         with caplog.at_level(logging.DEBUG, logger='zfsbackup.chain'):
             assert rig.run() is False
@@ -786,7 +786,7 @@ class TestUnreadableLocalAnchorFailsClosed:
         rig.sender._refusal_logged[permit_key] = 'the permit already said something'
         with caplog.at_level(logging.WARNING, logger='zfsbackup.chain'):
             assert rig.run() is False
-        assert [r for r in caplog.records if 'the next cycle retries' in r.getMessage()]
+        assert [r for r in caplog.records if 'the next attempt retries' in r.getMessage()]
         assert rig.sender._refusal_logged[permit_key] == 'the permit already said something'
 
     def test_settle_in_a_dry_run_does_not_read_the_anchor(self, rig_factory, mocker):

@@ -490,7 +490,9 @@ class TestRemoteBackupWorker:
         rig.remote.backup_dataset.assert_not_called()
         assert rig.built == []
 
-    def test_a_fresh_anchor_is_not_sent(self, monkeypatch):
+    def test_a_fresh_anchor_does_not_keep_a_scheduled_send_from_happening(self, monkeypatch):
+        """The schedule decides when a pair sends (every dispatch is forced past the anchor-age check; only the
+        re-run of a slot after a clock step back keeps it)."""
         rig = LoopRig(remote_config('offsite'), monkeypatch)
         anchor = MagicMock()
         anchor.name = 'autosnap_20240101120000'
@@ -498,8 +500,8 @@ class TestRemoteBackupWorker:
         rig.manager.get_own_anchor.return_value = anchor.name
         rig.manager.list_snapshots.return_value = [anchor]
         rig.run()
-        rig.remote.backup_dataset.assert_not_called()
-        assert [(k, kind) for k, kind, _, _ in rig.finished] == [(('pool/data', 'offsite'), 'not_due')]
+        rig.remote.backup_dataset.assert_called_once()
+        assert [(k, kind) for k, kind, _, _ in rig.finished] == [(('pool/data', 'offsite'), 'ok')]
 
     def test_a_pair_with_no_anchor_is_sent_with_its_dataset_info_remote_config_and_should_stop(self, monkeypatch):
         config = remote_config('offsite')
@@ -1379,10 +1381,11 @@ NTP_MESSAGE = 'system clock is behind the newest snapshot; check NTP'
 
 
 class TestFutureDatedAnchor:
-    """The remote worker skips a destination whose anchor is younger than the frequency. An anchor
-    dated beyond the clock tolerance is not 'young': the clock is wrong, and the destination is
-    due (`DatasetManager.clock_behind` logs the ERROR once per destination). Driven through the real
-    scheduler loop: each pair's sender runs `send_pair`'s due check."""
+    """A destination's anchor is READ for every dispatch, forced or not, and one dated beyond the clock tolerance
+    is announced (`DatasetManager.clock_behind` logs the ERROR once per destination): the clock is wrong. The
+    sends themselves are the schedule's: a young anchor does not stop one (only the re-run of a slot after a clock
+    step back keeps the anchor-age check; `test_zfsbackup_sendloop.py`). Driven through the real scheduler loop:
+    each pair's sender runs `send_pair`."""
 
     def build(self, monkeypatch, frozen_clock, anchors, *, check_interval=timedelta(minutes=5),
               destinations=('a', 'b')):
@@ -1401,10 +1404,10 @@ class TestFutureDatedAnchor:
         rig.run()
         return sorted(dest for _, dest in rig.remote.attempts)
 
-    def test_a_fresh_past_anchor_is_not_due(self, monkeypatch, frozen_clock, caplog):
+    def test_a_fresh_past_anchor_does_not_stop_the_send_and_is_no_error(self, monkeypatch, frozen_clock, caplog):
         rig = self.build(monkeypatch, frozen_clock, {'a': -20, 'b': -20})
         with caplog.at_level(logging.DEBUG):
-            assert self.cycle(rig) == []
+            assert self.cycle(rig) == ['a', 'b']
         assert not [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
 
     def test_an_old_anchor_is_due(self, monkeypatch, frozen_clock):
@@ -1426,23 +1429,27 @@ class TestFutureDatedAnchor:
     def test_each_destination_is_judged_by_its_own_anchor(self, monkeypatch, frozen_clock, caplog):
         rig = self.build(monkeypatch, frozen_clock, {'a': 600, 'b': -20})
         with caplog.at_level(logging.DEBUG):
-            assert self.cycle(rig) == ['a']
+            assert self.cycle(rig) == ['a', 'b']
         errors = [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
         assert len(errors) == 1 and 'anchor for a' in errors[0].getMessage()
 
-    def test_an_anchor_within_the_tolerance_is_just_young(self, monkeypatch, frozen_clock, caplog):
+    def test_an_anchor_within_the_tolerance_is_no_error(self, monkeypatch, frozen_clock, caplog):
         rig = self.build(monkeypatch, frozen_clock, {'a': 4, 'b': 4})
         with caplog.at_level(logging.DEBUG):
-            assert self.cycle(rig) == []
+            assert self.cycle(rig) == ['a', 'b']
         assert not [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
 
-    def test_just_past_the_tolerance_it_is_due(self, monkeypatch, frozen_clock):
+    def test_just_past_the_tolerance_it_is_announced(self, monkeypatch, frozen_clock, caplog):
         rig = self.build(monkeypatch, frozen_clock, {'a': 6, 'b': 6})
-        assert self.cycle(rig) == ['a', 'b']
+        with caplog.at_level(logging.DEBUG):
+            assert self.cycle(rig) == ['a', 'b']
+        assert len([r for r in caplog.records if NTP_MESSAGE in r.getMessage()]) == 2
 
-    def test_a_long_check_interval_widens_the_tolerance(self, monkeypatch, frozen_clock):
+    def test_a_long_check_interval_widens_the_tolerance(self, monkeypatch, frozen_clock, caplog):
         rig = self.build(monkeypatch, frozen_clock, {'a': 20, 'b': 20}, check_interval=timedelta(minutes=30))
-        assert self.cycle(rig) == []
+        with caplog.at_level(logging.DEBUG):
+            assert self.cycle(rig) == ['a', 'b']
+        assert not [r for r in caplog.records if NTP_MESSAGE in r.getMessage()]
 
     def test_the_error_comes_again_for_a_later_episode(self, monkeypatch, frozen_clock, caplog):
         rig = self.build(monkeypatch, frozen_clock, {'a': 600}, destinations=('a',))

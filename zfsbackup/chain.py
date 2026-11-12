@@ -359,11 +359,11 @@ class ChainSender:
             server_ds = self._server_info.get(key, (None, None))[1] or self._copy_placeholder
             self._logger.error(
                 f"{dsi.name} -> {destination}: the resume-token check has skipped the last "
-                f"{count} cycles in a row ({reason}); nothing is sent for this dataset until "
+                f"{count} attempts in a row ({reason}); nothing is sent for this dataset until "
                 "it passes, so the destination is falling behind. See the WARNINGs above for "
                 f"the cause. If {self._receiver}'s partial receive of this dataset is no longer "
                 f"wanted, abort it {self._on_receiver} with `zfs receive -A {server_ds}`; the next "
-                "cycle then sends fresh"
+                "attempt then sends fresh"
             )
 
     def seed_token_skips(self, counts: Dict[Tuple[str, str], int]) -> None:
@@ -514,7 +514,7 @@ class ChainSender:
                 self._mark_retryable(dsi.name, destination)
                 self._logger.info(
                     f"{self._peer(transport)} is {_retry_word(e, self._busy_prefix)}; "
-                    f"skipping {dsi.name} this cycle"
+                    f"skipping {dsi.name} this attempt"
                 )
             return False
         key = (dsi.name, destination)
@@ -539,7 +539,7 @@ class ChainSender:
                 self._logger.error(
                     f"{self._peer(transport)} reports {common_snap_name!r} as the common "
                     f"snapshot of {dsi.name}, which is not a managed local snapshot; "
-                    "skipping this cycle rather than sending a full stream"
+                    "skipping this attempt rather than sending a full stream"
                 )
                 return False
 
@@ -608,7 +608,7 @@ class ChainSender:
             f"{dsi.name} -> {destination}: the {self._copy_noun} {name} is a {copy} copy but this "
             f"dataset is now sent {mode}; nothing is sent. {self._on_receiver_capitalized()}, "
             f"move the old copy aside with `zfs rename {name} <a name outside the backup target>` "
-            f"(see {self._rename_doc}); the next cycle sends a full {mode} stream"
+            f"(see {self._rename_doc}); the next attempt sends a full {mode} stream"
         ))
         return False
 
@@ -676,7 +676,7 @@ class ChainSender:
                 f"but none of them is a snapshot {self._sender} still has, and a full stream "
                 f"cannot replace it, so nothing is sent. To keep the {self._copy_noun}, "
                 f"{self._on_receiver}: zfs rename {server_ds} <a name outside the backup target> "
-                f"(the next cycle sends a full stream; see {self._rename_doc})."
+                f"(the next attempt sends a full stream; see {self._rename_doc})."
                 + self._rejoin_pointer()
             ))
             return None
@@ -690,7 +690,7 @@ class ChainSender:
             self._log_warning_once(unknown_key, (
                 f"{dsi.name} -> {destination}: the {self._copy_noun} {server_ds} could not list "
                 f"which of its snapshots are newer than {common_snap.name}, so nothing is sent "
-                "and no anchor is written this cycle; the next cycle retries"
+                "and no anchor is written this attempt; the next attempt retries"
             ))
             return None
         self._forget_refusal(unknown_key)
@@ -718,7 +718,7 @@ class ChainSender:
                 self._log_warning_once(unreadable_key, (
                     f"{dsi.name} -> {destination}: cannot read the local anchor property "
                     f"org.zfsbackup:anchor.{destination} ({e}), which decides whether "
-                    f"{self._receiver} may discard its newer snapshot; nothing is sent this cycle"
+                    f"{self._receiver} may discard its newer snapshot; nothing is sent this attempt"
                 ))
                 return None
         self._forget_refusal(unreadable_key)
@@ -745,10 +745,10 @@ class ChainSender:
             f"({shown}), for example after a rollback or an in-place restore of this dataset, "
             f"or snapshots {self._taken_on_receiver}. Sending would make {self._receiver} "
             f"destroy them, so nothing is sent. To keep them, {self._on_receiver}: "
-            f"zfs rename {server_ds} <a name outside the backup target> (the next cycle "
+            f"zfs rename {server_ds} <a name outside the backup target> (the next attempt "
             f"sends a full stream; see {self._rename_doc}). If they are "
             f"expendable: zfs destroy {server_ds}@{destroy} "
-            "(the next cycle continues)."
+            "(the next attempt continues)."
             + self._rejoin_pointer()
         ))
         return None
@@ -907,7 +907,7 @@ class ChainSender:
                 self._mark_retryable(dsi.name, destination)
                 self._logger.info(
                     f"stop requested; {dsi.name} -> {destination} continues to "
-                    f"{latest.name} next cycle"
+                    f"{latest.name} next attempt"
                 )
                 # Cleanly settled on the anchor: the kept pin is not needed.
                 self.local_manager.clear_inflight(dsi, destination)
@@ -922,7 +922,7 @@ class ChainSender:
                     self._mark_retryable(dsi.name, destination)
                     self._logger.info(
                         f"{self._peer(transport)} is {_retry_word(e, self._busy_prefix)}; "
-                        f"{dsi.name} continues next cycle"
+                        f"{dsi.name} continues next attempt"
                     )
                 return False
             latest = snapshots[0]
@@ -933,7 +933,7 @@ class ChainSender:
                     self._logger.error(
                         f"{self._peer(transport)} reports {common_name!r} as the common snapshot of "
                         f"{dsi.name}, which is not a managed local snapshot; skipping the rest "
-                        "of this cycle rather than sending a full stream"
+                        "of this attempt rather than sending a full stream"
                     )
                     return False
             discard = self._rollback_permit(dsi, destination, common_snap, snapshots)
@@ -968,7 +968,7 @@ class ChainSender:
                     if sent_any:
                         self._logger.info(
                             f"stop requested; {dsi.name} -> {destination} continues to "
-                            f"{chain[-1].name} next cycle"
+                            f"{chain[-1].name} next attempt"
                         )
                         # Settled on the anchor of the step just sent; the pin
                         # kept between steps is not needed any more.
@@ -1194,7 +1194,7 @@ class ChainSender:
             self._log_warning_once(read_key, (
                 f"{dsi.name} -> {destination}: cannot read the local anchor property "
                 f"org.zfsbackup:anchor.{destination} ({e}) after sending {sent.name}; no anchor "
-                f"is written or cleared and the in-flight pin is kept, so the next cycle "
+                f"is written or cleared and the in-flight pin is kept, so the next attempt "
                 f"negotiates again"
             ))
             return _ANCHOR_FAILED
@@ -1239,7 +1239,7 @@ class ChainSender:
                         f"{dsi.name}@{sent.name} was destroyed while it was being sent to "
                         f"{destination}; {self._receiver} has it but {self._sender} no longer does. "
                         + (f"Putting the anchor back on {restore}. " if restore else "")
-                        + "Stopping; the next cycle negotiates again"
+                        + "Stopping; the next attempt negotiates again"
                     )
                     if restore:
                         self.local_manager.set_anchor(dsi, destination, restore)
@@ -1313,7 +1313,7 @@ class ChainSender:
                 f"{dsi.name} -> {destination}: cannot read the local anchor property "
                 f"org.zfsbackup:anchor.{destination} ({e}), so the anchor and the in-flight "
                 f"pin are left as they are although {latest.name} is {self._at_receiver}; "
-                "the next cycle retries"
+                "the next attempt retries"
             ))
             return False
         self._forget_refusal(read_key)
@@ -1460,7 +1460,7 @@ class ChainSender:
         except Exception as e:
             self._logger.warning(
                 f"cannot check the resume token of {dsi.name}: {e}; skipping this "
-                f"cycle rather than risk discarding {self._receiver}'s partial progress "
+                f"attempt rather than risk discarding {self._receiver}'s partial progress "
                 "with a fresh send"
             )
             self._token_skipped(dsi, destination, f"cannot check the token: {e}")

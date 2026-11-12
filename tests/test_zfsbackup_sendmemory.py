@@ -25,6 +25,7 @@ import copy
 import json
 import multiprocessing
 import pickle
+import time
 import sys
 import threading
 
@@ -443,6 +444,22 @@ class TestPickling:
         assert back.pending_active('copy', 100, 20.0) is True
         assert back.expiry_checked_at == 50.0
         assert back.claim_expiry_check(100.0, 60.0) is False, "the claim window survives"
+
+    def test_claims_are_not_pickled_but_the_pending_map_is(self):
+        """A claim means "held by a thread of this process": a copy in another process starts with none, and the
+        original keeps its own."""
+        original = self.populated()
+        assert original.claim(['held-here', 'and-here']) is True
+        back = pickle.loads(pickle.dumps(original))
+        assert back.claim(['held-here', 'and-here']) is True, 'free in the copy'
+        assert original.claim(['held-here']) is False, 'still held in the original'
+        assert back.pending_active('copy', 100, 20.0) is True
+
+    def test_pickling_does_not_release_the_originals_claims(self):
+        original = SendMemory()
+        original.claim(['x'])
+        pickle.dumps(original)
+        assert original.claim(['x']) is False
 
     def test_the_lock_is_recreated_free_and_distinct(self):
         original = self.populated()
@@ -1047,6 +1064,8 @@ class TestMemoryInARealChild:
             mem.incr(TOKEN_SKIPS, ('pool/a', 'offsite'))
             mem.claim_expiry_check(100.0, 100.0)
             mem.note(WAITING, ('pool/p', 'offsite'))
+            mem.claim(['held-in-parent'])
+            mem.pending_put('copy-in-parent', time.monotonic())
         return worker
 
     @pytest.mark.parametrize('method', START_METHODS)
@@ -1060,6 +1079,9 @@ class TestMemoryInARealChild:
         assert record['preseeded_expiry'] == 100.0
         assert record['expiry_reclaimed_inside_window'] is False
         assert record['waiting'] == [['pool/p', 'offsite']]
+        if method != 'fork':        # a forked child inherits the whole address space, the claim included
+            assert record['parents_claim_is_free'] is True, 'a claim belongs to a thread of the parent: not pickled'
+        assert record['pending_carried'] is True, 'the pending map is carried'
         # the lock and the aliases
         assert record['lock_was_free'] is True
         assert record['waiting_is_the_memorys_latch'] is True

@@ -181,6 +181,33 @@ class TestRealRemoteWorker:
         assert records['pool/b'].result == 'ok'
         assert events(rec2) == [], 'a pair attempted in the current slot is not re-sent after a reload'
 
+    def test_a_chain_cut_by_a_reload_is_sent_again_by_the_successor_but_a_complete_one_is_not(self, launch, method):
+        """`pool/a`'s chain was cut (a retryable DONE: recorded as an `incomplete` success), `pool/b` completed.
+        Both were attempted a moment ago, yet the successor catches `pool/a` up at once (the cut attempt did not
+        serve its slot) and leaves `pool/b` alone until its next slot."""
+        epoch = ReloadEpoch()
+        first, rec1, _ = launch(method, {'pool/a': 'cut', 'pool/b': 'ok'}, epoch=epoch, tag='1')
+        assert wait_for(lambda: (st := status(launch.sdir, first.pid)) is not None and len(st.records) == 2, bound(90))
+        records = {r.dataset: r for r in status(launch.sdir, first.pid).records}
+        assert records['pool/a'].incomplete is True and records['pool/a'].result == 'ok'
+        assert records['pool/b'].incomplete is False
+        raw = json.loads((launch.sdir / f'{NAME}.json').read_text())['records']
+        assert {r['dataset']: r.get('incomplete') for r in raw} == {'pool/a': True, 'pool/b': None}
+        epoch.set(1)
+        first.join(bound(60))
+        assert first.exitcode == WORKER_EXIT_RELOAD
+        second, rec2, _ = launch(method, {'pool/a': 'ok', 'pool/b': 'ok'}, epoch=epoch, born=1, tag='2')
+        assert wait_for(lambda: 'done:pool/a' in events(rec2), bound(90)), \
+            'the successor did not catch the cut pair up'
+        # a later heartbeat: at least one more tick looked at `pool/b` and found it served
+        written = status(launch.sdir, second.pid).updated_at
+        assert wait_for(lambda: (st := status(launch.sdir, second.pid)) is not None and st.updated_at > written,
+                        bound(30)), 'no heartbeat from the second incarnation'
+        assert events(rec2) == ['start:pool/a', 'done:pool/a'], 'a complete DONE is not re-sent after a reload'
+        records = {r.dataset: r for r in status(launch.sdir, second.pid).records}
+        assert records['pool/a'].incomplete is False and records['pool/a'].result == 'ok'
+        assert records['pool/b'].incomplete is False
+
     def test_the_heartbeat_moves_updated_at_while_the_worker_is_idle(self, launch, method):
         worker, rec, stop = launch(method, {'pool/a': 'ok'})
         assert wait_for(lambda: status(launch.sdir, worker.pid) is not None

@@ -336,7 +336,7 @@ def _anchor_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
                 f"datasets[{name}] no longer sends to {dest!r}: its "
                 f"org.zfsbackup:anchor.{dest} property stays behind and keeps "
                 "pinning that snapshot against pruning; clear it with "
-                f"`zfs inherit org.zfsbackup:anchor.{dest} {shlex.quote(name)}` once it is "
+                f"`zfs inherit -S org.zfsbackup:anchor.{dest} {shlex.quote(name)}` once it is "
                 "no longer needed"
             )
     for dest in sorted(set(old_dest) - set(new_dest) - covered):
@@ -346,7 +346,7 @@ def _anchor_warnings(old: BackupConfig, new: BackupConfig) -> List[str]:
             f"destination {dest!r} is deleted: datasets that sent to it keep "
             f"their org.zfsbackup:anchor.{dest} property, which keeps pinning "
             "its snapshot against pruning until you clear it with "
-            f"`zfs inherit org.zfsbackup:anchor.{dest} <dataset>`"
+            f"`zfs inherit -S org.zfsbackup:anchor.{dest} <dataset>`"
         )
     return messages
 
