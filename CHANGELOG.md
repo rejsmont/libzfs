@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.0.0rc6 (2026-11-12)
+
+Recursive datasets send their whole tree, and the remote worker sends several pairs at once.
+
+### Compatibility
+
+- **Wire protocol 1** and the **config schema head** are unchanged: no migration. A new `negotiate` refusal reason,
+  `name_too_long`, is additive (an rc5 client logs its `error` text like any other 400).
+- **Destination names must form ZFS property names.** `validate_config` now refuses a destination whose name is
+  empty, longer than 232 characters, or contains anything but letters, digits and `- _ . :`. The daemon refuses to
+  start on, or reload to, such a database. Such a destination never worked (its `org.zfsbackup:anchor.<name>`
+  could not be set); rename it with `zfsbackup-config rename destination` before upgrading.
+- **Send flags, `raw` semantics and the server's dataset layout** are unchanged. Each descendant of a recursive
+  dataset is its own copy at `T/<client_id>/<pool>/<path>`, laid out like any configured dataset.
+- **First run after the upgrade:** the children of every enabled recursive dataset with `remote:` are new pairs
+  and get a full send each (raw or plain, decided per child), after their parent's copy is confirmed.
+- **Worker status files** gain an optional `incomplete` flag (schema 1, additive); rc5 ignores it.
+- `zfsbackup-check.service` gets `TimeoutStartSec=150`.
+
+### Changes
+
+- **Recursive datasets send every descendant.** Until now `recursive: true` snapshotted the whole tree but sent
+  only the configured dataset. Every filesystem and volume below an enabled recursive dataset with `remote:` is
+  now its own dataset × destination pair, with the parent's settings. An explicit config for a descendant wins; a
+  disabled or recursive configured descendant ends the walk. A child waits until its parent's copy is confirmed in
+  the current run. Send decisions and `check` read a dataset's own anchor, never an inherited one. See
+  `zfsbackup/README.md`, "Recursive datasets".
+- **Backup copies are never sources.** A dataset carrying zfsbackup's copy markers (local, received or inherited),
+  or a receive target, is never snapshotted, sent or pruned as part of a recursive source tree: the recursive
+  snapshot is one atomic `zfs snapshot a@N b@N …` over the source datasets only, and the recursive prune keeps every
+  snapshot name a copy below holds. The CLI (`set`, `unset`, `edit`, `import`, `rename dataset`) refuses a config
+  that puts a backup copy below a newly recursive dataset; `--force` overrides with warnings.
+- **Parallel sends.** The remote worker schedules each dataset × destination pair on its own slots (a stable
+  per-pair offset spreads them over the destination's period) and runs up to 4 sends at once, 2 per destination;
+  an ancestor and its descendant never run together on one destination. A retryable failure is retried after
+  60/120/300 s, any other at the next slot or within an hour; a missed slot is caught up within minutes; a chain
+  cut by a reload or stop is continued at start. See `zfsbackup/README.md`, "How sends are scheduled".
+- **Stale anchors no longer delay a send**: the schedule decides when a pair sends. The CLI's warning after a
+  destination's URL or target changes says so, and prints `zfs inherit -S`.
+- **`check`** grades the children of recursive datasets per destination, reads in batches per parent under a
+  time limit (`--time-limit`, `--per-call-timeout`), warns about skipped backup copies and failed discoveries, and
+  caps `--nagios` output (`--nagios-max-bytes`).
+- **`rename destination`** also moves the anchors and pins of a recursive dataset's descendants.
+- **Fixed:** two senders creating the same missing local container could refuse it as unowned (OpenZFS lists a
+  new dataset before its properties read back).
+- **libzfseasy:** `zfs.snapshot.many` (one atomic multi-dataset snapshot), `property_sources(properties=[…])`,
+  `snapshot(recursive=True)` runs the snapshot before listing, every command puts options before operands (BSD
+  getopt), child pipes are closed on every path, and a forked process refuses to use its parent's child
+  (`ZFSForkError`).
+
 ## 1.0.0rc5 (2026-11-09)
 
 One backup dataset for remote clients and this host's own local copies.
