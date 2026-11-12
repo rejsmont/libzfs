@@ -822,6 +822,24 @@ echo "${BOLD}=================================================================${
 # ── Phase 1: provision VMs ──
 ensure_vm "$SERVER_VM"
 ensure_vm "$CLIENT_VM"
+
+# A VM that was running while the host slept can come back hours behind with NTP not yet
+# resynced (rc6 checks: the server was 3h13m slow, so enrollment refused the client's fresh
+# certificate as "not valid until ..."). Step any VM more than 30 s off the host's clock.
+sync_clock() {
+    local vm="$1" host_now vm_now skew
+    host_now="$(date -u +%s)"
+    vm_now="$(mexec "$vm" date -u +%s | tr -d '[:space:]')"
+    [ -n "$vm_now" ] || die "could not read the clock of $vm"
+    skew=$(( vm_now - host_now )); [ "$skew" -lt 0 ] && skew=$(( -skew ))
+    if [ "$skew" -gt 30 ]; then
+        info "$vm clock is ${skew}s off the host's; stepping it and restarting time sync"
+        msh "$vm" "date -u -s @$(date -u +%s) >/dev/null; systemctl restart chrony 2>/dev/null || systemctl restart systemd-timesyncd 2>/dev/null; true"
+    fi
+}
+sync_clock "$SERVER_VM"
+sync_clock "$CLIENT_VM"
+
 install_stack "$SERVER_VM"
 install_stack "$CLIENT_VM"
 
