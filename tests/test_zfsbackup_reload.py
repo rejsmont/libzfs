@@ -5150,7 +5150,12 @@ class TestRealDaemonSupervisorBatchB:
         info = d.info()
         assert info.rejected is None and info.target is None
         assert d.worker_pids() == before
-        assert "is identical to running generation 0" in d.log()
+        # _accept_identical publishes applied= BEFORE it logs the line, so a
+        # slow runner can read the pid file first: wait for the line.
+        d.wait_for_regex(
+            r"configuration generation 2 is identical to running generation 0",
+            HUP_TIMEOUT + 5,
+        )
         assert "Reloaded" not in d.log()
 
     # -- B3 ----------------------------------------------------------------
