@@ -1054,8 +1054,11 @@ class TestMemoryInARealChild:
     memory's latches; the child then uses it from threads."""
 
     @staticmethod
-    def worker(preseed=True):
-        worker = MemoryProbeWorker(_worker_config(), multiprocessing.Event(), 'INFO')
+    def worker(method, preseed=True):
+        # The event comes from the child's own context: a SemLock made in the default context (fork on
+        # Linux before 3.14) cannot be handed to a spawn or forkserver child.
+        stop = multiprocessing.get_context(method).Event()
+        worker = MemoryProbeWorker(_worker_config(), stop, 'INFO')
         mem = worker._mem()
         if preseed:
             mem.note(CLOCK, ('pool/a', 'snapshot', 's1'))
@@ -1070,7 +1073,7 @@ class TestMemoryInARealChild:
 
     @pytest.mark.parametrize('method', START_METHODS)
     def test_the_child_sees_the_memory_and_uses_it(self, tmp_path, method):
-        record = _run_child(self.worker(), tmp_path, method)
+        record = _run_child(self.worker(method), tmp_path, method)
         assert record['memory_type'] == 'SendMemory'
         # what the parent noted before the start
         assert record['preseeded_latch'] is True
@@ -1096,14 +1099,14 @@ class TestMemoryInARealChild:
 
     @pytest.mark.parametrize('method', START_METHODS)
     def test_the_childs_writes_do_not_reach_the_parent(self, tmp_path, method):
-        worker = self.worker(preseed=False)
+        worker = self.worker(method, preseed=False)
         _run_child(worker, tmp_path, method)
         assert worker._mem().count(TOKEN_SKIPS, 'child') == 0
         assert not worker._mem().noted(CLOCK, ('child', 0))
 
     @pytest.mark.parametrize('method', START_METHODS)
     def test_a_child_of_an_empty_memory_starts_empty(self, tmp_path, method):
-        record = _run_child(self.worker(preseed=False), tmp_path, method)
+        record = _run_child(self.worker(method, preseed=False), tmp_path, method)
         assert record['preseeded_latch'] is False
         assert record['preseeded_count'] == 0
         assert record['preseeded_expiry'] is None
