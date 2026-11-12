@@ -421,7 +421,15 @@ ck_expr() { jfile /tmp/zfsb-ck.out "$1"; }
 ck_anchor_states() { ck_expr '",".join(sorted(e["subject"] + ":" + e.get("peer", "") + "=" + e["state"] for e in d["entries"] if e["source"] == "anchor"))' | tr -d '[:space:]'; }
 
 loglines() { msh "wc -l < '$LOG'" | tr -d '[:space:]'; }
-log_since() { msh "tail -n +$(( $1 + 1 )) '$LOG'"; }
+# The slice can be tens of thousands of lines: streamed through `multipass exec` stdout on macOS, the host client
+# was seen spinning for hours after the guest command had exited (rc6 checks). Move it with `multipass transfer`.
+log_since() {
+    local out="$WORK/log_since.txt"
+    msh "tail -n +$(( $1 + 1 )) '$LOG' > /tmp/zfsb-log-since.txt; chmod 0644 /tmp/zfsb-log-since.txt" || return 1
+    rm -f "$out"
+    multipass transfer "$LOCAL_VM:/tmp/zfsb-log-since.txt" "$out" >/dev/null 2>&1 || return 1
+    cat "$out"
+}
 
 # config: write_config <snapshot frequency> [<destination retention items, e.g. '"1m": "2m"'>]
 # The destination's retention overrides the dataset's for the COPIES (the config stamped on them); empty = inherit.
