@@ -132,7 +132,7 @@
 #        M4  the client unmounts and UNLOADS the key: sends continue
 #        M5  raw: false with the key unloaded: ONE ERROR, nothing sent (not even a negotiate)
 #        M6  a plain server copy switched to raw: ONE ERROR with the `zfs rename` hint, nothing sent; after the operator renames the
-#            copy aside the next cycle sends a full raw stream
+#            copy aside the next attempt sends a full raw stream
 #        M7  raw: true on an unencrypted dataset: ONE ERROR, nothing sent
 #        M8  an ENCRYPTED server target receives a plain dataset (the receive creates the leaf; the copy inherits the
 #            target's encryption, keystatus=available)
@@ -1150,10 +1150,10 @@ fi
 throttle_off
 
 echo
-step "SCENARIO F — reload the SERVER daemon during an inbound receive (512 MiB, throttled to 100 Mbit)"
+step "SCENARIO F — reload the SERVER daemon during an inbound receive (512 MiB, throttled to 50 Mbit)"
 cnt_f="$(server_snaps | count)"
 append_random 512 big_f.bin || fail "could not write the 512 MiB file"
-throttle_on 100mbit
+throttle_on 50mbit   # 100 Mbit was too short a window when the file spans two snapshots (rc6 checks)
 if wait_for_proc recv_running 240; then
     pass "a zfs receive is running on the server"
     mark_f="$(loglines "$SERVER_VM")"; mark_fc="$(loglines "$CLIENT_VM")"
@@ -2797,7 +2797,7 @@ fi
 #   M4  the client's key is UNLOADED (`zfs unmount` + `zfs unload-key`): sends continue (raw does not need the key)
 #   M5  `raw: false` on that dataset with the key unloaded: ONE ERROR, nothing sent (no negotiate); back to auto: it goes out
 #   M6  an existing PLAIN server copy (raw: false) is switched to raw (auto): ONE ERROR with the `zfs rename` hint, nothing sent;
-#       after the operator renames the copy aside the next cycle sends a full raw stream
+#       after the operator renames the copy aside the next attempt sends a full raw stream
 #   M7  `raw: true` on an unencrypted dataset: ONE ERROR, nothing sent
 #   M8  an ENCRYPTED server target receives a plain client dataset (R0: the receive creates the leaf; the copy inherits the
 #       target's encryption and its key is available)
@@ -3032,7 +3032,7 @@ else
     echo "    hint: $hint"
     hsrc="$(printf '%s' "$hint" | awk '{print $3}')"
     check "(M6) the hint renames the server copy to a name OUTSIDE the backup target: zfs rename <copy> <a name outside the backup target>" "$SW" "$hsrc"
-    check_has "(M6) ... and says the next cycle sends a full raw stream" "the next cycle sends a full raw stream" "$clog"
+    check_has "(M6) ... and says the next attempt sends a full raw stream" "the next attempt sends a full raw stream" "$clog"
     M6_ASIDE="${SERVER_POOL}/m6-msw-plain"           # outside ${TARGET_DS}: a name inside it would be a received dataset the pruner takes over
     mark_c="$(loglines "$CLIENT_VM")"
     msh "$SERVER_VM" "zfs rename '$hsrc' '$M6_ASIDE'" && pass "(M6) the operator renamed the copy aside, out of the target tree" || fail "(M6) the rename failed"
