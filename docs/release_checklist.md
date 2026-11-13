@@ -43,9 +43,10 @@ on the release branch after the last merge. Every item that touches a VM uses on
       Record the result (pass/fail counts, date, OpenZFS version) in `docs/two_vm_backup_report.md`.
 - [ ] `scenarios/test_config_permissions.sh` (the group-operator permission model).
 - [ ] Install scenario on fresh Ubuntu 22.04 (systemd 249, the `pre-253.conf` drop-in) and 24.04 (systemd 255):
-      `scenarios/test_install.sh`, including the upgrade step (I15) from the previous release
-      (`OLD_REF=<previous release tag>`; the default is `v1.0.0rc1`, the last single-wheel release) and the
-      in-place upgrade (I16).
+      `scenarios/test_install.sh`, including the upgrade step (I15) and the in-place upgrade (I16). I15 upgrades
+      from a single-wheel tree to the split wheels, so keep the default `OLD_REF=v1.0.0rc1` (the last single-wheel
+      release); a later tag builds two wheels and the script refuses it. The upgrade between two split-wheel
+      versions under a running daemon is I16.
 
 ## 4. Package
 

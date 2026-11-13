@@ -113,6 +113,46 @@ Notes:
 
 ---
 
+## Release 1.0.0rc6
+
+**Run:** 2026-11-12/13, the 1.0.0rc6 tree (sender rework: Track A, recursive datasets whose children are sent as
+their own pairs, backup copies never snapshotted, sent or pruned as sources; Track B, the remote worker's
+scheduler with up to four sender threads), `SRC_REF=edb21c1` (the release commit), `zfsb-server` + `zfsb-client`
+(Ubuntu 26.04, OpenZFS 2.4.1). Harness: **1083 passed, 0 failed**, every scenario including the new T1–T5
+(recursive trees, an encrypted grandchild, a destroyed child, a backup copy planted below a recursive dataset).
+
+An earlier complete run reached 1081 / 2, both the harness's: M6 still looked for the pre-Track-B wording ("the
+next cycle sends a full raw stream"; it is "the next attempt" now), and scenario F's reload landed after the
+stream it meant to cut, because a 512 MiB file that spans two snapshots splits into a long and a short step and
+100 Mbit left too short a window for the second; F now throttles to 50 Mbit. A rerun on reused VMs found one more:
+the reset now removes the workers' status directory (a previous run's `remote-backup-worker.json` kept the
+server's `check` at WARN). Four other runs were invalid and are not counted: the server VM's kernel ZFS wedged
+after an OOM with seven VMs up (no more than two run at once now), multipassd lost track of a running VM twice
+(`sudo launchctl kickstart -k system/com.canonical.multipassd`), and the host's clamshell sleep froze a run
+twice (`caffeinate` does not prevent it, on battery or on AC; keep the lid open).
+
+The other release checks, all on the release code:
+- the parallel-senders scenario (`test_parallel_senders.sh`, new: up to four senders at once to local and remote
+  destinations, caps, reload and stop with streams in flight, throughput): **389 / 0**;
+- the local-destination scenario: **294 / 0** (its `log_since` now copies the log slice with `multipass
+  transfer`: streaming ~67 000 lines through `multipass exec` wedged the host client for five hours);
+- the OpenZFS matrix with the real-ZFS tier on 2.1.5, 2.2.2, 2.3.9 and 2.4.1: **331 passed, 1 skipped** on each
+  (the skip is the mount test that cannot mount the server copy on the VM), and the format captures replayed;
+- `test_config_permissions.sh`: **321 / 0** (the first run's one failure was the script's: its "no 'group does not
+  exist' warning" check matched Track A's new "pool ... is not imported (or does not exist)" warning);
+- the install scenario on Ubuntu 22.04 and 24.04: **468 / 0**, with I15 from `v1.0.0rc1` (I15 upgrades from a
+  single-wheel tree, so it cannot start from rc5; the release checklist said otherwise and is corrected) and I16,
+  the in-place upgrade under a running daemon;
+- the `.deb` scenario on Ubuntu 26.04 and Debian 13 (install, enable, upgrade, trigger restart, reinstall, downgrade, purge): **241 / 0**;
+- CI on PR #26: every job green, the mocked suite about 27 900 tests on Python 3.11–3.15, SQLAlchemy 2.0 and 2.1,
+  macOS and the Debian 13 floors, plus the latest-dependencies and `.deb` workflows. One py3.13 run had failed a
+  real-daemon reload test: `_accept_identical` publishes `applied=` before it logs "is identical to running
+  generation", so a slow runner read the pid file first; the test now waits for the line.
+
+Not run: the mocked suite on `zfsb-ci`'s system Pythons (no `zfsb-ci` VM this time).
+
+---
+
 ## Release 1.0.0rc5
 
 **Run:** 2026-11-09, the 1.0.0rc5 tree (a local destination may share the server's target; the server reserves the
