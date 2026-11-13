@@ -6,7 +6,7 @@ An automated ZFS snapshot management daemon with configurable frequency and rete
 
 - 🕐 **Automated Snapshots**: Take snapshots at configurable intervals (minutes, hours, days)
 - 📋 **Retention Policies**: Define tiered retention rules based on snapshot age
-- 🔄 **Recursive Snapshots**: Support for recursive dataset snapshots
+- 🔄 **Recursive Datasets**: one entry covers a dataset's whole subtree: snapshotted and pruned together, and every filesystem and volume below it sent as a backup of its own (see [Recursive datasets](#recursive-datasets))
 - 🗑️ **Automatic Cleanup**: Automatically purge expired snapshots based on retention rules
 - 🔍 **Dry Run Mode**: Test configuration without making changes
 - 💾 **Remote and Local Backups**: send snapshots to another host over mutually authenticated TLS, or to a dataset or pool on the same host (a USB disk) with a direct `zfs send | zfs receive`
@@ -174,9 +174,11 @@ change always arrives within about 10 s even when no signal is sent. What happen
 - **Reload is checked first.** The daemon reads the new configuration, validates it and builds its dataset
   list before switching. If anything is wrong, it **rejects** that configuration, logs why, and keeps
   running the previous one.
-- **Nothing is interrupted.** Each worker switches at its next safe point, between datasets or between
-  destinations. A transfer in progress always finishes first. The daemon logs a warning if a switch is
-  still waiting after a minute.
+- **Nothing is interrupted.** Each worker switches at its next safe point: between datasets for the snapshot and
+  pruning workers; for the remote worker, between the steps of each running send (see [How sends are
+  scheduled](#how-sends-are-scheduled)). A stream in progress always finishes first, and the new worker starts only
+  after every running send has reached a step boundary. The daemon logs a warning if a switch is still waiting after
+  a minute.
 - **`--dry-run` stays in force** across reloads.
 
 After a change, `zfsbackup-config` reports what the daemon did. It waits up to 3 s for an answer, which
@@ -257,13 +259,24 @@ from the name, so the next send is likely a full one. `--clear-stale-props` remo
 `org.zfsbackup:*` properties. It is refused up front when the new dataset doesn't exist in ZFS yet (if
 you are about to `zfs rename`, those properties follow it). If a daemon is running, the rename itself is
 still saved but the properties are left alone: the command prints the `zfs inherit` commands to run
-after stopping the daemon and exits 1. The one exception is a daemon the CLI signalled (Linux only, see
+after stopping the daemon and exits 1 (`-S` on the anchors and pins, see below). The one exception is a daemon the CLI signalled (Linux only, see
 above) that reports the rename applied within `--reload-wait`: then the properties are cleared. To rename
 the ZFS dataset and the configuration together, `zfs rename` the dataset (its properties follow it) and run
 `zfsbackup-config rename dataset`, which then finds nothing stale. If you renamed the ZFS dataset by hand with
 `zfs rename`, run `systemctl restart zfsbackup`: the `org.zfsbackup:config` property is synced only when
 the snapshot worker starts or the configuration changes, so `systemctl reload` with an unchanged
 configuration does not re-sync it.
+
+Renaming a **recursive** dataset (`rename dataset`, with `--force` when it sends anywhere) is also checked against
+the backup copies below it, like any change that makes a dataset recursive: it is refused (exit 1, nothing
+written) when a copy is found below the new name, unless `--force-copies` (a separate flag, because `--force`
+already means "accept a full send"; see [Backup copies below a recursive
+dataset](#backup-copies-below-a-recursive-dataset)). `rename dataset` also says that the dataset's descendants are
+sent as copies of their own **below** the parent's copy on each destination, so the single `zfs rename` of the
+parent's copy that it prints moves them too, and that each descendant's copy records its own
+`org.zfsbackup:source_dataset`, which you then re-label (the CLI prints the `zfs set` pattern; on a server the
+receiver refuses a child whose recorded source differs from the new name). A local destination's copy path is
+printed the same way. The CLI runs none of these commands.
 
 `rename destination` and `--clear-stale-props` change ZFS user properties, so they need ZFS write
 rights on the datasets involved: run them as root, or grant them with
@@ -280,9 +293,33 @@ rights on the datasets involved: run them as root, or grant them with
 If `anchor.<new>` already exists with a different value (left over from an earlier destination of that
 name), it is overwritten and both values are printed; the snapshot it used to name is no longer pinned
 by it. The daemon protects the snapshot named by *every* local or received anchor property, so keep the
-old anchor until the first send to the new name has succeeded, then clear it with the `zfs inherit`
-commands the CLI prints. The running daemon reloads after a rename like after any other change. Both
-renames support `--dry-run`.
+old anchor until the first send to the new name has succeeded, then clear it with the `zfs inherit -S`
+commands the CLI prints (`-S` clears only a **local** value; a plain `zfs inherit` would merely hide a received
+anchor, which the pruner still protects, so the CLI uses `-S` for every anchor and pin it advises you to clear).
+Only **local** anchors are copied: a received one is another host's progress, and copying it would turn it into
+this host's own evidence. For a **recursive** dataset that sends to the old name, the same copy is made on **each
+of its descendants** that carries a local `anchor.<old>` or `inflight.<old>` (they are sent as datasets of their own
+and have their own anchors), under the same lock and with the same undo commands. If a parent's descendants cannot
+be listed, the rename still goes through, with a `warning: NOT handled` and the commands to move that subtree's
+properties by hand (`-r` reaches the descendants; check that no backup copy below carries an anchor you want to
+keep first). The running daemon reloads after a rename like after any other change. Both renames support
+`--dry-run`.
+
+**Changing where a destination points.** Anchors are keyed by the destination's **name**, not its URL, so after
+`set 'destinations.<name>.url' …` (or `edit`) the properties `org.zfsbackup:anchor.<name>` on every dataset that
+sends there, the descendants of recursive datasets included, still describe the **old** copy. `set` and `edit`
+print a warning when a URL (or a `zfs:` target) changes and datasets send to it. If the destination now points to a
+**different** copy (another server or pool), the stale anchor no longer makes a send wait (the schedule decides when
+a pair sends, and the sender does not skip it for a young anchor; see [How sends are
+scheduled](#how-sends-are-scheduled)), but it still names a base the new copy may not have, and each descendant of a
+recursive dataset keeps its own. Until the first send to the new copy replaces it, the old anchor keeps its snapshot
+from being pruned and `check` grades the destination by it; and if the new copy already holds snapshots of this
+dataset, a stale anchor can let that send discard a lone snapshot of the copy's that this host lacks (with no anchor
+the send is refused instead), so clear it before the next send in that case. The warning prints the optional
+`zfs inherit [-r] -S org.zfsbackup:anchor.<name> <dataset>` commands; use them **only** for a different copy. If it is the same server under a new name, address or port (the
+warning says so when the server certificate is unchanged), **clear nothing**: the old anchor is the incremental
+base, and once it is gone the pruner may remove that snapshot, after which the next send finds no common snapshot
+and stops until you intervene. The tool changes no property itself.
 
 ## TLS and enrollment
 
@@ -490,7 +527,15 @@ zfsbackupd --test-config -c /path/to/config.db
 - `destinations`: client side, a mapping of name to `url` and `server_fingerprint`. A `url` is `https://HOST[:PORT]`
   (a remote server; `http://` is refused; `server_fingerprint` is set by `enroll`, and a destination without
   one is not enrolled and is skipped) or `zfs:<dataset>` (a dataset on this host, no server and no
-  fingerprint; see [Local destinations](#local-destinations))
+  fingerprint; see [Local destinations](#local-destinations)). **The name** becomes part of two ZFS user
+  properties on every dataset that sends there, `org.zfsbackup:anchor.<name>` and `org.zfsbackup:inflight.<name>`
+  (the snapshot last sent, and the pair in flight), so it may contain only letters, digits, `-`, `_`, `.` and `:`,
+  and at most **232 characters**. Any other name is refused when the configuration is validated (`import`, `set`,
+  `edit`, `rename`, reload and daemon start): a name that cannot be a property name could never have its incremental
+  base protected from pruning. A database that already stores such a name (written by an older release) makes the
+  daemon refuse to start; repair it with `zfsbackup-config rename destination BAD GOOD`, which finds nothing to copy
+  (no property could ever have been stored under the bad name) and prints no `zfs` advice for it. The first send to
+  the new name negotiates its base again
 - `remote_backup`: server side, `target_dataset` (required, must exist) and `enabled` (default: true)
 
 ### Dataset Configuration
@@ -500,7 +545,10 @@ Each dataset can have:
 - `name`: ZFS dataset path (required)
 - `enabled`: Whether this dataset should be backed up (default: true)
 - `frequency`: How often to take snapshots (default: "1h")
-- `recursive`: Whether to snapshot child datasets (default: false)
+- `recursive`: Whether the dataset stands for its whole subtree (default: false). The snapshot worker takes one
+  atomic `zfs snapshot -r`, the pruner destroys expired names across the tree, and, when the dataset has `remote:`
+  entries, **every filesystem and volume below it is sent** to the same destinations as a dataset of its own, never
+  as `zfs send -R`. Backup copies below it are kept out of all three. See [Recursive datasets](#recursive-datasets)
 - `retention`: Dictionary of retention rules (default: `"1d": "30d"`); `retention: forever` never prunes
 - `remote`: a list of destinations to send to, each `destination` (a name from `destinations`) and optionally
   `frequency` (default: the dataset's), `retention` (what the destination keeps; default: the dataset's) and `raw`
@@ -610,7 +658,8 @@ has a comment saying why. In short:
   raises its stop flag, workers leave at their next safe point, and the API worker gives in-flight receives
   up to 20 s. The default control-group kill would cut a `zfs send` mid-stream. The supervisor itself makes
   no `zfs` call, so a hung pool cannot stall the stop; a stuck worker is escalated (SIGTERM, then SIGKILL)
-  inside a 30 s budget.
+  inside a 30 s budget. The remote worker may have up to four streams running; any that has not reached a step
+  boundary when the budget ends is cut (its partial receive is kept and resumed).
 - **`Restart=on-failure`, `RestartForceExitStatus=SIGHUP 76`, `RestartSec=60`**: a daemon killed by a stray
   SIGHUP in the few milliseconds before it ignores the signal is restarted, not treated as a clean exit.
   Exit status 76 means "the installed zfsbackup (or its Python interpreter) changed under me, restart me":
@@ -660,6 +709,97 @@ sudo systemctl status zfsbackup
 sudo systemctl reload zfsbackup   # re-read the configuration now (it also does so every 10 s)
 ```
 
+## How sends are scheduled
+
+The remote worker sends every **pair** of a dataset and one of its `remote:` destinations: remote and local
+(`zfs:`) destinations alike, and every child of a recursive dataset. There is no common cycle. Each pair has its own
+timetable, and a short-lived sender thread runs one pair at a time. (The worker's main thread only schedules: it
+makes no `zfs` call.)
+
+- **A period and a fixed offset per pair.** A pair's period `P` is the `frequency` of its `remote:` entry, else the
+  dataset's `frequency`. The pair is tried at slots `P` apart, aligned to UTC like the snapshots (multiples of `P`
+  since the epoch), each shifted by an offset. The offset comes from a hash of the client id, the dataset name and
+  the destination name, and lies between `check_interval` + 1 minute (never more than half the window) and the
+  window `W`, the smaller of `P` and the dataset's `frequency`: the snapshot worker has had time to take the
+  snapshot first, and the pairs of a host spread over the period instead of all starting together. It is the same
+  after every restart and reload; it changes only with the client id, the dataset or destination name, or the
+  frequencies. With the default `check_interval` (5 minutes) and an hourly dataset sent hourly, each pair has its
+  own minute between :06 and :59.
+- **The schedule decides; the sender does not second-guess it.** At its slot, or when it is retried or caught up, the
+  pair negotiates with the destination and sends whatever is pending (the `-i` steps, as described elsewhere in this
+  file); with nothing pending the negotiation settles the pair as up to date and records a success. The sender's
+  anchor-age check ("the anchor snapshot is younger than `P`: not due") is kept only for the one re-run a backwards
+  clock step can cause. It would otherwise misjudge a pair after a send that ran late (a retry an hour later, a
+  catch-up): the anchor is dated by its snapshot's name, so it looks younger than the next slot allows.
+- **Catching up.** When the remote worker starts (the daemon's start, and a reload that changes the configuration),
+  a pair whose last recorded attempt (read from its status file) is older than its latest slot, or that has none, is
+  tried within a stable fraction of the next 5 minutes, not at its next slot. A pair attempted since its latest slot
+  waits for the next one. The same catch-up applies to a pair that finds itself more than a minute behind a slot
+  while the worker runs (a suspended host, a clock set forward); the slots missed meanwhile are not run one by one.
+  A send that outlasts its period owes one follow-up, started when it ends. If the clock is set back, a slot may be
+  tried a second time: the sender's anchor-age check usually turns that into a no-op (a step larger than the clock
+  tolerance makes the anchor look future-dated, which logs the ERROR and sends). A step back is caught only while the worker runs (a status record dated in the future after a restart
+  is not), and the check goes to the pair's next dispatch, which may be a pending retry rather than the re-run:
+  then the re-run itself is one cheap up-to-date attempt and the retry waits for the slot (at most one period). Only recorded attempts count, and
+  "not due" is not recorded. Two recorded states are read differently:
+  - **A chain stopped between steps** by a reload, an upgrade drain or a stop does not count as the slot's attempt.
+    It is recorded as a success marked `incomplete` (`"incomplete": true` in the status record), which the new
+    worker does not read as an attempt, so it continues the chain within the catch-up window above, not at the next
+    slot. The continuation sends whatever is pending (no anchor-age check), so a destination whose `frequency` is
+    longer than the dataset's, for example a `usb` destination daily on an hourly dataset, does not wait a day because
+    the cut chain's anchor looks young. A worker that dies without a record (a kill, an out-of-memory kill, a stop
+    that ran out of time) leaves no mark; its pair is caught up the same way. If nothing is left to send, the send
+    ends as up to date and the mark is gone.
+  - **A recorded failure** is retried by the new worker when the previous one would have retried it: at the pair's
+    next slot or one hour after the failure, whichever comes first (at once, within the catch-up window, if that
+    time has passed). A reload does not postpone that retry to the next slot, and it is not an extra attempt.
+  In short: the schedule decides when a pair sends; the sender's anchor-age check only guards the one re-run a
+  backwards clock step can cause.
+- **Limits.** At most **4 sends run at once, and 2 per destination** (fixed; no setting). Never two sends of one
+  pair; the same dataset can go to two destinations at once. At one destination a dataset and a dataset below it
+  are never sent together: the ancestor goes first, and the descendant waits ([Parents are sent
+  first](#parents-are-sent-first)). Due pairs start in this order: an ancestor before its descendants, then the
+  earliest due time, then the shallower path, then the order of the configuration. A pair that cannot start (a
+  cap, an ancestor) does not hold back unrelated pairs. Across unrelated trees a shallower dataset is not promised
+  to go first. A pair's first full send takes as long as it takes; it occupies one of the slots meanwhile.
+- **Retries.** A failure that usually passes by itself (the server busy, reloading or still settling an ancestor, a
+  connection that failed before any stream byte) is retried after **60 s, then 120 s, then 300 s**, and is recorded
+  in the status file (so that `check` counts it) only if all three fail. A chain stopped between steps happens only
+  when the worker is leaving (a reload, an upgrade drain or a stop): it is not retried by that worker, it is
+  recorded as a success at once (marked `incomplete`), and the worker that replaces it continues it (see Catching
+  up). **Any other failure** (a
+  refusal, a `zfs` call that timed out, a missing target, a resume-token skip, no client id) is recorded at once
+  and retried at the pair's next slot or after **1 hour**, whichever comes first (also across a reload: see
+  Catching up). A retry sends whatever is pending, like every other send the schedule starts: the sender's
+  anchor-age check only guards the one re-run a backwards clock step can cause. A success puts the pair back on its
+  slots.
+- **Reload, upgrade drain and stop.** After a reload that changes the configuration, or at the start of an upgrade
+  drain, no new send starts and every running sender finishes its current chain step (each `-i` step is one
+  stream, and a stream is never cut by this); the worker leaves when all have, so the turnover can take as long
+  as the longest running stream (`applied=` stays behind meanwhile). The scheduler tells the senders within about a
+  second, and a running sender acts on it only at its next chain-step boundary (between two `-i` steps, never
+  during a stream). The remote worker's replacement begins with every ancestor pair that has dependents (a
+  dataset with another configured or expanded dataset below it at the same destination) whose copy is not yet
+  confirmed negotiating at once, whatever its offset; the caps above bound the burst.
+  A **stop** keeps the 30 s budget of [systemd Service](#systemd-service); a stream still running then is cut, and
+  up to four can be.
+- **A hung pool holds a slot.** A send blocked in a source-side `zfs` call that does not return (a hung source
+  pool; source-side calls are never time-limited) keeps its slot, one of the 4 and one of the 2 for its
+  destination, until the daemon is stopped. Every other pair carries on in the remaining slots, and a reload or
+  upgrade drain waits for it (there is no time cap on a drain; a stop ends it). A hung *local target* does not do
+  that: its checks run under a 60 s limit and a stream that moves no byte for 600 s is stopped (see [Removable and
+  USB pools](#removable-and-usb-pools)).
+- **Logs are once per outage, for the whole worker.** `cannot reach <url> (destination D)` is one ERROR for the
+  destination, not one per pair; further failures are DEBUG, and one INFO says that the server answers again. The
+  same holds for an unexpected `/whoami` answer. The client certificate's "loaded" INFO appears once per
+  certificate. Log lines say "this attempt" and "next attempt": one try for one dataset and destination.
+- **Monitoring.** Only the scheduler writes the status files. It writes after every recorded outcome and rewrites
+  the file at least every `check_interval` while it runs or drains, so a long send does not make the file stale.
+  `check` counts **consecutive recorded failures**: after a failure the next attempt is at the next slot or in an
+  hour, so "4 in a row" (CRIT) is about 4 attempts spaced that far apart, and a failure that clears within its
+  60/120/300 s retries is never counted. A configuration with many pairs (recursive trees) keeps at most 2048
+  records and logs one WARNING when it has more; see [Monitoring](#monitoring).
+
 ## Monitoring
 
 `zfsbackup-config check` answers "are my backups happening?". It reads the stored configuration and ZFS
@@ -670,11 +810,15 @@ often something is expected to happen. A lag is WARN from **2x** and CRIT from *
 | What | Measured | Expected interval |
 |---|---|---|
 | `snapshot` (client) | the newest managed snapshot of each enabled dataset | the dataset's `frequency`, but at least `check_interval` (the snapshot worker looks no more often) |
-| `anchor` (client) | the snapshot last sent to each destination, remote or local | the larger of the dataset's interval (as above) and the destination's `frequency` |
+| `anchor` (client) | the snapshot last sent to each destination, remote or local, read from the dataset's **own** (local) `org.zfsbackup:anchor.<destination>` property; for a recursive dataset also one entry per descendant and destination | the larger of the dataset's interval (as above) and the destination's `frequency`; a descendant is graded against its **parent's** |
 | `received` (server) | the newest snapshot of each received client dataset | the largest of that received dataset's own `frequency` and its remote frequencies (as the client sent them) |
 
 Also: a dataset with **no managed snapshot** is CRIT; a destination that has **not been sent to yet** is WARN
-until the dataset's oldest snapshot is itself older than the CRIT threshold, then CRIT; a snapshot dated
+until the dataset's oldest snapshot is itself older than the CRIT threshold, then CRIT (for a descendant of a
+recursive dataset, its own oldest snapshot: one created after the parent's last snapshot has none yet, which is
+WARN until the parent's next snapshot); an anchor that `zfs` **cannot read** is CRIT ("cannot read"), never
+"not yet sent" (an unreadable send pin alone does not hide a readable anchor; the detail says the pin could not be
+read); a snapshot dated
 in the future beyond the tolerance is CRIT ("clock behind newest snapshot"); `dry_run` is a WARN; a dataset
 `zfs` could not list is CRIT, and so is a server whose `target_dataset` cannot be listed or does not exist. A
 received dataset with no managed snapshot stays WARN (there is no time reference to turn it into CRIT). A send in progress is noted, not graded separately. A raw/plain mismatch with
@@ -693,10 +837,23 @@ the server's copy shows only as lag (the client logs the reason once).
   no server to present it to): WARN when the certificate is missing
   (not enrolled), unreadable or would not be accepted, or expires within 30 days; CRIT once it has expired
   (`identity rotate`); OK otherwise.
+- **`descendants`** (subject the recursive dataset), WARN: the descendants of that recursive dataset could not be
+  listed, so their copies are **not checked** (the dataset's own entries are unaffected; the daemon logs the same
+  failure as one ERROR). If a descendant's anchors cannot be read in the batch, every descendant of that parent is
+  one CRIT "cannot read" per destination, never a smaller or wrong answer.
+- **`copies`** (subject the copy), WARN: a backup copy (or a receive target) sits below a recursive dataset. It is
+  not snapshotted, sent or pruned with the tree; the entry names the `zfs rename` that moves it out (see [Backup
+  copies below a recursive dataset](#backup-copies-below-a-recursive-dataset)). At most 20 copies are listed per
+  recursive dataset, then one entry "(+N more)". A recursive dataset that is itself inside a copy is one entry
+  about it.
+- **`check` / `(time limit)`**, WARN: what the check did not reach within `--time-limit` (below). Never OK, never
+  CRIT.
 - **`worker_snapshot`, `worker_prune`, `worker_send`** (subject the dataset, peer the destination for a send):
   the outcome of each worker's last attempts, read from the status files the daemon writes next to the
   database (`<db>.status/<worker>.json`). A failed attempt counts like one missed interval: attempts failing
-  **in a row** below `--warn-factor` (default 2) are OK (a single failure is named in the reason but is not a
+  **in a row** (for a send, recorded attempts: a transient failure is recorded only after its 60/120/300 s
+  retries fail, and the next attempt after a recorded failure is at the next slot or in an hour; see [How sends
+  are scheduled](#how-sends-are-scheduled)) below `--warn-factor` (default 2) are OK (a single failure is named in the reason but is not a
   verdict), from `--warn-factor` WARN, from `--crit-factor` (default 4) CRIT; a last attempt that succeeded is
   OK whatever came before. **No status files is "no data", never a failure**: a daemon that predates them, a
   worker that has nothing to report yet, or a `--dry-run` daemon (which writes none) adds no entry. A status
@@ -710,11 +867,20 @@ the server's copy shows only as lag (the client logs the reason once).
   it was not updated for `max(4 x check_interval, 24 h)` (a backstop; one long transfer can keep a worker from
   writing for hours). A stale file is one WARN `worker_status` entry ("no recent data") and its outcomes are
   not graded: never OK, never CRIT for staleness alone. `status` marks it `STALE` and uses 24 h.
+  A **`worker_snapshot`** record can also carry a standing **warning** about a snapshot that succeeded: a recursive
+  dataset's snapshot left backup copies out of it, or could not tell whether any are below (see [Backup copies
+  below a recursive dataset](#backup-copies-below-a-recursive-dataset)). It is graded WARN, with the warning in the
+  reason, never CRIT, and the next snapshot's record replaces it (so it stays until the next snapshot is taken,
+  and a clean one clears it). Every descendant of a recursive dataset also has its own `worker_send` record per
+  destination (the daemon keeps at most 2048 records per worker and logs one WARNING when a configuration has more
+  pairs: the least recently attempted are dropped and `check` cannot report them).
 
 ```bash
 zfsbackup-config check                       # text: one line per entry, then "overall: …"
 zfsbackup-config check --json                # machine readable; "schema": 1, only ever extended
 zfsbackup-config check --nagios              # one plugin line; exit 0 OK, 1 WARN, 2 CRIT, 3 UNKNOWN
+zfsbackup-config check --nagios --nagios-max-bytes 1000   # a smaller cap, for NRPE v2
+zfsbackup-config check --time-limit 120 --per-call-timeout 20   # a big host: more time (see below)
 zfsbackup-config check --prometheus          # Prometheus text format on stdout
 zfsbackup-config check --prometheus --output /var/lib/node_exporter/textfile_collector/zfsbackup.prom
 ```
@@ -724,11 +890,34 @@ zfsbackup-config check --prometheus --output /var/lib/node_exporter/textfile_col
   as soon as the file is written, whatever the verdict (it is in the file); an unwritable path or an
   unusable database still exits non-zero.
 - **`--nagios`** prints one line, `ZFSBACKUP <STATE> - <the first three entries that are not OK> | perfdata`
-  (an age per lag entry, with its warn and crit thresholds), and exits 0/1/2 for OK/WARN/CRIT. **Anything that
+  (an age per lag entry, with its warn and crit thresholds), and exits 0/1/2 for OK/WARN/CRIT. **The whole output
+  is capped** at 4000 bytes, newline included, because a plugin transport that cuts the perfdata mid-item makes it
+  unparseable and a configuration with recursive datasets easily has hundreds of entries. When the perfdata does
+  not fit, the most severe items are kept (CRIT, then WARN, then OK) **in their usual order**, so a consumer that
+  maps perfdata by position still sees a stable order, and the last item is `omitted=N`. The status line and the
+  exit code are never affected; `--json` and `--prometheus` list every entry. `--nagios-max-bytes N` (at least 64,
+  and only with `--nagios`) changes the cap: Nagios Core 4 reads about 8 KiB, NRPE 3 and later and Icinga 2 take
+  more, NRPE v2 carries only about 1 KiB per packet (use `--nagios-max-bytes 1000` there). **Anything that
   stops the check from running is UNKNOWN (3), never CRIT**: an unusable database, and bad arguments when
   `--nagios` is on the command line (printed as `ZFSBACKUP UNKNOWN - …`). A dataset or pool that `zfs`
   cannot read is different: it is a CRIT entry about the backups (exit 2), not UNKNOWN. It cannot be combined
   with `--json`, `--prometheus` or `--output`.
+- **Time bounds.** `check` never waits on a hung pool: its ZFS reads stop after `--time-limit SECONDS` in all
+  (default 60) and any one `zfs` command after `--per-call-timeout SECONDS` (default 10); `0` or `none` turns a
+  limit off. What was not reached is named in one WARN `check` entry, `(time limit)`, never reported as OK. Every
+  command is timed on its own, so the limit is overshot by at most the kill time of one command (a few seconds). A
+  command that times out and cannot even be killed (a hung pool) makes every later one fail at once, so the rest
+  reads as "cannot read" (CRIT), which is the right answer. **The per-call bound does not apply to the batched
+  reads**, whose run time grows with the size of a tree rather than with the health of the pool: a recursive
+  dataset's descendant listing and backup-copy marker read, its descendants' anchor read, snapshot listing and name
+  re-listing, and the received datasets' listing and property read. These may use all the time **left** of
+  `--time-limit` (about 60 000 snapshots can take longer than 10 s on a healthy host), so a slow pool, or a hung one
+  whose `zfs` can still be killed, can spend all the remaining time on one batched read; the datasets not reached
+  are then the `(time limit)` WARN. A recursive dataset's descendants are read per parent, in a handful of `zfs`
+  commands for the whole tree (300 children: 11 commands, not about 1500). Whoever calls `check` must wait longer
+  than the limit: NRPE's `-t` (command timeout) must exceed `--time-limit` by a few seconds, and the shipped
+  `zfsbackup-check.service` sets `TimeoutStartSec=150`, which assumes the default 60 s (raise it to at least
+  2 x the limit + 30 s if you raise `--time-limit`).
 - **`--output FILE`** (or `-o`) writes the text, JSON or Prometheus form to FILE instead of stdout, and prints
   nothing. The write is atomic (a temporary file in the same directory, then a rename; mode 0644), so
   node_exporter's textfile collector never reads half a file. A check that fails to run **leaves the previous
@@ -736,7 +925,8 @@ zfsbackup-config check --prometheus --output /var/lib/node_exporter/textfile_col
 - The metric names are prefixed by what they measure and will only be added to: `zfsbackup_snapshot_*`,
   `zfsbackup_anchor_*` and `zfsbackup_received_*`, each with `_age_seconds`, `_threshold_seconds{level="warn|crit"}`
   and `_check_state` (0 OK, 1 WARN, 2 CRIT), labelled `dataset` and, where it applies, `destination` or
-  `client`; other checks appear as `zfsbackup_check_state{source,subject}`; then `zfsbackup_check_overall_state`,
+  `client`; a descendant of a recursive dataset is an `anchor` entry labelled with its own dataset name; other
+  checks (`descendants`, `copies`, `check`, ...) appear as `zfsbackup_check_state{source,subject}`; then `zfsbackup_check_overall_state`,
   `zfsbackup_check_success` (1 only when nothing is WARN or CRIT), `zfsbackup_check_timestamp_seconds` and
   `zfsbackup_build_info{version}`. The worker-outcome entries above are
   `zfsbackup_check_state{source="worker_send",subject="tank/data",peer="offsite"}` and so on, with
@@ -750,7 +940,9 @@ zfsbackup-config check --prometheus --output /var/lib/node_exporter/textfile_col
   `systemctl edit zfsbackup-check.service`) to your node_exporter textfile directory, and
   `systemctl enable --now zfsbackup-check.timer`. The Debian/Ubuntu package installs both units, with the
   output already set to `/var/lib/prometheus/node-exporter/zfsbackup.prom`, the directory the distribution's
-  `prometheus-node-exporter` reads: there, install that package and enable the timer. It runs every 5 minutes. With `--output`, `check` exits 0
+  `prometheus-node-exporter` reads: there, install that package and enable the timer. It runs every 5 minutes, and
+  the service allows it `TimeoutStartSec=150` (twice the default `--time-limit` plus 30 s; see the time bounds above
+  before raising the limit). With `--output`, `check` exits 0
   once the file is written, whatever the verdict, because the verdict is in the metrics; a failed unit means the
   check could not run or could not write the file (database unusable, an unwritable path, a crash), and the
   previous file stays until the next successful run.
@@ -769,7 +961,8 @@ a transient read error cannot restart a healthy daemon. It then logs one WARNING
 `STATUS=` in `systemctl status` and `draining=` in the pid file, reloads no configuration (a `zfsbackup-config`
 write is answered as deferred, to be applied after the restart, not re-checked) and **drains**: the remote
 worker, then the API worker, which load parts of the program from disk on demand, finish what they are doing
-at their next safe point (a `zfs send` or an inbound receive runs to its end, however long that takes, not cut
+at their next safe point (every running send finishes its current `zfs send` step and the rest of its chain is not
+started, and an inbound receive runs to its end, however long that takes, not cut
 after the usual 30 s stop budget) and are not restarted; the API worker keeps serving until the remote worker
 has left. Snapshots and pruning go on meanwhile (if one of them is found not running, the drain is cut short
 with the ordinary stop). When those two have left, the daemon stops the rest the usual way and exits
@@ -845,7 +1038,7 @@ match, and `check` shows the lag growing.
 
 **Changing how a destination is sent** (the send flags are fixed per destination, or `raw:` set to a
 different value) cannot be applied to a server copy that already exists: the client refuses, logs one ERROR
-and sends nothing. The server copy has to be renamed aside (below); the next cycle sends in full.
+and sends nothing. The server copy has to be renamed aside (below); the next attempt sends in full.
 
 ## Operating the backup server
 
@@ -894,17 +1087,28 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   dataset, and **never `zfs inherit`** them (with or without `-S`). The server sets them as local values; a
   received dataset without its local `config` is skipped by the pruner, and one without its local
   `client_id` is refused for further sends.
-- **Parents are sent first.** The remote worker sends a dataset's ancestors before its descendants. If a
-  child was backed up first (its parent was added to the configuration afterwards), the server holds a
-  placeholder for the parent and a full stream of the parent is refused. Rename the placeholder aside
-  (below); that also moves the children's server copies, so they are sent in full again.
+- **Parents are sent first.** The remote worker sends a dataset's ancestors before its descendants, and a
+  descendant of a recursive dataset also waits until its nearest ancestor's copy at that destination has been
+  **confirmed in this run** (see [Recursive datasets](#recursive-datasets)): a child sent first would make the
+  server create its parent as an unowned placeholder, which the parent's own full stream (raw, or onto an encrypted
+  target) can never replace. If a child was nevertheless backed up first (its parent was added to the
+  configuration afterwards, or the parent's copy was lost), the server holds a placeholder for the parent and a
+  full stream of the parent is refused. Rename the placeholder aside (below); that also moves the children's
+  server copies, so they are sent in full again.
+- **A recursive dataset's descendants arrive as separate client datasets.** Each child of a `recursive` dataset is
+  its own `<target>/<client_id>/<pool>/<path>` copy, stamped with the child's name and the parent's retention for
+  that destination, pruned on its own, never by `-r`. A child destroyed on the client leaves its server copy where
+  it is, still pruned to its stamped retention (the newest snapshot is always kept) until you destroy it. A client
+  whose copy of a child would have a snapshot name over 255 characters (a deep tree, a long client id) is refused
+  at `/negotiate` with 400 and `reason: name_too_long` before anything is written; the client logs one ERROR per
+  episode.
 - **Encrypted datasets go raw by default** (`zfs send -w`), and the server never holds the key. The server
   therefore cannot mount, read or restore the contents of an encrypted dataset; keep a copy of the key off
   the client. Per destination, `raw: true` requires a raw send and `raw: false` forbids it. An unencrypted
   server copy cannot be switched to raw or the other way round without a full re-send.
 - **Renaming a server copy aside.** For a server copy that can no longer be continued from the client (a
   different kind of stream, a placeholder parent, no common snapshot), move it **out of the target tree**
-  on the server, then let the next cycle send in full:
+  on the server, then let the next attempt send in full:
   ```bash
   sudo zfs create -p tank/backups-aside
   sudo zfs rename tank/backups/<client_id>/tank/data tank/backups-aside/<client_id>-data-$(date +%F)
@@ -919,7 +1123,8 @@ and sends nothing. The server copy has to be renamed aside (below); the next cyc
   location waits for a passphrase on a terminal). A raw copy is always its own encryption root and renames
   anywhere.
 - **Sizing.** Nothing limits a client's space or bandwidth (`zfs set quota=… <target>/<client_id>` does; see
-  [First run](#first-run)); a host's remote sends run one after another.
+  [First run](#first-run)); a host sends at most 4 streams at once, 2 per destination (see [How sends are
+  scheduled](#how-sends-are-scheduled)).
 
 ## Local destinations
 
@@ -950,7 +1155,11 @@ deleted dataset or snapshot, not against losing the pool.
      no `@` or `#`), or a `zfs:` destination has a `server_fingerprint`;
    - a copy's snapshot name, `<target>/<client_id>/<dataset>@<prefix>_<14 digits>`, would be over ZFS's 255
      characters even with a one-character client id (an enabled dataset is refused, a disabled one warns). A
-     warning also names the longest client id that still fits. A recursive dataset's children have longer names.
+     warning also names the longest client id that still fits. Only **configured** datasets are checked here: the
+     descendants of a `recursive` dataset have longer names and are found only when they are sent. A copy whose
+     snapshot name would be over the limit is then refused before anything is created, with one ERROR per dataset
+     and destination (the other children carry on); shorten the names, the snapshot prefix, the target or the client
+     id.
 
 2. **Configure it** (import YAML as usual, or `zfsbackup-config edit`):
 
@@ -972,8 +1181,10 @@ deleted dataset or snapshot, not against losing the pool.
 
    The `remote:` entries mean the same as for an https destination, and a dataset can send to local and remote
    destinations at once. `frequency`, `retention` and `raw` are per dataset and destination. Local and remote
-   sends run one after another in the same worker, in the order of the `remote:` list, so a long copy delays
-   the sends after it; a failure at one destination does not stop the others.
+   sends are scheduled alike, each pair on its own slots, by the same worker (see [How sends are
+   scheduled](#how-sends-are-scheduled)): up to 4 sends run at once and 2 per destination, so a long local copy
+   occupies one slot and delays nothing else unless the slots are all taken; a failure at one destination does
+   not stop the others.
 
 3. **The client id.** The copies are laid out under this host's client id (below). A host that never enrolled has
    none, so the `import`, `set` or `edit` that adds the first local destination generates one and prints
@@ -1032,7 +1243,9 @@ The pruning worker finds this host's copies under `<target>/<client_id>` of ever
 each one with the retention stamped on it (`org.zfsbackup:config`, the destination's rules as configured now,
 refreshed at every send; a change that shortens the horizon is logged at WARNING), with this host's
 `snapshot_prefix`. The newest snapshot of a copy is always kept, as are the ones an anchor or pin protects, a
-held or a cloned one. Pruning is never recursive: each copy is its own dataset with its own retention. Only this
+held or a cloned one. Pruning is never recursive: each copy is its own dataset with its own retention, and so is
+the copy of each descendant of a `recursive` dataset (stamped with the parent's retention for that destination; see
+[Recursive datasets](#recursive-datasets)), found and pruned like any other copy. Only this
 host's own id is touched, so another host's tree in the same target is never listed or pruned by this pass
 (including an id that merely starts with ours, `host` and `host2`). The rules of a copy outlive a configuration
 change: the copy of a dataset you removed from the configuration keeps being pruned to its last rules, as long
@@ -1048,18 +1261,18 @@ with one WARNING per episode and destroys nothing.
   skipped with one message per episode ("the target dataset … does not exist; … import its pool if it is on an
   exported one"), the other destinations carry on, and a line says it is usable again once it is back. The
   sending resumes on its own when the pool is imported: the anchor keeps the last common snapshot on the
-  source, so the next cycle sends the whole chain of snapshots taken meanwhile. Until then `check` shows the
+  source, so the next attempt sends the whole chain of snapshots taken meanwhile. Until then `check` shows the
   destination's lag growing and its sends and the pruning discovery failing, which is the intended signal that
   nothing is being copied. A stream cut by an export is resumed from where it stopped.
 - **A pool that is suspended or hung** (`zpool status` says so) cannot stall the daemon: the checks that
-  precede a stream run under a 60 s limit and skip the destination for the cycle; a stream that moves no byte for
+  precede a stream run under a 60 s limit and skip the destination for that attempt; a stream that moves no byte for
   600 s is stopped (`zfs send` and `zfs receive` both, the partial receive is kept for a resume); and a
   `zfs` process that survives SIGKILL (uninterruptible sleep on the hung pool) is abandoned with one WARNING.
-  While such a process exists, every time-limited `zfs` call in that worker is refused, so the local destinations
-  are skipped, and the log says so, until the process exits. Fix the pool (`zpool clear`, reconnect the disk);
+  While such a process exists, every time-limited `zfs` call in that worker is refused, so every local
+  destination (not only the pair that hung) is skipped, and the log says so, until the process exits. Fix the pool (`zpool clear`, reconnect the disk);
   the sending resumes by itself when the process is gone.
 - **Stopping the daemon** during a local copy behaves like a remote transfer: the supervisor gives the worker
-  its stop budget, then ends it, and the next cycle resumes the partial receive.
+  its stop budget, then ends it, and the next attempt resumes the partial receive.
 
 ### When a copy cannot be continued
 
@@ -1067,7 +1280,7 @@ As for a server copy, the daemon never destroys or renames a copy by itself. It 
 for that dataset and destination when the copy is of the other kind (plain vs raw, or a changed `raw:`), when
 it and the source have no snapshot in common, when it holds snapshots the source does not (after a rollback or an
 in-place restore of the source), or when a placeholder parent blocks a full stream. The message names the
-fix. To keep the copy, move it **out of the target tree** on this host; the next cycle then sends a full stream:
+fix. To keep the copy, move it **out of the target tree** on this host; the next attempt then sends a full stream:
 
 ```bash
 sudo zfs create -p backup/aside
@@ -1077,7 +1290,7 @@ sudo zfs rename backup/zfsbackup/<client_id>/tank/data backup/aside/<client_id>-
 (Inside the tree it would still be pruned, and its recorded source would get the new copy refused. Under an
 encrypted target the rules of [Renaming a server copy aside](#operating-the-backup-server) apply.) If the
 newer snapshots are expendable, the message gives the `zfs destroy <copy>@<first>%<last>` that removes just
-them, and the next cycle continues. The other points of [Rejoining](#rejoining-seed-and-continue) apply here too,
+them, and the next attempt continues. The other points of [Rejoining](#rejoining-seed-and-continue) apply here too,
 with `ssh` left out.
 
 ### Sharing the server's target
@@ -1129,7 +1342,7 @@ server's binding equals the local id, so the id is the right one), the source da
 stop: keep the destination's name (the anchors and pins on the source datasets are keyed by it),
 `zfsbackup-config edit destination <name>`, set `url: "zfs:T"` and remove the `server_fingerprint`, then
 `zfsbackup-config trust revoke --client <client_id>` the host's own enrollment (the CLI reminds you; the server
-refuses that client's receives meanwhile). The next cycle continues the chain with an incremental step; check it
+refuses that client's receives meanwhile). The next attempt continues the chain with an incremental step; check it
 with `zfsbackup-config check`.
 
 **Moving them to another target `L`**: a rename of the whole `T/<client_id>` tree to `L` continues the chain with
@@ -1150,15 +1363,16 @@ no new full send:
    the anchors if you do want a new name.) The CLI warns about a full send and orphaned copies; with the tree
    moved that does not apply. Disable or remove `remote_backup` if nothing else uses it, and optionally `trust
    revoke --client <client_id>` the host's own enrollment.
-5. `zfsbackupd --test-config`, start the daemon, and watch the first cycle: it should send an incremental
+5. `zfsbackupd --test-config`, start the daemon, and watch the first send: it should be an incremental
    step, not a full stream (`zfsbackup-config check`).
 
 ### Renames, the client id and monitoring
 
 - **`rename dataset`** (like for a remote) needs `--force` and prints, for each local destination, the copy's
   real path and the exact `zfs rename` (plus `zfs set org.zfsbackup:source_dataset=<new name> …`) that moves it
-  within its parent. Otherwise the copy stays under the old name, orphaned, and the new name starts with a full
-  send. Nothing sends to the old copy any more, but the pruner still applies its last stamped retention, so its
+  within its parent (for a recursive dataset the copies of its descendants are below that copy and move with it;
+  each records its own `source_dataset`, which the CLI prints the `zfs set` pattern to re-label). Otherwise the copy stays
+  under the old name, orphaned, and the new name starts with a full send. Nothing sends to the old copy any more, but the pruner still applies its last stamped retention, so its
   history expires down to its newest snapshot: move it out of `<target>/<client id>/` (or destroy it) by hand
   if you want to keep it. The CLI does not run these commands.
 - **`identity set-client-id`** changes the directory the copies live in: the next send to each local
@@ -1176,6 +1390,246 @@ no new full send:
   The copies themselves are not read by `check`; the anchor lag covers them.
 - **Logs.** The messages start `<dataset> -> <destination>` and name the target or the copy; a pool that is
   not there, a hung `zfs`, a refused stream and a stalled one each say what to do.
+
+## Recursive datasets
+
+`recursive: true` makes one entry stand for a dataset and everything below it:
+
+- the snapshot worker snapshots the whole tree in **one atomic command** (`zfs snapshot -r`);
+- the pruner destroys expired snapshot names across the tree (`zfs destroy -r`) with the dataset's retention;
+- when the entry has `remote:` destinations, the remote worker sends **every filesystem and volume below it** as a
+  dataset of its own. Each child gets its own plain or raw `-i` chain, its own copy on the destination and its own
+  anchor and pin properties. The daemon never uses `zfs send -R`, `-p` or `-I` (the server refuses such streams
+  anyway).
+
+```yaml
+datasets:
+  - name: "tank/home"
+    frequency: "1h"
+    recursive: true
+    retention: { "1d": "1M", "1M": "1y" }
+    remote:
+      - destination: offsite
+      - destination: usb
+        frequency: "1d"
+```
+
+Here `tank/home`, `tank/home/alice`, `tank/home/alice/mail` (and a zvol `tank/home/vm0`) are each sent to `offsite`
+every hour and to `usb` every day.
+
+### What is sent
+
+- **Every descendant** of an enabled recursive dataset that has `remote:` entries goes to **every destination of
+  that dataset**, with that entry's `frequency`, retention and `raw`. A recursive dataset with `remote: []`
+  snapshots locally and sends nothing, below it too.
+- **The copy of a child is stamped with the parent's configuration**: the child's own name, `recursive: false`, and
+  the parent's retention and frequency for that destination. The receiver (the server, or this host's pruner for a
+  local destination) therefore prunes the copy of `tank/home/alice` by the same rules as the copy of `tank/home`.
+- **`raw` is decided per child.** With `raw: auto` (the default) an encrypted child goes raw and its unencrypted
+  siblings go plain. `raw: true` on the parent applies to **every** child: an unencrypted child is then refused with
+  the usual ERROR and nothing of it is sent (its siblings carry on), as for a configured dataset. Leave `auto`
+  unless every dataset in the tree is encrypted.
+- **Explicit configuration wins.** A descendant that has its own entry in `datasets:` is sent by that entry (its own
+  frequency, retention, destinations and `raw`) and not a second time as a child. The names below it still belong
+  to the **nearest** enabled recursive dataset above them.
+- **A disabled descendant excludes its whole subtree from sending.** A descendant configured `enabled: false`
+  keeps being snapshotted and pruned with the parent's tree, but neither it nor anything below it is sent. An
+  **enabled recursive** descendant owns its subtree, even with `remote: []`: the outer dataset does not send there.
+  Every name has exactly one owner.
+- **Clones are sent as ordinary datasets**: a full, independent copy of the clone's own data (its origin is not
+  used), so a clone costs its whole size on the destination.
+- **Discovery** is a name-only `zfs list -r -t filesystem,volume` of each recursive dataset, run on a thread of its
+  own (the scheduler never waits for it; at most 4 run at once) and repeated every `max(check_interval, min(the
+  smallest period of the parent's `remote:` entries, 1 hour))`, with no time limit (source datasets are never timed).
+  A failed discovery is retried after at most 5 minutes. While one fails, or has not yet finished, the children found
+  by the last successful discovery keep being sent (a parent never discovered since the worker started has none, and
+  is sent by itself); the daemon logs **one ERROR per episode** and an INFO when it works again, and the children's
+  status records are kept so that `check` still sees them. A name `libzfseasy` cannot represent (see [Known limitations](#known-limitations)) is skipped with
+  libzfseasy's own WARNING and nothing else: no `check` entry names it.
+- **Space and time.** Every child is a complete copy of its dataset. The parent goes first and its children wait for
+  it ([Parents are sent first](#parents-are-sent-first)); then the children go two at a time per destination (4 sends
+  at once in all, see [How sends are scheduled](#how-sends-are-scheduled)). A grandchild waits for its own
+  parent in turn. The first full send of a big tree is the parent's time plus the children's, two at a time at
+  best, per destination.
+- **Load.** Each discovery costs one `zfs list -r` (names) and one value-free `zfs get -r` of the two backup-copy
+  marker properties per recursive dataset. Then, per child and destination and per slot, the sender reads the
+  child's own anchor and lists its snapshots, then negotiates (local `zfs` reads, or `/whoami` and `/negotiate` on a
+  remote destination) even when the copy is already up to date. A tree of 300 children with one destination is
+  therefore a few short `zfs` commands and requests per child per period, spread over the period by the pairs'
+  offsets, not issued in one burst.
+- **A copy name over ZFS's 255 characters** (a deep tree, a long prefix or client id) is refused before anything is
+  created, with one ERROR per child and destination; the other children carry on. Configuration validation can
+  check only configured names, so a child is found out only when it is sent.
+- **`--dry-run`** logs the children's sends like any other and creates nothing.
+
+### Parents are sent first
+
+The worker sends an ancestor before its descendants, and a child additionally **waits until the copy of its nearest
+ancestor at that destination has been confirmed in this run of the remote worker**: that ancestor's send found its
+copy there (a negotiate that reported one), or a stream to it was acknowledged. A child sent first would make the
+receiver create the ancestor as an empty placeholder, which the ancestor's own full stream, raw or onto an encrypted
+target, can never replace (see [Operating the backup server](#operating-the-backup-server)).
+
+- **Whose children wait.** Every pair whose dataset lies below another pair's dataset at the same destination, the
+  children of a recursive dataset **and** a configured dataset below another configured one. At one destination the two
+  are also never sent at the same time. The children are released when the ancestor's send has *finished*, the
+  whole chain and not only the negotiate, and confirmed the copy; they then go two at a time (see [How sends are
+  scheduled](#how-sends-are-scheduled)). A grandchild waits for its own parent, not for the top of the tree.
+- An **anchor is not evidence**. Anchors are keyed by destination name and can outlive the copy they described (a
+  changed URL, a lost copy), so only a confirmation in this run releases the children. To get one, an ancestor with
+  waiting children is **due once per start of the remote worker** (the daemon's start and every reload that changes
+  the configuration), whatever its anchor says: it negotiates, an up-to-date copy is settled without a stream, and
+  the children are released. If that attempt confirms nothing (the ancestor has no snapshot yet), it is asked again
+  after `max(60 s, check_interval)`. After a reload every unconfirmed ancestor with children negotiates at once, not
+  at its offset.
+- **The WARNING.** The daemon logs **one WARNING per episode** and (ancestor, destination): "N descendants of … wait
+  until its copy at … is confirmed in this run", and an INFO ("… is confirmed at …: its descendants follow") when they
+  are released. The WARNING appears only when the hold has lasted a minute **while the ancestor was neither sending
+  nor waiting for a free slot**: a long full send of the ancestor, or a queue behind the caps, is normal and says
+  nothing. So it means that the ancestor's attempt ended without a confirmation (it failed, was refused, its
+  destination is unreachable, or it has no snapshot yet) and the ancestor is waiting for its next attempt (a
+  retry, or its next slot). Nothing is recorded against a waiting child (the ancestor's own `worker_send` entry
+  carries the cause, and `check` shows the children's `anchor` lag).
+- If the ancestor's send fails (refused, destination unreachable), its children wait too. A child with no managed
+  snapshot yet is held like the others and, once released, has nothing to send.
+- In a `--dry-run` the ancestor's dry send counts as the confirmation, so the log shows the children's turn.
+
+### Children that appear, disappear or move
+
+- **A new child** is found by the parent's next discovery (see above) and sent at its own slot. It gets a **full** send
+  once the parent's recursive snapshot has covered it; until then it has no snapshot to send, and `check` shows it as "not yet sent" (WARN) until the parent's
+  next snapshot.
+- **A destroyed child** drops out of the list, and its status records are forgotten (except while that parent's
+  discovery is failing). Its **copy stays** on the destination, and the receiver keeps pruning it to its stamped
+  retention, down to its newest snapshot, until you destroy it.
+- **A renamed child** (`zfs rename` inside the tree) is a new dataset: a full send under the new name. Its local
+  anchor travels with it and describes the old copy until the first send replaces it; it does not hold that send up
+  (see [Changing where a destination points](#changing-the-configuration)). The old copy stays as above.
+
+### Backup copies below a recursive dataset
+
+A **backup copy** is a dataset the daemon (or `zfs send -R`) received: it carries `org.zfsbackup:client_id` or
+`org.zfsbackup:source_dataset` as a local, received **or inherited** value, or it lies at or below a receive target
+(`remote_backup.target_dataset`, enabled or not, or a local destination's target). One can end up below a recursive
+dataset when a `zfs:` destination is removed from the configuration, when a former server becomes a client, or when
+a tree is replicated onto the host. A copy holds the very snapshot names its source has, so `zfs snapshot -r` would
+snapshot **into** it and `zfs destroy -r` would destroy its history in step with the source. The daemon keeps copies
+out of all of it:
+
+- **Never sent.** Expansion skips a copy, and everything below it, with one ERROR per recursive dataset and copy
+  that names it and the remedy. A name at or below a receive target is skipped the same way.
+- **Never snapshotted.** With a copy below, the snapshot worker takes **one atomic `zfs snapshot`** naming the dataset
+  and every source descendant (a name-only listing minus every copy's subtree), not `snapshot -r`: all or none, one
+  transaction. One ERROR per recursive dataset and copy names it and the remedy, an INFO says when it is gone, and the
+  dataset's `worker_snapshot` record carries a standing warning that `check` shows as WARN. With no copy below,
+  nothing changes: plain `snapshot -r`.
+  - **Deliberate fallback to `snapshot -r`.** If the copies cannot be read, the listing cannot be trusted or the
+    command would not fit (about 1000 datasets, 128 KiB of arguments, never split because it would not be atomic),
+    the worker falls back to plain `zfs snapshot -r`, with one ERROR per episode and a warning in the status record.
+    A stray snapshot in a copy is recoverable; a missed source snapshot is not.
+  - A child created between the listing and the snapshot misses that one snapshot (the next period catches up). A
+    child destroyed or renamed in that window fails the command, so nothing is snapshotted that cycle and the next
+    one lists again.
+- **Never pruned.** Every snapshot **name** that a copy holds is kept in the whole recursive tree, because a
+  recursive destroy of `<dataset>@<name>` would also take `<copy>@<name>`. The log says "keeping … (recursive
+  prune)". Source children are still pruned, for names the copy does not have. If a copy cannot be read, nothing is
+  destroyed that pass (one ERROR).
+- **A recursive dataset that itself sits inside a copy** (it has or inherits the markers, so everything below it is a
+  copy by inheritance) is snapshotted alone, nothing below it is sent, and one ERROR says so.
+
+**The remedy is to move the copy out** of the recursive tree: `zfs rename <copy> <a name outside the tree>`. The
+daemon notices (INFO) and treats the tree normally again. A **received** marker cannot be cleared with `zfs
+inherit` (it only masks it, and a masked copy is no longer recognised as one), so move the copy. A **local** marker
+on something that is really a source is cleared with `zfs inherit org.zfsbackup:client_id <dataset>` and
+`zfs inherit org.zfsbackup:source_dataset <dataset>`.
+
+**Stray snapshots: never destroy received history.** A copy may hold a snapshot that `snapshot -r` put there (an older
+release, or the fallback above). On a live replica a stray also stops the incremental receives into it. A stray has
+the **same `createtxg` as the source's `<dataset>@<name>`** (one atomic command, one transaction); every other
+snapshot in a copy is received backup history. Compare before you destroy anything:
+
+```bash
+zfs get -H -o name,value createtxg tank/home@autosnap_20261110120000
+zfs get -r -t snapshot -H -o name,value createtxg backup/zfsbackup/<client_id>/tank/home
+```
+
+**Prevention in `zfsbackup-config`.** `set`, `unset`, `edit` (every form), `import` and `rename dataset` look at ZFS
+before they commit and **refuse** (exit 1, nothing written) a change that would leave a copy below a recursive
+dataset: a dataset made recursive (or added as recursive) with a copy below it or inside one, or a `zfs:`
+destination (or the server's `target_dataset`) removed, changed or switched to `https://` while the copies under its
+target would be left below an enabled recursive dataset. The message names the copy and the `zfs rename` that moves
+it out. **`--force`** writes the change anyway and prints the refusal as a warning (`rename dataset`: `--force-copies`,
+because its `--force` already means "accept a full send"). If ZFS cannot be read at all (no `zfs` on this host, a pool
+that is not imported, a timeout after 30 s per command or 120 s in all) the CLI only warns and commits: it must work
+on a host without ZFS. The check runs before the write, outside the lock, and the write compares the generation, so a
+concurrent change ends in exit 75. The daemon's handling above is the backstop for the copies no check can see.
+
+**What cannot be told apart:** a copy with no markers that is not under a known receive target (a hand-made `zfs send
+| zfs receive` without `-o`, a syncoid replica without properties) looks exactly like a source child. It is sent
+as a child and pruned recursively.
+
+### The snapshot worker: parents first, children ride
+
+The snapshot worker handles datasets by path depth, so an enabled recursive dataset is snapshotted **before** a
+configured child of it (config order within a depth). Before, a configured child listed first took the period's
+snapshot name, and the parent's `snapshot -r` then failed with "already exists" for the whole period, leaving the
+tree unsnapshotted.
+
+- **Children ride.** A configured child whose snapshot for the period was **just created over it by its enabled
+  recursive ancestor in this cycle** counts that as its own: nothing to create, no "already exists" WARNING, recorded
+  as a success. It keeps its own retention and destinations, and takes extra snapshots only when its own frequency
+  is higher than the ancestor's.
+- **Boundary retry.** If a period boundary falls between the parent's turn and a configured child's turn in one
+  cycle, or the parent's command failed once and the child then snapshotted itself, the child already holds the name
+  and the parent's tree command collides. On **any** failure of the tree command the worker lists which source
+  datasets already hold the name and **retries once**, atomically, over the rest (an INFO says how many). A failed
+  retry fails that cycle; there is no loop. The rest of the tree therefore gets its snapshot at worst one cycle
+  later, never skips a period. **Exception:** inside the `snapshot -r` fallback (above) the retry needs a strict
+  listing of the source datasets and an argument list that fits. When the fallback was taken because a name
+  `libzfseasy` cannot represent sits below the dataset, or because the list is too long, that is exactly what just
+  failed, so the retry fails again: one ERROR, and the rest of that tree misses that period.
+
+### Pruning, and the space a lagging child holds
+
+Children are never handed to the snapshot or pruning workers; the parent's recursive snapshot and destroy cover them.
+A recursive destroy never destroys a name that something below the dataset still needs: a local or received
+`org.zfsbackup:anchor.*` or `inflight.*` on **any descendant**, the retention of a configured enabled descendant, or
+a backup copy's names (above). These are re-read right before every destroy; a pass that cannot read them destroys
+nothing.
+
+A **lagging child therefore holds space across the whole tree.** If a child cannot be sent (its destination is down,
+its copy is refused, it was never sent), its anchored snapshot name is kept on **every** dataset of the tree, not
+only on the child: the snapshot it last sent from, and anything it pinned, stay while everything else expires. The
+older that snapshot, the more changed data each dataset of the tree carries. `check` names the lagging child (its
+`anchor` entry); fix the cause. If the child is not to be sent any more (an explicit `enabled: false` entry for it,
+or the destination removed), its anchor keeps pinning that snapshot until you clear
+`org.zfsbackup:anchor.<destination>` and `inflight.<destination>` on it (`zfs inherit -S …`).
+
+### Monitoring a tree
+
+`check` expands recursive datasets itself (read-only) and grades **each child per destination** from its own local
+anchor, against its parent's expected interval (see [Monitoring](#monitoring)): a never-sent child is no longer
+invisible, and an inherited anchor can no longer make it look fresh. It adds the `descendants`, `copies` and
+`(time limit)` entries described there, and its descendants are read per parent in a handful of `zfs` commands. There
+is no per-child snapshot-age entry: the parent's covers the `-r` snapshot.
+
+### Caveats
+
+- **A child without a readable own anchor has an unprotected common snapshot** until its in-flight pin is written
+  at the start of its first step (the same as for a configured dataset that was never sent): the pruner protects
+  what the anchors and pins name, and a new child, or one whose anchor property was lost, names nothing yet.
+- **Dropped names.** A descendant whose name `libzfseasy` cannot represent is not sent, and the only trace is
+  libzfseasy's WARNING in the journal.
+- **A child's configuration near the 8 KiB limit.** The stamped configuration of a child (the parent's, with a
+  longer name) must stay under 8 KiB. One that does not is refused at negotiate for that child alone, with the
+  server's (or the local sender's) message; its siblings carry on. Shorten the retention rules.
+- **After a URL or target change**, anchors keyed by the destination's name still describe the old copy (see
+  [Changing the configuration](#changing-the-configuration)) until the children's first sends replace them; they do
+  not hold those sends up, but meanwhile `check` grades by them and the pruner keeps their snapshots.
+- **One worker sends everything, 4 streams at a time.** Many children make a long first send: the parent goes
+  first, then the children two at a time per destination (4 in all). The slots are shared by every pair of every
+  destination, so a big tree can keep other pairs waiting for a slot. The daemon keeps at most 2048 send records, and
+  logs one WARNING when more pairs exist.
 
 ## Backing up the host
 
@@ -1324,25 +1778,25 @@ the client**: the server has none, so a lost key means a lost raw backup.
 > growing meanwhile. Nothing is lost while it waits.
 >
 > Then, on the server, either **keep** the newer snapshots by renaming the server copy aside (out of the
-> target tree, see [Renaming a server copy aside](#operating-the-backup-server)); the next cycle sends a full
+> target tree, see [Renaming a server copy aside](#operating-the-backup-server)); the next attempt sends a full
 > stream into a fresh server dataset. Or, if they are expendable, **destroy** just them with the
 > `zfs destroy <server copy>@<first>%<last>` the ERROR prints (a `%` range is inclusive, by creation order; over
 > 64 newer snapshots it prints the open-ended `<first>%`, which runs to the newest);
-> the next cycle continues incrementally.
+> the next attempt continues incrementally.
 >
 > The one case the client lets the server roll back by itself: a snapshot it had just sent was deleted on the
 > client before the client could record the send. The server then holds exactly one snapshot the client never
-> recorded, newer than the client's recorded base, and the next cycle replaces it (the server logs a WARNING
+> recorded, newer than the client's recorded base, and the next attempt replaces it (the server logs a WARNING
 > naming it).
 
 Safe ways to bring a dataset back on the client:
 
 1. **Restore the server's NEWEST snapshot in place.** The next send is incremental from it and loses nothing.
    Negotiation finds the common snapshot by name, and the server checks the stream's base by guid; check the
-   next cycle in the log or with `zfsbackup-config check`.
+   next attempt in the log or with `zfsbackup-config check`.
 2. **Restore into a new dataset name** (and configure that name). The server stores it as a separate
    dataset, sent in full, and the old server copy stays untouched until you decide to destroy it.
-3. **Rename the server copy aside first** (above), then do whatever you need on the client. The next cycle
+3. **Rename the server copy aside first** (above), then do whatever you need on the client. The next attempt
    sends a full stream into a fresh server dataset, and the old history is kept under the aside name.
 
 It also pays to stop the sending while you work: disable the dataset (`zfsbackup-config set
@@ -1352,7 +1806,7 @@ When there is simply **no common snapshot** (the dataset on the client was repla
 you restored a snapshot the server does not have), the server never replaces or wipes its copy: it refuses a
 full stream onto a dataset that has snapshots (so would ZFS), encrypted or not. The client logs one ERROR and
 sends nothing for that dataset, which shows as remote lag turning CRIT in `check`, until you rename the server
-copy aside (above). The next cycle then sends a full stream into a fresh dataset. Keep the aside copy until you
+copy aside (above). The next attempt then sends a full stream into a fresh dataset. Keep the aside copy until you
 are satisfied.
 
 ### Recovering a whole host
@@ -1413,7 +1867,7 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   drain. Restrict the port by firewall.
 - **A TLS 1.3 key-update request during a stalled server write.** A client that sends a KeyUpdate request while
   the server is in the middle of a stalled write aborts that one transfer on OpenSSL 3.0 (Ubuntu 22.04 and 24.04);
-  it resumes on the next cycle. This is an OpenSSL limitation; zfsbackup clients never send such a request.
+  it resumes on the next attempt. This is an OpenSSL limitation; zfsbackup clients never send such a request.
 - **Revocation cuts running streams** within about 2 seconds (the partial receive is kept for a resume); a key
   rotation does not.
 - **Flood control is per address, with constants, no configuration**: a rate limit and 8 connections per
@@ -1426,9 +1880,10 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   ignore its expiry by design; a compromised server key means every client enrolls again.
 - **The daemon runs as root.** Only the group `zfsbackup` is created for operators.
 - **No metrics endpoint**; use `check --prometheus` with the textfile collector. **No bandwidth limit** and no
-  automatic per-client quota (set `zfs set quota`). A host's remote sends run one after another.
+  automatic per-client quota (set `zfs set quota`). A host sends at most 4 streams at once, 2 per destination.
 - **No bookmarks.** A destination that was removed from the configuration leaves its `anchor.*` property
-  pinning one snapshot per dataset until you clear it (the pruner protects every local anchor).
+  pinning one snapshot per dataset (per descendant of a recursive dataset too) until you clear it with `zfs inherit
+  -S` (the pruner protects every local anchor).
 - **A client with a different `snapshot_prefix`** is never pruned on the server (it keeps everything).
 - **No common snapshot means a refusal, not an overwrite.** If a client and its server copy have no snapshot
   in common (a restore of a snapshot the server does not have, a replaced dataset), the server refuses the
@@ -1451,8 +1906,10 @@ list with background is in [docs/production_readiness_report.md](../docs/product
 - **There is no restore over the API.** Restoring is ZFS work done by an operator (see [Restoring data](#restoring-data)).
 
 **Local destinations**
-- **Local and remote sends share one worker** and run one after another; a long local full send delays the
-  host's remote sends in that cycle.
+- **Local and remote sends share one worker and its 4 send slots** (2 per destination). A long local full send
+  occupies one slot, so it delays other pairs only when every slot is taken.
+- **A send blocked in a source-side `zfs` call keeps its slot** until the daemon stops (source-side calls are not
+  time-limited, and a reload or upgrade drain waits for it too); see [How sends are scheduled](#how-sends-are-scheduled).
 - **A stuck `zfs receive` is not remembered across worker restarts.** If a copy's pool hangs so badly that a
   receive survives SIGKILL, the next worker (after a reload, upgrade or crash) does not know about it: ZFS
   refuses its sends to that copy as busy, and each new worker can leave one more stuck process, until the
@@ -1461,6 +1918,25 @@ list with background is in [docs/production_readiness_report.md](../docs/product
   imported again (a removable disk that is usually detached will alert).
 - **Copies of a renamed dataset or a changed client id are not moved for you**: the CLI prints the commands
   when they are safe, otherwise the copy is orphaned and the next send is full.
+
+**Recursive datasets** (see [Recursive datasets](#recursive-datasets))
+- **A lagging child holds a snapshot name across the whole tree.** The recursive prune keeps the names that any
+  descendant's anchor or pin names, on every dataset of the tree, until that child catches up or its anchor is
+  cleared.
+- **A copy without markers** that is not under a known receive target (a hand-made `send | receive` without
+  properties, a syncoid replica) cannot be told from a source child: it is sent as one and pruned recursively.
+- **The `snapshot -r` fallback can snapshot into a backup copy.** When the copies below a recursive dataset cannot
+  be read (or the dataset list cannot be trusted or is too long for one command), the worker prefers a possible
+  stray snapshot in a copy to a missed source snapshot, and logs one ERROR per episode. Inside that fallback the
+  boundary retry cannot work (the rest of the tree may miss that period).
+- **Children are sent by one worker, at most 4 streams at once and 2 per destination**, a parent before its
+  children; the first full send of a big tree is the parent's time plus the children's, two at a time. At most 2048 send records are kept; a configuration with more dataset x destination pairs
+  logs one WARNING and `check` cannot report the least recently attempted.
+- **A name `libzfseasy` cannot represent** is skipped with libzfseasy's WARNING and no `check` entry.
+- **Anchors are keyed by the destination's name, not its URL**: after pointing a destination at a different copy,
+  the datasets' (and descendants') stale anchors stay until the first send replaces them (they do not delay it, but
+  `check` grades by them meanwhile); the CLI warns and prints the optional `zfs inherit -S` commands (see [Changing
+  the configuration](#changing-the-configuration)).
 
 **Operation**
 - **Stop the daemon to upgrade** (see [Upgrading](#upgrading-and-downgrading)). An in-place install is
@@ -1474,7 +1950,9 @@ list with background is in [docs/production_readiness_report.md](../docs/product
 **ZFS bindings (`libzfseasy`)**
 - **Pool names** containing `:` or inner spaces, which ZFS allows, are refused by the name validation, so
   datasets in such a pool cannot be configured.
-- **Names longer than 255 bytes** (`longname`, OpenZFS 2.3 and later) are skipped with a warning.
+- **Names longer than 255 bytes** (`longname`, OpenZFS 2.3 and later) are skipped with a warning, and so is a
+  name that ZFS allows but the validation refuses (for example a component starting with `.` or `-`). A
+  descendant of a recursive dataset with such a name is simply not sent.
 - **`zpool` must be installed**, though it is never used: both binaries are resolved when the program starts
   (`ZFS_CMD` and `ZPOOL_CMD` override the paths).
 - **A user property whose value is exactly `-`** reads back as unset.
@@ -1516,12 +1994,27 @@ zfsbackupd --test-config -c /path/to/config.db
 - **Schema errors (the database is newer or older than the program):** see [Upgrading](#upgrading-and-downgrading).
 - **The API address is in use** at startup: the daemon refuses to start until the port is free.
 
+### Descendants of a recursive dataset are not being sent
+
+1. `journalctl -u zfsbackup | grep -i 'descendants\|backup cop'`: "N descendants of X wait until its copy at D is
+   confirmed in this run" means the parent's own send to D has not succeeded yet and is waiting for its next
+   attempt (look at its `worker_send` entry in `check`; a parent still sending, or queued for a slot, logs nothing);
+   "Cannot list the descendants of X" is the discovery failing (the pool, a timeout); "… is a backup
+   copy … not sent" names a copy below the tree, with the `zfs rename` that moves it out.
+2. `zfsbackup-config check`: each child has its own `anchor` entry per destination; `descendants`, `copies` and
+   `(time limit)` entries explain the rest. A child "not yet sent" has no snapshot of its own yet (wait for the
+   parent's next snapshot).
+3. A child sent to a *different* copy than before (changed URL or target) can wait up to a period on its stale
+   anchor: see [Changing the configuration](#changing-the-configuration).
+
 ### Remote backups are not happening
 
 For a local `zfs:` destination see [Local destinations](#local-destinations): the usual causes are a target
 dataset that does not exist (or whose pool is exported), no client id, and a refused copy (the log names the fix).
 
-1. `zfsbackup-config check` (and `list destinations`): is the destination enrolled, and which side lags?
+1. `zfsbackup-config check` (and `list destinations`): is the destination enrolled, and which side lags? A pair is
+   tried at its own slot, not at once, and a failed one again at its next slot or within an hour (see [How sends are
+   scheduled](#how-sends-are-scheduled)); a daemon started a moment ago may simply not have reached it.
 2. `journalctl -u zfsbackup`: a 426 means client and server run different protocol versions; a
    refusal that names the server copy needs it renamed aside (see [Operating the backup server](#operating-the-backup-server)).
 3. `zfsbackup-config identity show`: is the client certificate valid and the id the one the server knows?

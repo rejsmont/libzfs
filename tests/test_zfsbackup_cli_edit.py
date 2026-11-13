@@ -67,6 +67,7 @@ from _cli_support import (
     generation,
     isolated,
     make_db,
+    plant_destination_name,
     run,
     scratch_tmp,
     stderr_lines,
@@ -728,6 +729,9 @@ class TestEditAnchorWarnings:
             warnings_in(result), "datasets[tank/data] no longer sends to 'offsite'"
         ) == 1
         assert "org.zfsbackup:anchor.offsite" in result.stderr
+        # the exact command: `-S` clears the local value and leaves a received one alone
+        assert "`zfs inherit -S org.zfsbackup:anchor.offsite tank/data`" in " ".join(result.stderr.split())
+        assert "zfs inherit org.zfsbackup:anchor.offsite" not in result.stderr
         # (the rest of the wording -- "stops protecting them from pruning" -- is
         # stale since the pruner protects every local anchor; deliberately not pinned)
 
@@ -737,6 +741,8 @@ class TestEditAnchorWarnings:
         assert result.exit_code == 0, result.stderr
         assert count_containing(warnings_in(result), "destination 'spare' is deleted") == 1
         assert sorted(stored(rich).destinations) == ["dc.two", "offsite"]
+        assert "`zfs inherit -S org.zfsbackup:anchor.spare <dataset>`" in " ".join(result.stderr.split())
+        assert "zfs inherit org.zfsbackup:anchor.spare" not in result.stderr
 
     def test_a_destination_dropped_from_a_dataset_and_deleted_warns_once(self, run, rich, stub, scratch_tmp):
         stub.plan([
@@ -747,6 +753,70 @@ class TestEditAnchorWarnings:
         assert result.exit_code == 0, result.stderr
         warned = [w for w in warnings_in(result) if "offsite" in w]
         assert len(warned) == 1 and "no longer sends to 'offsite'" in warned[0]
+
+    # -- a stored destination name that cannot form the anchor property ------------------------
+    # It never held an anchor or a pin, so the advice (`zfs inherit ... anchor.<name>`) would be an
+    # invalid command about a property that cannot exist.
+
+    @pytest.fixture
+    def bad(self, run, rich):
+        plant_destination_name(rich, "offsite", "bad name")
+        return rich
+
+    @staticmethod
+    def advice_free(result):
+        output = result.stdout + result.stderr
+        assert "zfs inherit" not in output
+        assert "anchor.bad name" not in output
+        assert "no longer sends to" not in output and "is deleted" not in output
+        assert [w for w in warnings_in(result) if "bad name" in w and "anchor" in w] == []
+
+    def test_deleting_an_unusable_destination_and_its_remote_entry_gives_no_anchor_advice(
+        self, run, bad, stub, scratch_tmp
+    ):
+        stub.plan([
+            {"replace": ['      - destination: "bad name"\n', ""]},
+            {"replace": ['  "bad name":\n    url: "https://offsite:8080"\n', ""]},
+        ])
+        result = edit(run, bad, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr          # the way out: the stored name is gone
+        assert sorted(stored(bad).destinations) == ["dc.two", "spare"]
+        self.advice_free(result)
+
+    def test_removing_an_unusable_destination_from_a_dataset_gives_no_anchor_advice(
+        self, run, bad, stub, scratch_tmp
+    ):
+        """Refused (the destination, still stored, is unusable), and without the "no longer sends to" advice."""
+        state = db_state(bad)
+        stub.plan([{"replace": ['      - destination: "bad name"\n', ""]}])
+        result = edit(run, bad, stub, "--no-prompt")
+        assert result.exit_code == 1
+        assert "destinations[bad name]: the name cannot form the ZFS properties" in result.stderr
+        assert db_state(bad) == state
+        self.advice_free(result)
+
+    def test_deleting_an_unreferenced_unusable_destination_gives_no_anchor_advice(
+        self, run, rich, stub, scratch_tmp
+    ):
+        plant_destination_name(rich, "spare", "bad name")
+        stub.plan([{"replace": ['  "bad name":\n    url: "https://spare:8080"\n', ""]}])
+        result = edit(run, rich, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert "bad name" not in stored(rich).destinations
+        self.advice_free(result)
+
+    def test_a_usable_name_still_gets_the_advice_in_the_same_edits(self, run, rich, stub, scratch_tmp):
+        """Control for the three tests above: only the unusable name is exempt."""
+        plant_destination_name(rich, "spare", "bad name")
+        stub.plan([
+            {"replace": ['  "bad name":\n    url: "https://spare:8080"\n', ""]},
+            {"replace": ['      - destination: "dc.two"\n        frequency: "4h"\n        retention:\n          "1d": "7d"\n', ""]},
+        ])
+        result = edit(run, rich, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        warned = warnings_in(result)
+        assert count_containing(warned, "no longer sends to 'dc.two'") == 1
+        assert [w for w in warned if "bad name" in w] == []
 
     def test_no_warning_when_nothing_is_dropped(self, run, rich, stub, scratch_tmp):
         stub.plan([replace('frequency: "4h"', 'frequency: "3h"')])
@@ -1282,23 +1352,67 @@ class TestEditRecreateWarning:
 
 
 class TestEditDestinationNames:
-    def test_creating_an_unusable_destination_name_only_warns(self, run, plain, stub, scratch_tmp):
+    def test_creating_an_unusable_destination_name_is_refused(self, run, plain, stub, scratch_tmp):
+        state, gen = db_state(plain), generation(plain)
         stub.plan([{"replace": ["datasets:", 'destinations:\n  "bad name":\n    url: "https://b"\n\ndatasets:']}])
         result = edit(run, plain, stub, "--no-prompt")
-        assert result.exit_code == 0, result.stderr
-        # the warning comes from validate_config (the single source), once
-        warned = [w for w in warnings_in(result) if "destinations[bad name]" in w]
-        assert len(warned) == 1
-        assert "the name cannot hold a ZFS anchor (it contains ' '" in warned[0]
-        assert "not protected from pruning" in warned[0]
-        assert "bad name" in stored(plain).destinations
+        assert result.exit_code == 1, result.stderr
+        # the refusal comes from validate_config (the single source), once, as a rejected buffer
+        refused = [l for l in stderr_lines(result) if "destinations[bad name]" in l]
+        assert len(refused) == 1 and refused[0].startswith("error: ")
+        assert "the name cannot form the ZFS properties" in refused[0]
+        assert "(it contains ' '" in refused[0]
+        assert "would not be protected from pruning" in refused[0]
+        assert "edit abandoned; nothing was written" in result.stderr
+        assert warnings_in(result) == []
+        assert db_state(plain) == state and generation(plain) == gen
+        assert "bad name" not in stored(plain).destinations
 
-    def test_an_existing_unusable_name_is_not_warned_about_again(self, run, db, stub, scratch_tmp):
-        make_db(run, db, 'destinations:\n  "bad name":\n    url: "https://b"\ndatasets:\n  - name: "tank/a"\n')
+    @pytest.mark.parametrize("name", ["", "a/b", "a@b", "caf\u00e9", "x" * 233])
+    def test_each_kind_of_unusable_name_is_refused(self, run, plain, stub, scratch_tmp, name):
+        state = db_state(plain)
+        stub.plan([{"replace": ["datasets:", f'destinations:\n  "{name}":\n    url: "https://b"\n\ndatasets:']}])
+        result = edit(run, plain, stub, "--no-prompt")
+        assert result.exit_code == 1
+        assert "the name cannot form the ZFS properties" in result.stderr
+        assert db_state(plain) == state
+
+    def test_the_longest_usable_name_is_accepted(self, run, plain, stub, scratch_tmp):
+        name = "x" * 232
+        stub.plan([{"replace": ["datasets:", f'destinations:\n  "{name}":\n    url: "https://b"\n\ndatasets:']}])
+        result = edit(run, plain, stub, "--no-prompt")
+        assert result.exit_code == 0, result.stderr
+        assert name in stored(plain).destinations
+
+    def test_a_refused_name_is_asked_about_again_and_can_be_fixed(self, run, plain, stub, scratch_tmp, tty):
+        stub.plan(
+            [{"replace": ["datasets:", 'destinations:\n  "bad name":\n    url: "https://b"\n\ndatasets:']}],
+            [replace("bad name", "good-name")],
+        )
+        result = edit(run, plain, stub, input="r\n")
+        assert result.exit_code == 0, result.stderr
+        assert "the name cannot form the ZFS properties" in result.stderr
+        assert "good-name" in stored(plain).destinations and "bad name" not in stored(plain).destinations
+
+    def test_an_existing_unusable_name_blocks_every_edit_and_is_reported(self, run, db, stub, scratch_tmp):
+        make_db(run, db, 'destinations:\n  "good":\n    url: "https://b"\ndatasets:\n  - name: "tank/a"\n')
+        plant_destination_name(db, "good", "bad name")
+        state = db_state(db)
         stub.plan([replace('frequency: "1h"', 'frequency: "2h"')])
         result = edit(run, db, stub, "--no-prompt")
-        assert result.exit_code == 0, result.stderr
-        assert [w for w in warnings_in(result) if "bad name" in w] == []
+        assert result.exit_code == 1, result.stderr
+        assert "destinations[bad name]: the name cannot form the ZFS properties" in result.stderr
+        assert db_state(db) == state
+
+    def test_renaming_a_stored_unusable_destination_in_the_buffer_points_at_rename(self, run, db, stub, scratch_tmp):
+        make_db(run, db, 'destinations:\n  "good":\n    url: "https://b"\ndatasets:\n  - name: "tank/a"\n')
+        plant_destination_name(db, "good", "bad name")
+        state = db_state(db)
+        stub.plan([replace('"bad name"', '"fixed"')])
+        result = edit(run, db, stub, "--no-prompt")
+        assert result.exit_code == 1
+        assert "rename destination bad name fixed" in result.stderr
+        assert db_state(db) == state
 
     def test_usable_names_are_not_warned_about(self, run, plain, stub, scratch_tmp):
         stub.plan([{"replace": ["datasets:", 'destinations:\n  "ok-1_x.y:z":\n    url: "https://b"\n\ndatasets:']}])

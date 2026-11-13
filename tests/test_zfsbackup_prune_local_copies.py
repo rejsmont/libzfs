@@ -872,8 +872,9 @@ class TestTheOverallBudget:
         assert local.LOCAL_ZFS_BUDGET == LOCAL_DISCOVER_COMMAND_BUDGET
 
     def test_the_budget_shrinks_the_command_limit_near_the_deadline_and_then_runs_out(self, world, mocker):
-        """100 s in all, 30 s per command on a fake monotonic clock: 60 s, 60 s, then what is left (40 s),
-        then the budget is spent and the discovery ends in an error without another command."""
+        """100 s in all, 30 s per command on a fake monotonic clock: 60 s, 60 s, then what is left, re-read
+        for each command (40 s, then 10 s), then the budget is spent and the discovery ends in an error
+        without another command."""
         clock = FakeTime()
         clock.frozen = 1000.0
         mocker.patch.object(bm, 'time', clock)
@@ -885,10 +886,10 @@ class TestTheOverallBudget:
         (outcome,) = mgr.last_local_discovery
         assert outcome.count == 0
         assert outcome.error == 'ZFSTimeoutError: the 100 s budget for discovering local copies is spent'
-        # list (left 100) and batch (left 70) at the command budget, then the first dataset's two reads
-        # (left 40) at what is left
+        # list (left 100) and batch (left 70) at the command budget, then the first dataset's two reads,
+        # each timed on its own: the first at what is left (40), the second at what is left after it (10)
         assert world.timeouts[:2] == [60.0, 60.0]
-        assert world.timeouts[2:] == [40.0, 40.0]
+        assert world.timeouts[2:] == [40.0, 10.0]
         assert len(world.argvs) == 4, 'nothing runs after the budget is spent'
 
     def test_a_spent_budget_before_the_first_command_runs_nothing(self, world, mocker):
@@ -1156,6 +1157,20 @@ class TestLocalCopyPruneTimeouts:
         assert verbs and all(t == (300.0 if v == 'destroy' else 60.0) for v, t in verbs), verbs
         assert any(v == 'destroy' for v, _ in verbs)
 
+    def test_a_copys_pass_never_reads_for_backup_copies(self, world):
+        """A2b: the copy read and the recursive snapshot listing are for a recursive SOURCE dataset. A local
+        copy is pruned non-recursively (its stamped `recursive` is dropped), so its pass issues neither, and
+        every destroy is non-recursive."""
+        mgr, found = self.copies(world)
+        start = len(world.argvs)
+        result = mgr.prune_snapshots(found['bk/A/tank/data'])
+        assert result.ok and result.pruned == len(OLD) - 1
+        issued = world.argvs[start:]
+        assert issued and not [a for a in issued if 'inherited' in ','.join(a)]
+        assert not [a for a in issued if '-r' in a], issued
+        assert all('-r' not in a for a in world.destroy_argvs)
+        assert mgr._copy_protect_noted == set()
+
     def test_a_source_dataset_is_pruned_untimed(self, world):
         world.add('tank/data')
         world.snaps['tank/data'] = list(OLD)
@@ -1298,17 +1313,17 @@ class TestEveryTimeoutSiteOfACopysPass:
         assert world.snaps['bk/A/tank/data'] == OLD or world.destroyed == []
 
     def test_the_single_property_read_raises_a_timeout_only_inside_a_copys_pass(self, world):
-        """`_get_prop` (behind `get_anchor`/`get_inflight`): "could not read" is "unset" for the senders and
+        """`_get_prop` / `_get_own_prop` (behind `get_anchor` / `get_own_inflight`): "could not read" is "unset" for the senders and
         the source datasets, but inside a copy's pass a timeout must propagate, never read as unset."""
         mgr, dsi = self.setup_pass(world)
         Hang(world, is_value)
         assert mgr.get_anchor(dsi, 'usb') is None                     # outside a pass: as before
-        assert mgr.get_inflight(dsi, 'usb') is None
+        assert mgr.get_own_inflight(dsi, 'usb') is None
         mgr._prune_timed = True
         with pytest.raises(ZFSTimeoutError):
             mgr.get_anchor(dsi, 'usb')
         with pytest.raises(ZFSTimeoutError):
-            mgr.get_inflight(dsi, 'usb')
+            mgr.get_own_inflight(dsi, 'usb')
 
     def test_the_snapshot_listing_is_debug_not_the_failed_to_list_error(self, world, caplog):
         mgr, dsi = self.setup_pass(world)

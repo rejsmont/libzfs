@@ -1,6 +1,6 @@
 from libzfseasy.types import InvalidNameError, InvalidValueError, Validate, ZFS, Dataset, Filesystem, Volume, Snapshot as Snapshot, Bookmark, \
      SnapshotRange, Property, Properties
-from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple, Tuple
+from typing import Optional, Union, Dict, Iterable, Callable, NamedTuple, Tuple, List, Sequence
 
 import collections
 import contextlib
@@ -68,8 +68,18 @@ _warned_lock = threading.Lock()
 # instead of going quiet for the rest of a long-lived process.
 _WARNED_NAMES_TTL = 3600.0
 _warned_names_since = None
-# Bumped (under the lock) every time `_skip_invalid_name` logs a WARNING, for callers that cannot see its return value.
+# Bumped (under the lock) every time `_skip_invalid_name` logs a WARNING, in any thread. Process-wide, so it must NOT be
+# diffed around a call to learn whether THAT call warned (another thread's warning would count); use
+# `_thread_name_warnings()` for that.
 _name_warnings = 0
+# The same count per thread: only the calling thread bumps its own, so a before/after diff around a call in one thread
+# says whether that call (and nothing running beside it) logged a per-name WARNING.
+_thread_warnings = threading.local()
+
+
+def _thread_name_warnings() -> int:
+    """How many per-name WARNINGs `_skip_invalid_name` has logged in the calling thread."""
+    return getattr(_thread_warnings, 'count', 0)
 
 
 def _skip_invalid_name(name: str, error: Exception) -> bool:
@@ -90,12 +100,14 @@ def _skip_invalid_name(name: str, error: Exception) -> bool:
             if len(_warned_names) == _MAX_WARNED_NAMES:
                 _warned_names.add(None)
                 _name_warnings += 1
+                _thread_warnings.count = _thread_name_warnings() + 1
                 logger.warning('skipping names from zfs output: more than %d distinct names libzfseasy cannot '
                                'represent; further ones are skipped silently', _MAX_WARNED_NAMES)
                 return True
             return False
         _warned_names.add(name)
         _name_warnings += 1
+        _thread_warnings.count = _thread_name_warnings() + 1
     logger.warning('skipping %r from zfs output: libzfseasy cannot represent this name (%s)', _clip(name), error)
     return True
 
@@ -360,6 +372,20 @@ class ZFSTimeoutError(Exception):
     """A command run under `timeout()` did not finish in time, or was refused because an earlier timed-out child is
     still alive. A plain `Exception` (not `OSError`, `ValueError` or the built-in `TimeoutError`). The outcome of a
     command that timed out is unknown: a write may or may not have happened."""
+
+
+class ZFSForkError(Exception):
+    """A command, or the `StreamHandle` of a `send`/`receive`, was started by one process and used from a process
+    forked from it. A plain `Exception` (like `ZFSTimeoutError` and `ZFSOutputError`): not an `OSError`, `ValueError`
+    or `RuntimeError`.
+
+    The child belongs to the process that spawned it. The fork inherits the generator, the `Popen` and its pipes, but
+    cannot wait for the child: `Popen.poll()`/`wait()` there fail with `ECHILD`, which the standard library turns into
+    a return code of 0. Carrying on would end a listing early as if it were complete, or report a failed or running
+    child as a clean exit, so the fork is refused instead, before it trusts anything it reads. The fork leaves the
+    child and its pipes alone (no signal, wait, close or stuck-child registration); the original process is
+    unaffected and still gets its complete result. Not raised by anything that only drops the object (closing or
+    collecting an inherited generator)."""
 
 
 _timeout_var = contextvars.ContextVar('libzfseasy_timeout', default=None)
@@ -746,7 +772,13 @@ class Command:
         Two opt-ins act here, both read when the generator first runs: a still-running child is reported by the
         slow-command watchdog (`slow_command_warning`), and under `timeout()` stdout is read against a deadline
         (`_read_until`) and an expired call ends in `_expire` and `ZFSTimeoutError`. Without a timeout the path is the
-        plain `readline` loop."""
+        plain `readline` loop.
+
+        Fork: a process forked while the generator is live inherits it, but the child belongs to the original process.
+        In the fork the generator's cleanup leaves the child and its pipes alone (no signal, wait, close or stuck-child
+        registration; see `_forked`) and just ends; the original process still cleans up after itself. Resuming it
+        there raises `ZFSForkError` instead of reading further (the fork cannot wait for the child, and a return code
+        it got would be a bogus 0), so a truncated listing never looks complete."""
         _log_command(cmd)
         seconds = _timeout_var.get()
         if seconds is not None:
@@ -754,6 +786,7 @@ class Command:
         started = time.monotonic()
         errors = _BoundedErrors()
         process = None
+        owner = None  # the pid that spawned the child (see `_forked`)
         stderr_thread = None
         watchdog = None
         deadline = None if seconds is None else started + seconds
@@ -761,6 +794,7 @@ class Command:
         completed = False
         settled = False
         try:
+            owner = os.getpid()  # before the spawn: no interruptible gap between a child and its owner
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
             stderr_thread = cls._start_stderr_reader_lines(process, errors)
             watchdog = _SlowCommandWatchdog.for_command(cmd, getattr(process, 'pid', None))
@@ -770,6 +804,9 @@ class Command:
             if fd is None:
                 timed = False
                 while True:
+                    # Resumed after a yield, in a fork? The pipe is shared with the parent: reading would steal its
+                    # output, and `poll()` below would answer ECHILD as a clean exit (see `ZFSForkError`).
+                    cls._refuse_fork(owner, cmd)
                     line = process.stdout.readline()
                     rc = process.poll()
                     if isinstance(line, (bytes, bytearray)):
@@ -782,11 +819,14 @@ class Command:
                     rc = process.wait()
             else:
                 try:
-                    rc = yield from cls._read_until(process, fd, deadline)
+                    rc = yield from cls._read_until(process, fd, deadline, owner, cmd)
                 except _DeadlineReached:
-                    error = cls._expire(process, stderr_thread, cmd, seconds)
+                    error = cls._expire(process, stderr_thread, cmd, seconds, owner)
                     settled = True  # the child is reaped or registered; the cleanup below must not repeat it
                     raise error from None
+            # A fork can also continue mid-call (a signal handler that forks and returns), not only at a yield: never
+            # take a return code obtained there for the child's.
+            cls._refuse_fork(owner, cmd)
             if timed:
                 # The budget bounds this wait too (the child has exited; only a grandchild holding stderr can stall it).
                 cls._join_stderr_reader(stderr_thread, min(_TERMINATE_TIMEOUT, max(0.0, deadline - time.monotonic())))
@@ -797,11 +837,16 @@ class Command:
             # The child first, the watchdog after: cancelling joins the watchdog's thread, and a second interrupt
             # arriving during that join must not skip the SIGTERM/SIGKILL below.
             try:
-                if not completed and not settled and process is not None and timed:
+                if cls._forked(owner):
+                    # A process forked from the one that spawned the child (this generator was inherited, then resumed,
+                    # closed or collected there): the child is the parent's, so nothing is signalled, waited for,
+                    # registered as stuck or closed here (see `_forked`).
+                    pass
+                elif not completed and not settled and process is not None and timed:
                     # Any exit other than the deadline (a consumer that raised, close() or GC of the generator, an
                     # interrupt): the same bounded sequence as an expiry, ending in the registry if the child survives
                     # SIGKILL. The original exception propagates afterwards.
-                    cls._reap_timed(process, stderr_thread, cmd)
+                    cls._reap_timed(process, stderr_thread, cmd, owner)
                 elif not completed and not settled and process is not None:
                     abandoned = cls._terminate_child(process, cmd)
                     if not abandoned:
@@ -809,10 +854,51 @@ class Command:
                         cls._join_stderr_reader(stderr_thread)
                         process.wait()
             finally:
-                if watchdog is not None:
-                    watchdog.cancel()
+                try:
+                    if process is not None:
+                        cls._close_child_pipes(process, stderr_thread, owner)
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
         if rc != 0:
             raise Exception(_failure_text(errors, rc))
+
+    @classmethod
+    def _refuse_fork(cls, owner, cmd, action: str = 'read') -> None:
+        """Raise `ZFSForkError` in a process forked from the one that spawned the child (`_forked`). Called wherever a
+        resumed or continuing call is about to read from the child's pipe or trust `poll()`/`wait()`, which in a fork
+        answer `ECHILD` as a clean exit (return code 0)."""
+        if cls._forked(owner):
+            raise ZFSForkError(f'{_command_label(cmd)}: this command was started by process {owner} and cannot be '
+                               f'{action} from a forked process (this is process {os.getpid()})')
+
+    @staticmethod
+    def _forked(owner) -> bool:
+        """True in a process forked from the one that spawned a child (`owner` is the spawner's pid, None before the
+        spawn). `os.fork()` leaves the generator, the `Popen` and its pipes in the forked process, but the child is
+        the parent's: it cannot be waited for or reaped there, and the parent's stderr reader (a thread that does not
+        exist after the fork) may have been inside `readline` holding the pipe's buffer lock, so closing the pipe in the
+        fork blocks for ever. The forked process therefore leaves the child and its pipes alone: no TERM/KILL, no
+        wait, no stuck-child registration and no close (the parent still owns and cleans all of it)."""
+        return owner is not None and os.getpid() != owner
+
+    @classmethod
+    def _close_child_pipes(cls, process, stderr_thread, owner=None) -> None:
+        """Close the parent's ends of a finished `_exec_lines` child's pipes, on every way out (completion, a non-zero
+        exit, an exception, an abandoned or closed generator, an expiry). Never blocks and never waits for the child.
+
+        stdout: this call is its only reader, so it is closed unconditionally (an abandoned child that still holds
+        the write end simply gets EPIPE if it ever writes). stderr: closed only once its reader thread has ended;
+        while the reader may still be inside the pipe (a stuck child, or a grandchild holding the write end) the fd
+        stays open, because closing a busy fd risks fd reuse (the stuck-child sweep or garbage collection closes it
+        later). Idempotent: `_reap_timed` may have closed them already. In a forked process (`_forked`) the pipes are
+        not ours and nothing is closed."""
+        if cls._forked(owner):
+            return
+        StreamHandle._close_pipe(getattr(process, 'stdout', None))
+        stderr = getattr(process, 'stderr', None)
+        if stderr is not None and (stderr_thread is None or not stderr_thread.is_alive()):
+            StreamHandle._close_pipe(stderr)
 
     @staticmethod
     def _timed_fd(process) -> Optional[int]:
@@ -825,7 +911,7 @@ class Command:
         return fd if isinstance(fd, int) and not isinstance(fd, bool) else None
 
     @staticmethod
-    def _read_until(process, fd: int, deadline: float):
+    def _read_until(process, fd: int, deadline: float, owner=None, cmd=None):
         """Generator behind `_exec_lines` under a timeout: yield the lines of the child's stdout (same framing and
         decoding as the `readline` path) reading with `selectors` and `os.read` so the wait can end at `deadline` (a
         monotonic time), then wait for the child to exit, also until `deadline`. Returns its return code. Raises
@@ -834,7 +920,10 @@ class Command:
 
         A child that has already exited when the deadline passes is not a timeout: what is already in the pipe is
         read without blocking and the call completes normally (if a grandchild still holds the pipe open, stdout is
-        closed here, this being its only reader)."""
+        closed here, this being its only reader).
+
+        `owner` and `cmd` (the spawner's pid and the argv) are for the fork guard: after every yield, and before every
+        `poll()`, a process forked from the spawner raises `ZFSForkError` (see `_refuse_fork`)."""
         selector = selectors.DefaultSelector()
         held = False
         try:
@@ -843,6 +932,7 @@ class Command:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    Command._refuse_fork(owner, cmd)
                     if process.poll() is None:
                         raise _DeadlineReached()
                     remaining = 0.0  # finished: take what is already there, never block
@@ -861,10 +951,12 @@ class Command:
                     if end < 0:
                         break
                     yield pending[start:end].decode('utf-8', errors='surrogateescape')
+                    Command._refuse_fork(owner, cmd)
                     start = end + 1
                 pending = pending[start:]
             if pending:
                 yield pending.decode('utf-8', errors='surrogateescape')
+            Command._refuse_fork(owner, cmd)
             rc = process.poll()
             if rc is None:
                 try:
@@ -876,11 +968,11 @@ class Command:
             return rc
         finally:
             selector.close()
-            if held:
+            if held and not Command._forked(owner):
                 StreamHandle._close_pipe(process.stdout)
 
     @classmethod
-    def _reap_timed(cls, process, stderr_thread, cmd) -> bool:
+    def _reap_timed(cls, process, stderr_thread, cmd, owner=None) -> bool:
         """Get rid of the child of a timed call that ends early. Returns True if the child could not be killed.
 
         If the child is running: SIGTERM, wait up to `_EXPIRY_WAIT`; SIGKILL, wait up to `_EXPIRY_WAIT`. A child that
@@ -888,7 +980,10 @@ class Command:
         stdout is closed either way: this thread is its only reader. stderr is never closed while its reader may be
         blocked on it: for a reaped child the reader is given `_EXPIRY_JOIN` and the pipe is closed only if it ended;
         a stuck child's stderr stays open (closing a busy fd risks fd reuse) until a sweep finds the child gone. A
-        further interrupt while waiting kills the child and propagates."""
+        further interrupt while waiting kills the child and propagates. In a forked process (`_forked`) the child and
+        its pipes are the parent's: nothing is done and False is returned."""
+        if cls._forked(owner):
+            return False
         stuck = False
         try:
             if process.poll() is None:
@@ -921,10 +1016,10 @@ class Command:
         return stuck
 
     @classmethod
-    def _expire(cls, process, stderr_thread, cmd, seconds) -> 'ZFSTimeoutError':
+    def _expire(cls, process, stderr_thread, cmd, seconds, owner=None) -> 'ZFSTimeoutError':
         """A timed call ran out of time with its child still running: reap it (`_reap_timed`) and build the
         `ZFSTimeoutError` to raise."""
-        stuck = cls._reap_timed(process, stderr_thread, cmd)
+        stuck = cls._reap_timed(process, stderr_thread, cmd, owner)
         message = f'{_command_label(cmd)} timed out after {seconds:g}s; outcome unknown'
         if stuck:
             message += f' (pid {process.pid} did not exit after SIGKILL)'
@@ -962,15 +1057,19 @@ class Command:
         printed (newline removed, indentation kept) for callers that parse structured stderr. The child is always
         reaped and the stderr thread joined (bounded, see `_join_stderr_reader`), even if the caller is interrupted.
         `env` replaces the child's environment when given (default: `_child_env()`, the C locale). Output is decoded as UTF-8 with
-        replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe)."""
+        replacement, so odd bytes can neither raise nor kill the stderr reader (which would leave the child blocked on a full pipe).
+        In a process forked mid-call the cleanup leaves the child and its pipes alone (see `_forked`) and the call
+        raises `ZFSForkError` rather than return what the fork read."""
         _log_command(cmd)
         errors = _BoundedErrors()
         process = None
         stderr_thread = None
         lines = []
         watchdog = None
+        owner = None  # the pid that spawned the child (see `_forked`)
         completed = False
         try:
+            owner = os.getpid()  # before the spawn: no interruptible gap between a child and its owner
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
                                        encoding='utf-8', errors='replace',
                                        env=_child_env() if env is None else env)
@@ -996,23 +1095,30 @@ class Command:
             if watchdog is not None:
                 watchdog.start()
             while True:
+                cls._refuse_fork(owner, cmd)  # a fork that continues the call would steal the parent's output
                 line = process.stdout.readline()
                 if line == '':
                     break
                 lines.append(line.rstrip('\n'))
+            cls._refuse_fork(owner, cmd)  # `wait()` in a fork answers ECHILD as a clean exit (see `ZFSForkError`)
             rc = process.wait()
+            cls._refuse_fork(owner, cmd)
             cls._join_stderr_reader(stderr_thread)
             completed = True
         finally:
             try:  # the child before the watchdog, as in `_exec_lines`
-                if not completed and process is not None:
+                if not completed and process is not None and not cls._forked(owner):
                     if process.poll() is None:
                         process.kill()
                         process.wait()
                     cls._join_stderr_reader(stderr_thread)
             finally:
-                if watchdog is not None:
-                    watchdog.cancel()
+                try:
+                    if process is not None:
+                        cls._close_child_pipes(process, stderr_thread, owner)
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
         return lines, list(errors), rc
 
     @staticmethod
@@ -1093,11 +1199,14 @@ class Command:
         thread._libzfseasy_joined = True
 
     @classmethod
-    def _abort_stream(cls, process, thread):
+    def _abort_stream(cls, process, thread, owner=None):
         """Reap a streaming child after a failed start (or an interrupt while starting): terminate it if it is
         still running, wait for it, join the stderr reader and close the pipes. Exceptions are swallowed, but the
         pipes are closed (and the child killed) even if a further interrupt arrives mid-cleanup; that interrupt
-        then propagates."""
+        then propagates. In a forked process (`owner`, see `_forked`) the child and its pipes are the parent's and
+        nothing is done."""
+        if cls._forked(owner):
+            return
         reaped = False
         try:
             try:
@@ -1151,12 +1260,44 @@ class StreamHandle:
         errors: list -- stderr lines captured so far (mutated in place, default [])
         stderr_thread: threading.Thread -- the thread appending the child's stderr lines to `errors`; joined by
             `close()` (default None: stderr is read directly in `close()` instead)
+        owner: int -- the pid of the process that spawned the child (default: this process; the stream cores pass
+            the pid they took before the spawn)
+
+    Fork. The child, the stream and the pipes belong to the process that spawned the child (`owner`). A process forked
+    from it (`os.fork()` with the handle alive) inherits the objects but cannot wait for the child (`Popen.poll()`/
+    `wait()` there answer `ECHILD`, which the standard library reports as return code 0), so it may only let go:
+      * `poll()` and `terminate()` raise `ZFSForkError` and touch nothing: no signal, no wait.
+      * `close()` closes the fork's own descriptor copies of the stream (and of `process.stdin`/`process.stdout`) at
+        the descriptor, without flushing and without taking any buffer lock, and then raises `ZFSForkError`. A copy
+        left open would keep a receive from seeing EOF (the owner's `close()` would wait for `zfs receive` for as long
+        as the fork lives) and keep a send from getting EPIPE. Closing a descriptor in the fork never affects the
+        owner's (separate descriptor tables). It reports nothing as closed, joins no reader, closes no stderr and
+        never flushes buffered bytes into the shared pipe.
+      * Every public attribute that is not a status query (`read`, `write`, `peek`, `readinto`, `flush`, `fileno`,
+        `raw`, `buffer`, ... everything but `closed`, `readable`, `writable`, `seekable`, `name`, `mode`,
+        `isatty`) raises `ZFSForkError` instead of being forwarded: a fork could otherwise take bytes from the owner's
+        send or inject bytes into its receive. Underscore names are forwarded as before.
+      * `pid` and an already-closed handle's `close()` still work.
+    Not covered: the stream object itself (what `with handle as stream` yields, or was taken before the fork) is a
+    plain buffered file and is not guarded, and when a fork is garbage-collected or the interpreter finalises there,
+    an unflushed `BufferedWriter` of a receive that was never `close()`d in the fork can still flush its buffered bytes
+    into the owner's receive. Known follow-up (not implemented): an `os.register_at_fork(after_in_child=...)` hook
+    that `dup2`s `/dev/null` over the inherited pipe descriptors. A fork that has called `close()` is safe from that,
+    as its stream's descriptor is already closed. Only the owner can close the handle for good and learn how the child
+    ended.
 
     Returns:
         None
     """
 
-    def __init__(self, process, stream, errors: Optional[list] = None, stderr_thread=None):
+    # Attributes of the wrapped stream that only report state: forwarded in a fork, everything else refused.
+    _FORK_SAFE_ATTRS = frozenset(('closed', 'readable', 'writable', 'seekable', 'name', 'mode', 'isatty'))
+    # Names of the wrapped stream whose refusal in a fork says what was attempted ("... cannot be <action> ...").
+    _FORK_WRITE_ATTRS = frozenset(('write', 'writelines', 'flush'))
+
+    def __init__(self, process, stream, errors: Optional[list] = None, stderr_thread=None, owner=None):
+        # The process that spawned the child (see `Command._forked`).
+        self._owner = os.getpid() if owner is None else owner
         self._process = process
         self._stream = stream
         self._errors = errors if errors is not None else []
@@ -1174,7 +1315,36 @@ class StreamHandle:
         return False
 
     def __getattr__(self, name):
+        # Only reached for names the handle does not define itself: the wrapped stream's methods and attributes. In a
+        # fork the I/O ones are refused (see the class docstring); `__dict__` is read so a half-built handle cannot
+        # recurse.
+        if not name.startswith('_') and name not in self._FORK_SAFE_ATTRS:
+            owner = self.__dict__.get('_owner')
+            if owner is not None and Command._forked(owner):
+                Command._refuse_fork(owner, getattr(self.__dict__.get('_process'), 'args', None),
+                                     'written' if name in self._FORK_WRITE_ATTRS else 'read' if name.startswith('read')
+                                     or name == 'peek' else 'used')
         return getattr(self._stream, name)
+
+    def _refuse_fork(self, action: str) -> None:
+        """`ZFSForkError` in a process forked from the one that created the handle (see the class docstring)."""
+        Command._refuse_fork(self._owner, getattr(self._process, 'args', None), action)
+
+    def _release_in_fork(self) -> None:
+        """In a forked process: close this process's own descriptor copies of the stream pipes, at the descriptor.
+
+        Never flushes (the buffered bytes belong to the owner's stream and a flush would write them into the shared
+        pipe a second time), takes no buffer lock (a lock the owner's thread held when the fork happened can never be
+        released here) and never signals or waits. Errors are ignored. The `Buffered` object closes quietly
+        afterwards, its raw being closed (as in `_close_abandoned`)."""
+        process = self._process
+        for pipe in (self._stream, getattr(process, 'stdin', None), getattr(process, 'stdout', None)):
+            if pipe is None or getattr(pipe, 'closed', False):
+                continue
+            try:
+                getattr(pipe, 'raw', pipe).close()
+            except Exception:
+                pass
 
     @property
     def pid(self):
@@ -1212,12 +1382,16 @@ class StreamHandle:
         but not yet recorded it. A pidfd would close it, but only on Linux and with extra fd bookkeeping, so it is not
         used.
 
+        Raises:
+            ZFSForkError -- in a process forked from the one that created the handle (nothing is signalled)
+
         Returns:
             bool -- True if the child was abandoned (it survived SIGKILL and may still be running), False otherwise
         """
         process = self._process
         if process is None:
             return False
+        self._refuse_fork('terminated')
         with self._terminate_lock:
             if self._terminate_done:
                 return self._abandoned
@@ -1250,12 +1424,17 @@ class StreamHandle:
         `poll()` is not None, call `close()`. Do not call `poll()` from a thread while another is inside `close()`'s
         `wait()` expecting an exact return code: both are safe, they just share the reaping.
 
+        Raises:
+            ZFSForkError -- in a process forked from the one that created the handle: it cannot see the child, and
+                `Popen.poll()` there would report a running child as exited with code 0
+
         Returns:
             int | None -- the child's return code, or None if it is still running or there is no process
         """
         process = self._process
         if process is None:
             return None
+        self._refuse_fork('polled')
         return process.poll()
 
     def _abandoned_and_running(self) -> bool:
@@ -1314,9 +1493,17 @@ class StreamHandle:
         exited by now, `close()` takes the normal path and reports its exit status.
 
         Bounded close: `close()` on a child that has not been abandoned is an unbounded `wait()`. Call it only once
-        `poll()` is not None or after `terminate()` if you need it bounded (see `poll()`)."""
+        `poll()` is not None or after `terminate()` if you need it bounded (see `poll()`).
+
+        In a process forked from the one that created the handle it closes that process's descriptor copies of the
+        stream (no flush, no lock, no signal, no wait) and raises `ZFSForkError`: it cannot wait for the child, so it
+        could not tell success from failure (see the class docstring). An already-closed handle is a no-op
+        everywhere."""
         if self._closed:
             return
+        if Command._forked(self._owner):
+            self._release_in_fork()
+            self._refuse_fork('closed')
         # A `terminate()` escalating in another thread holds the lock for up to ~10 s: wait for it (bounded, so a
         # re-entrant call from a signal handler on the terminating thread cannot deadlock) so the abandon decision is
         # not taken halfway through it. The lock is never held across the wait for the child below.
@@ -1741,25 +1928,136 @@ class SnapshotCommand(Command):
 
     @classmethod
     def _snapshot(cls, ds: Dataset, name: str, recursive: bool = False,
-                  properties: Optional[Properties] = None) -> Snapshot:
+                  properties: Optional[Properties] = None) -> Union[Snapshot, List[Snapshot]]:
+        """Create the snapshot `ds@name`, or with `recursive=True` the same-named snapshot of `ds` and every
+        descendant filesystem and volume in one atomic `zfs snapshot -r`.
+
+        Arguments:
+            ds: Dataset -- the dataset to snapshot
+            name: str -- the short snapshot name (what follows the `@`)
+
+        Keyword arguments:
+            recursive: bool -- snapshot the descendants too (`-r`; default False)
+            properties: dict -- user properties to set on the snapshot(s) (`-o`)
+
+        Returns:
+            A `Snapshot` when `recursive` is False. When it is True, a list of `Snapshot`s whose FIRST element is
+            always the snapshot of `ds` itself, followed by the descendants' as listed by `zfs list -r`.
+
+        The recursive form runs `zfs snapshot -r` FIRST and lists the descendants afterwards, best-effort, to build
+        the list. If that listing fails (zfs error, timeout under `timeout()`) or does not contain `ds`, one WARNING is
+        logged on the 'libzfseasy' logger and the list holds only what is known: the `Snapshot` of `ds` (and any
+        descendants a partial listing did return). A snapshot that was made is never reported as a failure, so a
+        caller must not read a short list as "the descendants were not snapshotted"; `-r` takes them all or none
+        (the list is the listing's view taken after the snapshot, so a dataset created in between can appear in it).
+        Previously the listing ran before `zfs snapshot -r`, so a failing listing raised and no snapshot was made,
+        and a row the listing dropped could leave `ds` out of (or not first in) the returned list.
+
+        Raises:
+            ValueError -- before zfs runs: an invalid dataset, name or property
+            Exception -- `zfs snapshot` failed (`ZFSTimeoutError` under `timeout()`); a failure of the later listing
+                is never raised
+        """
 
         snapshot = Snapshot(ds, name, properties)
-        # Before the recursive listing below, which already runs zfs.
         _check_values(snapshot.properties)
         cmd = [_zfs_cmd(), 'snapshot']
         if recursive:
             cmd += ['-r']
-            datasets = ListCommand()(ds, types='filesystem,volume', recursive=recursive)
-            result = [Snapshot(cds, name, properties) for cds in datasets]
-        else:
-            result = snapshot
         if properties:
             for k, v in snapshot.properties:
                 cmd += ['-o', k + '=' + str(v)]
         cmd += [str(snapshot)]
         cls._exec(cmd)
 
-        return result
+        if not recursive:
+            return snapshot
+
+        # The snapshots exist now: nothing below may turn that into a failure.
+        own = snapshot
+        rest = []
+        found = False
+        try:
+            for cds in ListCommand()(ds, types='filesystem,volume', recursive=True):
+                if cds.name == snapshot.dataset.name:
+                    own, found = Snapshot(cds, name, properties), True
+                else:
+                    rest.append(Snapshot(cds, name, properties))
+        except Exception as e:
+            logger.warning('zfs snapshot -r %s succeeded, but listing the descendants failed (%s); returning the '
+                           'snapshots known', _clip(str(snapshot)), _clip(str(e)))
+        else:
+            if not found:
+                logger.warning('zfs snapshot -r %s succeeded, but its listing did not contain the dataset itself; '
+                               'the result may be incomplete', _clip(str(snapshot)))
+        return [own] + rest
+
+    # The most argv one `snapshot.many()` command may carry (every argument plus its NUL, in bytes). A bound is
+    # needed because the command cannot be split without losing atomicity. 128 KiB is far below the smallest ARG_MAX
+    # in use (1 MiB on macOS, 2 MiB on Linux, both shared with the environment) and keeps the nvlist zfs hands the
+    # kernel small; it takes roughly a thousand datasets with typical names (a name is at most 255 bytes, so never
+    # fewer than ~500).
+    MANY_MAX_ARGV_BYTES = 128 * 1024
+
+    @classmethod
+    def many(cls, datasets: Sequence[Dataset], name: str,
+             properties: Optional[Properties] = None) -> List[Snapshot]:
+        """Snapshot several datasets under one short name with ONE command, so that all the snapshots are atomic (the
+        same txg): `zfs snapshot [-o k=v ...] a@name b@name c@name`. Never `-r`: the caller chooses the datasets.
+
+        zfs is all-or-nothing here: if one snapshot cannot be created (a name collision on one dataset, say) none is,
+        and the failure is raised like the single form's, with zfs's stderr (it names the dataset and ends with
+        `no snapshots were created`).
+
+        Arguments:
+            datasets: [Dataset] -- the datasets to snapshot (Filesystem, Volume or Dataset), in the order they are
+                passed to zfs and returned. One pool only
+            name: str -- the short snapshot name (what follows the `@`)
+
+        Keyword arguments:
+            properties: dict -- user properties to set on every snapshot (`-o`), as for the single form
+
+        Returns:
+            The `Snapshot` objects, in the order of `datasets`.
+
+        Raises:
+            ValueError -- before zfs runs: an empty list, a non-dataset entry, an invalid dataset, name or property,
+                a dataset twice, datasets from more than one pool (a single `zfs snapshot` cannot span pools: the
+                kernel refuses it with EXDEV), or more argv than `MANY_MAX_ARGV_BYTES` (never split into several
+                commands, which would not be atomic)
+            Exception -- zfs failed (`ZFSTimeoutError` under `timeout()`), with zfs's stderr as the message
+        """
+        if isinstance(datasets, (str, bytes, ZFS)) or not isinstance(datasets, Iterable):
+            raise ValueError('Expected a list of Filesystem, Volume or Dataset, got ' + type(datasets).__name__
+                             + ' instead')
+        datasets = list(datasets)
+        if not datasets:
+            raise ValueError('No datasets to snapshot')
+        if not isinstance(name, str):
+            raise ValueError('Expected a snapshot name, got ' + type(name).__name__ + ' instead')
+        snapshots = [Snapshot(ds, name, properties) for ds in datasets]  # validates every dataset and the name
+        _check_values(snapshots[0].properties)
+        seen = set()
+        for snapshot in snapshots:
+            if str(snapshot) in seen:
+                raise ValueError('Dataset %s listed twice' % _clip(snapshot.dataset.name))
+            seen.add(str(snapshot))
+        pools = {snapshot.dataset.name.split('/', 1)[0] for snapshot in snapshots}
+        if len(pools) > 1:
+            raise ValueError('An atomic snapshot cannot span pools (got %s)' % ', '.join(sorted(map(_clip, pools))))
+
+        cmd = [_zfs_cmd(), 'snapshot']
+        if properties:
+            for k, v in snapshots[0].properties:
+                cmd += ['-o', k + '=' + str(v)]
+        cmd += [str(snapshot) for snapshot in snapshots]
+        size = sum(len(a.encode('utf-8', 'surrogateescape')) + 1 for a in cmd)
+        if size > cls.MANY_MAX_ARGV_BYTES:
+            raise ValueError('Too many datasets for one atomic snapshot command: %d bytes of arguments, at most %d '
+                             '(it is not split, which would not be atomic)' % (size, cls.MANY_MAX_ARGV_BYTES))
+        cls._exec(cmd)
+
+        return snapshots
 
 
 class BookmarkCommand(Command):
@@ -2370,7 +2668,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
     @classmethod
     def property_sources(cls, ds: Optional[ZFSList] = None, types: Optional[StringList] = 'all',
                          sources: Optional[StringList] = 'all', recursive: bool = False, depth: int = 0,
-                         prefix: Optional[StringList] = None) -> list:
+                         prefix: Optional[StringList] = None, properties: Optional[Sequence[str]] = None) -> list:
         """Discover which properties exist on objects and where each comes from, with no values
         (`zfs get -H -o name,property,source [-s sources] [-r | -d depth] -t types all <ds>`): phase one of a
         fail-closed read. Phase two is an explicit-list `rows()` of just the names wanted.
@@ -2394,6 +2692,16 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             prefix: str | [str] -- keep only properties whose name starts with one of these (default None: all),
                 filtered here, after every row has been checked (so a malformed row is never hidden by it). A string is
                 one prefix, never a comma list
+            properties: [str] -- ask zfs for just these properties (their comma-joined names go where `all` would) instead
+                of every property (default None: `all`, argv unchanged). On a large tree `all` makes zfs print a row per
+                inherited native property per dataset. Each is validated as `Validate.attribute` (a known native name or a
+                user property with a `:`; `all`, names starting with `-`, an empty list and duplicates are refused; a
+                string is one name). zfs prints a row for every requested property on every object, an unset user property
+                as source `-` (all of 2.1.5, 2.2.2, 2.3.9 and 2.4.1 print `-  -  -` for value, received and source;
+                captured, `tests/fixtures/openzfs/*/M5_Z1.txt`): such a row means "not set" and is dropped from the
+                result, never returned as a row with a source (after being checked and counted for duplicates and
+                contiguity). A native property with source `-` (read-only or not applicable) is kept, as with `all`. A
+                row for a property that was not requested is refused. `prefix` still applies, on top
 
         Returns:
             A list of `PropertySource(name, property, source)` in the order zfs printed them (each object's rows
@@ -2427,11 +2735,31 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         for x in prefixes:
             if not isinstance(x, str) or not re.fullmatch(Validate.name, x, re.ASCII):
                 raise ValueError('%s is not a valid property name prefix' % _clip(repr(x)))
+        names = requested = None
+        if properties is not None:
+            if isinstance(properties, str):
+                names = [properties]
+            elif isinstance(properties, (list, tuple)):
+                names = list(properties)
+            else:
+                raise ValueError('properties must be None, a string or a list of strings, got %s'
+                                 % type(properties).__name__)
+            if not names:
+                raise ValueError('properties must not be empty')
+            for x in names:
+                if not isinstance(x, str) or x == 'all' or x.startswith('-'):
+                    raise ValueError(_clip(repr(x)) + ' is not a valid ZFS property name')
+                Validate.attribute(x)
+            if len(set(names)) != len(names):
+                raise ValueError('properties lists a property twice')
+            requested = frozenset(names)
 
         cmd = [_zfs_cmd(), 'get', '-H', '-o', 'name,property,source']
         if sources and 'all' not in sources:
             cmd += ['-s', ','.join(sources)]
-        cmd += cls._scope_options(recursive=recursive, depth=depth, types=types) + ['all'] + datasets
+        cmd += cls._scope_options(recursive=recursive, depth=depth, types=types) + [
+            'all' if names is None else ','.join(names)
+        ] + datasets
         scope = _Scope(datasets, recursive=recursive, depth=depth)
 
         found = []
@@ -2445,7 +2773,7 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             for line in lines:
                 if not line:
                     continue
-                problem = cls._source_row_problem(line, wanted, scope)
+                problem = cls._source_row_problem(line, wanted, scope, requested)
                 row = None
                 if problem is None:
                     row = PropertySource(*line.split('\t'))
@@ -2463,6 +2791,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
                     if first is None:
                         first = '%s: %r' % (problem, _clip(_redact(line)))
                     continue
+                if requested is not None and row.source == '-' and ':' in row.property:
+                    continue    # an unset user property: zfs prints it as `-`, it has no source
                 if not prefixes or row.property.startswith(tuple(prefixes)):
                     found.append(row)
         finally:
@@ -2473,8 +2803,10 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         return found
 
     @staticmethod
-    def _source_row_problem(line: str, wanted: Optional[set], scope: Callable[[str], bool]) -> Optional[str]:
-        """Why one `name<TAB>property<TAB>source` row of `property_sources()` cannot be trusted, or None."""
+    def _source_row_problem(line: str, wanted: Optional[set], scope: Callable[[str], bool],
+                            requested: Optional[frozenset] = None) -> Optional[str]:
+        """Why one `name<TAB>property<TAB>source` row of `property_sources()` cannot be trusted, or None. With
+        `requested` (an explicit property list), a row for any other property is refused."""
         cols = line.split('\t')
         if len(cols) != 3:
             return 'expected 3 columns, got %d' % len(cols)
@@ -2498,6 +2830,8 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
         if not (re.fullmatch(Validate.native, prop, re.ASCII) or
                 (':' in prop and len(prop) <= Validate.max_name_len and re.fullmatch(Validate.name, prop, re.ASCII))):
             return 'invalid property name'
+        if requested is not None and prop not in requested:
+            return 'a property that was not requested'
         if source not in _PLAIN_SOURCES:
             if not source.startswith(_INHERITED):
                 return 'invalid source'
@@ -2730,12 +3064,13 @@ class GetCommand(Command, StringListArgument, ZFSListArgument):
             skips.skip('%s (%r)' % (problem, _clip(name)))
             return None
         try:
-            before = _name_warnings
+            before = _thread_name_warnings()
             obj = GetCommand._build(name, dstype, properties)
             if obj is None:
                 # `_build` returns None only for a name libzfseasy cannot represent, and has reported it (or not,
-                # when the name was already reported: the serial says which).
-                skips.count_unrepresentable(name, warned=_name_warnings != before)
+                # when the name was already reported). The per-thread count says whether THIS call warned; the
+                # process-wide one would also move for a listing running in another thread.
+                skips.count_unrepresentable(name, warned=_thread_name_warnings() != before)
             return obj
         except ValueError as e:
             skips.skip('cannot build %r (%s)' % (_clip(name), _clip(e)))
@@ -2805,7 +3140,10 @@ class InheritCommand(Command):
             ds.check_property(prop)
 
         for prop in props:
-            cmd = [_zfs_cmd(), 'inherit', prop] + cls._get_options(recursive=recursive, received=received) + [str(ds)]
+            # Every option before the property: BSD/macOS/illumos getopt stops at the first operand, so
+            # `inherit <prop> -S <ds>` fails there (`cannot open '-S'`); glibc would permute.
+            cmd = [_zfs_cmd(), 'inherit'] + cls._get_options(recursive=recursive, received=received) + \
+                [prop, str(ds)]
             cls._exec(cmd)
             ds.update({prop: None})
 
@@ -3161,32 +3499,45 @@ class SendCommand(Command):
         _log_command(cmd)
         errors = _BoundedErrors()
         stderr_thread = None
+        owner = os.getpid()  # the spawner, taken before the spawn (see `_forked`); the handle carries it on
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env())
         try:
             # stderr is drained on its own thread from the start, so a child writing more than a pipe buffer of
             # diagnostics can neither block itself nor stall the stdout peek below.
             stderr_thread = cls._start_stderr_reader_bin(process, errors)
             if not peek:
-                return StreamHandle(process, process.stdout, errors, stderr_thread)
+                # Only a fork that continues this call from inside it (a signal handler that forks) can be here under
+                # another pid; the handle is built for the spawner either way, so it refuses use there too.
+                cls._refuse_fork(owner, cmd)
+                return StreamHandle(process, process.stdout, errors, stderr_thread, owner=owner)
             while True:
-                output = cls._exec_capture_bin(process, errors, stderr_thread)
+                output = cls._exec_capture_bin(process, errors, stderr_thread, owner)
+                # What the peek or `poll()` told a fork is not the child's (see `ZFSForkError`).
+                cls._refuse_fork(owner, cmd)
                 if output is False:
                     # Process exited successfully without ever producing output
                     # (e.g. an empty stream); still hand back a StreamHandle so
                     # callers have a uniform close()/context-manager API.
-                    return StreamHandle(process, process.stdout, errors, stderr_thread)
+                    return StreamHandle(process, process.stdout, errors, stderr_thread, owner=owner)
                 elif output is not None:
-                    return StreamHandle(process, output, errors, stderr_thread)
+                    return StreamHandle(process, output, errors, stderr_thread, owner=owner)
         except BaseException:
             # Startup failed (or was interrupted): leave no child, pipe or reader thread behind.
-            cls._abort_stream(process, stderr_thread)
+            cls._abort_stream(process, stderr_thread, owner)
             raise
 
     @classmethod
-    def _exec_capture_bin(cls, process, errors, stderr_thread=None) -> Union[bool, io.BufferedReader, None]:
+    def _exec_capture_bin(cls, process, errors, stderr_thread=None, owner=None) -> Union[bool, io.BufferedReader, None]:
+        # `owner` (the spawner's pid; None = no fork guard) makes a process forked from the spawner raise
+        # `ZFSForkError` before it touches the parent's pipes (peek takes the reader's buffer lock, and a close could
+        # wait for ever on a lock the parent's reader thread holds) and before it trusts `poll()`/`wait()`, which in
+        # a fork answer ECHILD as a clean exit.
+        label = getattr(process, 'args', None)
+        cls._refuse_fork(owner, label)
         # Guard against mocked processes without real stdout. peek() blocks until the first byte or EOF; stderr is
         # drained concurrently by `stderr_thread`, so that cannot deadlock on a chatty child.
         stdout = process.stdout.peek(8) if getattr(process, 'stdout', None) else b''
+        cls._refuse_fork(owner, label)  # a fork can continue the call from inside it (a signal handler)
         if len(stdout):
             return process.stdout
         # stdout hit EOF (or there is none): the child is finished or about to be. Block until it exits (never spin
@@ -3202,9 +3553,12 @@ class SendCommand(Command):
                         _append_error(errors, error)
             except Exception:
                 pass
+        cls._refuse_fork(owner, label)
         rc = process.poll()
         if rc is None:
+            cls._refuse_fork(owner, label)
             rc = process.wait()
+        cls._refuse_fork(owner, label)  # before the join and before any close: a fork's rc is not the child's
         cls._join_stderr_reader(stderr_thread)
         if rc != 0:
             StreamHandle._close_pipe(getattr(process, 'stdout', None))
@@ -3362,6 +3716,7 @@ class ReceiveCommand(Command, StringListArgument):
         # process.wait().
         errors = _BoundedErrors()
         stderr_thread = None
+        owner = os.getpid()  # the spawner, taken before the spawn (see `_forked`); the handle carries it on
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                    env=_child_env())
         try:
@@ -3370,13 +3725,14 @@ class ReceiveCommand(Command, StringListArgument):
             stderr_thread = cls._start_stderr_reader_bin(process, errors)
             # Poll once to catch immediate startup failures; zfs receive emits no stderr while waiting for data
             rc = process.poll()
+            cls._refuse_fork(owner, cmd)  # `poll()` in a fork answers ECHILD as a clean exit (see `ZFSForkError`)
             if rc is not None and rc != 0:
                 cls._join_stderr_reader(stderr_thread)
                 raise Exception(_failure_text(errors, rc))
         except BaseException:
-            cls._abort_stream(process, stderr_thread)
+            cls._abort_stream(process, stderr_thread, owner)
             raise
-        return StreamHandle(process, process.stdin, errors, stderr_thread)
+        return StreamHandle(process, process.stdin, errors, stderr_thread, owner=owner)
 
 
 class LoadKeyCommand(Command):

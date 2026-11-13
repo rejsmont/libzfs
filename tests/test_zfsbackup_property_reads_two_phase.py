@@ -290,6 +290,122 @@ class TestPropertiesChangedBetweenThePhases:
             read_zfsbackup_properties(Filesystem(DS))
 
 
+class TestRaceWithPinWriters:
+    """B3: the remote worker runs up to four senders at once, and the pruner's two-step read can race two of
+    them writing `anchor.<dest>` / `inflight.<dest>` on the SAME dataset (two destinations). Real threads: two
+    writers walk their destination through a chain step (pin set, anchor moved, pin cleared) while the
+    reader reads the protect-set over and over, switching threads at every zfs call.
+
+    The contract: a read either returns a set in which every destination's anchor is present (the protect-set
+    is never a SMALLER set than the truth at any instant: every state has an anchor) with only well-formed pins,
+    or raises `ZFSOutputError` ("changed while they were being read": the caller treats it as unknown and
+    prunes nothing). Never a result that lost an anchor, never another exception.
+
+    Mutation-checked (scratch copy): phase 2 not asking for the configured destinations' names (`also`) fails
+    this test (a pin set between the phases is missing from the result); see the counts at the top of this
+    file for the others."""
+
+    DESTS = ('d1', 'd2')
+    OLD, NEW = SNAP, SNAP2
+
+    def test_two_writers_never_make_the_read_lose_an_anchor(self, world):
+        import sys
+        import threading
+        import time
+
+        from _sendloop_support import bound
+
+        lock = threading.Lock()
+        states = {d: (self.OLD, None) for d in self.DESTS}        # dest -> (anchor, pin)
+
+        published = []                                  # every state the dataset was ever in, in order
+
+        def publish():
+            props = []
+            for d, (anchor, pin) in sorted(states.items()):
+                props.append((A + d, anchor, 'local'))
+                if pin is not None:
+                    props.append((IF + d, pin, 'local'))
+            published.append({name: value for name, value, _ in props})
+            world.set_props(DS, props)
+
+        world.add(DS)
+        publish()
+        stop = threading.Event()
+        steps = [0]
+
+        def writer(d):
+            old, new = self.OLD, self.NEW
+            while not stop.is_set():
+                pin = f'{old},{new}'
+                for state in ((old, pin), (new, pin), (new, None)):   # pin set; anchor moved; pin cleared
+                    with lock:
+                        states[d] = state
+                        publish()
+                    steps[0] += 1
+                    time.sleep(0)
+                old, new = new, old
+
+        held, frozen = [False], [None]
+
+        def hook(argv):
+            """At the second exec: stop the writers (the lock) and remember the state the dataset is in, so the
+            answer can be compared with exactly that state. The first exec races freely."""
+            if columns(argv) == VALUE_COLUMNS:
+                if not held[0]:
+                    lock.acquire()
+                    held[0] = True
+                frozen[0] = published[-1]
+            time.sleep(0)
+
+        world.on_exec = hook
+        writers = [threading.Thread(target=writer, args=(d,), daemon=True) for d in self.DESTS]
+        also = [name for d in self.DESTS for name in (A + d, IF + d)]
+        good, raised, bad = 0, 0, []
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            for w in writers:
+                w.start()
+            deadline = time.monotonic() + bound(20)
+            reads = 0
+            while reads < 150 and time.monotonic() < deadline:
+                reads += 1
+                try:
+                    result = read_zfsbackup_properties(Filesystem(DS), also=also)
+                except ZFSOutputError as e:
+                    assert 'changed while they were being read' in str(e), str(e)
+                    raised += 1
+                    continue
+                except BaseException as e:  # noqa: BLE001
+                    bad.append(repr(e))
+                    continue
+                finally:
+                    if held[0]:
+                        held[0] = False
+                        lock.release()
+                good += 1
+                # The second exec is authoritative and reads ONE state of the dataset: the answer must be exactly
+                # that state. A read that asked only for what the discovery found would miss a pin that was set
+                # between the two execs.
+                if result != frozen[0]:
+                    bad.append(f'the answer is not the state of the second exec: {result} != {frozen[0]}')
+                for d in self.DESTS:
+                    if result.get(A + d) not in (self.OLD, self.NEW):
+                        bad.append(f'anchor of {d} lost or wrong: {result}')
+                    pin = result.get(IF + d)
+                    if pin is not None and pin not in (f'{self.OLD},{self.NEW}', f'{self.NEW},{self.OLD}'):
+                        bad.append(f'malformed pin of {d}: {pin!r}')
+        finally:
+            stop.set()
+            sys.setswitchinterval(old_interval)
+            for w in writers:
+                w.join(bound())
+        assert bad == [], bad[:5]
+        assert good >= 20 and steps[0] > 50, f'the race did not happen: {good} good reads, {steps[0]} writer steps'
+        assert good + raised == reads
+
+
 class TestEmptyDiscovery:
     def test_the_own_read_still_asks_for_type_and_never_reads_as_no_anchors_without_it(self, world):
         world.add(DS, [('compression', 'lz4', 'local')])
@@ -442,7 +558,7 @@ class TestThroughThePruner:
         assert group, 'the control: there is something to destroy, so [] is the read\'s doing'
         with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
             assert manager._still_prunable(dsi, group) == []
-        (error,) = records(caplog, logging.ERROR, 'Cannot re-read the anchors')
+        (error,) = records(caplog, logging.ERROR, 'Cannot re-read what protects')
         assert 'changed while they were being read' in error
         assert prune_pool.calls == []
 

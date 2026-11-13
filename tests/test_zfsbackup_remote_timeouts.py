@@ -154,13 +154,13 @@ def transfer(rbm_dsi, mocker, stream, ws, mode="fresh", inflight=False, sent=Non
     mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
     lm = manager.local_manager
     set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
-    get_anchor = mocker.patch.object(lm, "get_anchor", return_value=None)
+    get_local_anchor = mocker.patch.object(lm, "get_local_anchor", return_value=None)
     clear_inflight = mocker.patch.object(lm, "clear_inflight", return_value=True)
     set_inflight = mocker.patch.object(lm, "set_inflight", return_value=True)
     # a failed step re-lists to see whether its snapshot vanished: it has not
     mocker.patch.object(lm, "list_snapshots", return_value=[latest])
     result = manager._transfer(tr(), "client1", dsi, latest, common, "offsite", snapshots=[latest], **kwargs)
-    return Outcome(result, set_anchor, get_anchor=get_anchor, clear_inflight=clear_inflight,
+    return Outcome(result, set_anchor, get_local_anchor=get_local_anchor, clear_inflight=clear_inflight,
                    set_inflight=set_inflight)
 
 
@@ -768,7 +768,7 @@ from zfsbackup.remote import (  # noqa: E402
 
 REFUSAL = {"error": "server is reloading; retry later", "retry": True}
 REFUSAL_JSON = json.dumps(REFUSAL)
-RELOADING_MSG = "is reloading; skipping pool/data this cycle"
+RELOADING_MSG = "is reloading; skipping pool/data this attempt"
 
 
 def levels(caplog, text=None):
@@ -926,11 +926,11 @@ class TestLogRefusal:
 
     def test_busy_is_info_with_its_own_wording(self, caplog):
         assert self.logged(caplog, {"error": "busy", "retry": True}) == [
-            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this cycle")]
+            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this attempt")]
 
     def test_the_reload_refusal_is_info(self, caplog):
         assert self.logged(caplog, {"error": "server is reloading; retry later", "retry": True}) == [
-            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
+            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this attempt")]
 
     @pytest.mark.parametrize("result, shown", [
         ({"retry": True}, "unknown"),
@@ -944,17 +944,17 @@ class TestLogRefusal:
         got = self.logged(caplog, result)
         assert [lv for lv, _ in got] == ["INFO"]
         msg = got[0][1]
-        assert msg.startswith(f"server {self.URL_} asks to retry pool/data (") and msg.endswith("); skipping this cycle")
+        assert msg.startswith(f"server {self.URL_} asks to retry pool/data (") and msg.endswith("); skipping this attempt")
         assert expected in msg
         assert "is reloading" not in msg and "is busy" not in msg
 
     def test_the_real_busy_and_reloading_refusals_keep_their_own_wording(self, caplog):
         from zfsbackup import api
         assert self.logged(caplog, api.BUSY_ERROR) == [
-            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this cycle")]
+            ("INFO", f"server {self.URL_} is busy with another stream of pool/data; skipping this attempt")]
         caplog.clear()
         assert self.logged(caplog, api.RELOADING_ERROR) == [
-            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this cycle")]
+            ("INFO", f"server {self.URL_} is reloading; skipping pool/data this attempt")]
 
     def test_a_non_retryable_refusal_is_an_error_with_the_servers_text(self, caplog):
         assert self.logged(caplog, {"error": "pool/backups/c1/data is held for pool/other"}) == [
@@ -1004,7 +1004,7 @@ class TestRefusalAsTheFinalAck:
         assert result is False
         set_anchor.assert_not_called()
         assert "ERROR" not in levels(caplog)
-        assert f"server {URL} is busy with another stream of pool/data; skipping this cycle" in caplog.text
+        assert f"server {URL} is busy with another stream of pool/data; skipping this attempt" in caplog.text
 
     def test_a_non_retryable_final_ack_keeps_the_transfer_failed_wording(self, rbm, mocker, caplog):
         ws = ok_ws()
@@ -1194,7 +1194,7 @@ class TestRefusalDiscoveredAfterASendFailure:
         assert result is False
         set_anchor.assert_not_called()
         assert levels(caplog, "pool/data") == ["INFO"]
-        assert f"server {URL} is busy with another stream of pool/data; skipping this cycle" in caplog.text
+        assert f"server {URL} is busy with another stream of pool/data; skipping this attempt" in caplog.text
         assert "Transfer failed" not in caplog.text and "Broken pipe" not in caplog.text
         assert stream.closes == 1
         ws.recv.assert_called_once()
@@ -1485,7 +1485,7 @@ class TestPinAndAnchorAfterTheTransfer:
         stream, ws = FakeStream(), ok_ws()
         stub_start(mocker, manager, stream, inflight=True)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
-        mocker.patch.object(manager.local_manager, "get_anchor", return_value=None)
+        mocker.patch.object(manager.local_manager, "get_local_anchor", return_value=None)
         mocker.patch.object(manager.local_manager, "set_anchor", return_value=False)
         clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         dsi = rbm[1]
@@ -1521,7 +1521,7 @@ class TestResumeAnchorRules:
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         lm = manager.local_manager
         set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
-        mocker.patch.object(lm, "get_anchor", return_value=existing)
+        mocker.patch.object(lm, "get_local_anchor", return_value=existing)
         clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
         snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
         # a stop request right after the resume: the chain that would go on to NEW is not run here
@@ -1571,7 +1571,7 @@ class TestResumeAnchorRules:
         stub_start(mocker, manager, FakeStream(), "fresh", True, snapshot(MID), None)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ws)
         set_anchor = mocker.patch.object(manager.local_manager, "set_anchor", return_value=True)
-        mocker.patch.object(manager.local_manager, "get_anchor", return_value=NEW)
+        mocker.patch.object(manager.local_manager, "get_local_anchor", return_value=NEW)
         clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         snaps = [snapshot(NEW), snapshot(MID)]
         manager._transfer(tr(), "client1", dsi, snaps[1], None, "offsite", snapshots=snaps)
@@ -1583,7 +1583,7 @@ class TestResumeAnchorRules:
         stub_start(mocker, manager, FakeStream(), "fresh", True, snapshot(NEW), None)
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
         set_anchor = mocker.patch.object(manager.local_manager, "set_anchor", return_value=True)
-        mocker.patch.object(manager.local_manager, "get_anchor", return_value=MID)
+        mocker.patch.object(manager.local_manager, "get_local_anchor", return_value=MID)
         clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         snaps = [snapshot(NEW), snapshot(MID)]
         manager._transfer(tr(), "client1", dsi, snaps[0], None, "offsite", snapshots=snaps)
@@ -1594,7 +1594,7 @@ class TestResumeAnchorRules:
         manager, dsi = rbm
         stub_start(mocker, manager, FakeStream(), "resume", True, snapshot(MID), snapshot(OLD))
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
-        mocker.patch.object(manager.local_manager, "get_anchor", return_value=OLD)
+        mocker.patch.object(manager.local_manager, "get_local_anchor", return_value=OLD)
         mocker.patch.object(manager.local_manager, "set_anchor", return_value=False)
         clear = mocker.patch.object(manager.local_manager, "clear_inflight")
         snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
@@ -1613,7 +1613,7 @@ class TestPushStepClearPin:
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
         lm = manager.local_manager
         set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
-        mocker.patch.object(lm, "get_anchor", return_value=existing)
+        mocker.patch.object(lm, "get_local_anchor", return_value=existing)
         clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
         snaps = [snapshot(NEW), snapshot(MID), snapshot(OLD)]
         step = next(s for s in snaps if s.name == sent)
@@ -1645,7 +1645,7 @@ class TestPushStepClearPin:
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=ok_ws())
         lm = manager.local_manager
         mocker.patch.object(lm, "set_anchor", return_value=True)
-        mocker.patch.object(lm, "get_anchor", return_value=None)
+        mocker.patch.object(lm, "get_local_anchor", return_value=None)
         clear = mocker.patch.object(lm, "clear_inflight", return_value=True)
         snaps = [snapshot(NEW)]
         manager._push_step(tr(), "client1", dsi, "offsite", snaps, started(FakeStream(), "fresh", True, snaps[0], None))
@@ -1729,7 +1729,7 @@ class TestRealResumeStreamUnderTimeouts:
         )
         self.clear_inflight = mocker.patch.object(lm, "clear_inflight", return_value=True)
         self.set_anchor = mocker.patch.object(lm, "set_anchor", return_value=True)
-        mocker.patch.object(lm, "get_anchor", return_value=None)
+        mocker.patch.object(lm, "get_local_anchor", return_value=None)
         self.ws = ws or ok_ws()
         mocker.patch("zfsbackup.remote.websocket.WebSocket", return_value=self.ws)
 
@@ -1781,7 +1781,7 @@ class TestRealResumeStreamUnderTimeouts:
         with caplog.at_level(logging.INFO):
             assert self.run(rbm) is False
         assert "ERROR" not in levels(caplog)
-        assert "is reloading; skipping pool/data this cycle" in caplog.text
+        assert "is reloading; skipping pool/data this attempt" in caplog.text
         self.set_anchor.assert_not_called()
         self.clear_inflight.assert_not_called()
 

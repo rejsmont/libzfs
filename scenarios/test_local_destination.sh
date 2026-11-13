@@ -6,6 +6,7 @@
 # One disposable VM, `zfsb-local` (Ubuntu 24.04, OpenZFS 2.2 by default), two file-backed pools:
 #   zblsrc  the SOURCE pool:  zblsrc/plain (unencrypted) and zblsrc/enc (passphrase-encrypted, key loaded -> raw: auto)
 #   zbbak   the BACKUP pool:  zbbak/zfsbackup is the target (made by the operator, `zfs create -o canmount=off`)
+# (scenario 7 adds the tree zblsrc/rec/... to the source pool)
 # The daemon is the real `python -m zfsbackup.daemon` under a transient systemd unit, started from the shipped tree
 # with a SQLite config DB that `zfsbackup-config import` filled; the destination is
 #     destinations: { local1: { url: "zfs:zbbak/zfsbackup" } }
@@ -42,7 +43,20 @@
 #      exactly ONE snapshot, the newest, and stays there for 3 prune cycles; the next snapshot still arrives incrementally
 #   6  `zfsbackup-config check` grades both dataset x local1 anchors OK once caught up (JSON; exit 0); `list destinations`
 #      again
-#   7  clean exit: the daemon is stopped (no zfsbackup process, no zfs send/receive left), no Traceback in its log, the
+#   7  a RECURSIVE tree (sender rework, Track A; plan docs/sender_rework_plan.md, item A6b): zblsrc/rec (`recursive: true`, an
+#      unencrypted parent) with an ENCRYPTED child (its own encryption root: raw), a grandchild inheriting that encryption, an
+#      unencrypted child and a zvol, with the destination retention 1s:120s stamped on every copy. (a) every descendant gets its
+#      own copy at <target>/<id>/<pool>/<path> (parent first), plain or raw per child, with the forced properties and a copy
+#      config naming the CHILD (recursive: false), and its own LOCAL anchor (the inherited-anchor regression: a child never
+#      reads its parent's); (b) a backlog of three recursive snapshots goes out as a chain for every child; (c) children
+#      CREATED mid-run (`late`, `gone`) are discovered and sent (a full, then incrementals); `gone` is then DESTROYED on the
+#      source: its copy stays and the host's pruner thins it to its newest snapshot by the retention stamped on it; (d)
+#      `check --json` grades one anchor per child x destination (OK once caught up; `gone` is no longer listed); (e) a BACKUP COPY
+#      planted below the recursive dataset (it carries org.zfsbackup:client_id / source_dataset) is never snapshotted (the
+#      worker takes ONE atomic `zfs snapshot` over the source datasets instead of `-r`: one createtxg), never sent, never
+#      pruned (a snapshot NAME it holds is kept across the whole tree, a name it lacks is pruned from the source children),
+#      and `check` shows a `copies` WARN naming it
+#   8  clean exit: the daemon is stopped (no zfsbackup process, no zfs send/receive left), no Traceback in its log, the
 #      pools are destroyed, the VM is deleted (unless a keep flag is given)
 #
 # Usage (from the repository root):
@@ -50,6 +64,7 @@
 #   ./scenarios/test_local_destination.sh --keep         # leave the daemon, pools and VM in place (to inspect)
 #   ./scenarios/test_local_destination.sh --keep-pools   # remove the daemon and config, keep the pools and the VM
 #   ./scenarios/test_local_destination.sh --keep-vm      # clean the VM up (daemon, config, pools) but do not delete it
+#   ./scenarios/test_local_destination.sh --only-rec     # scenarios 1, 7, 8 only (setup, the recursive tree, clean exit): ~12 minutes
 #   ./scenarios/test_local_destination.sh --purge        # accepted: deleting the VM (multipass delete --purge: only this
 #                                                        # VM) is already the default
 #   SRC_REF=<commit-ish> ...    # the tree shipped to the VM (default HEAD); SRC_REF=WORKTREE ships the working tree as it
@@ -65,7 +80,8 @@
 #
 # Exit status: 0 when every assertion passed, 1 otherwise or when the run could not complete, 2 on usage errors.
 # Needs multipass and git on the host. Never touches ZFS on the host and never any VM but the one named above. About
-# 15 minutes (the VM install, ~6 minutes of waiting for prune ages and the 130 s outage of scenario 4 included).
+# 30 minutes (the VM install, ~6 minutes of waiting for prune ages, the 130 s outage of scenario 4 and the recursive tree of
+# scenario 7 included).
 
 set -uo pipefail
 
@@ -87,6 +103,10 @@ SRC_POOL="zblsrc"
 BAK_POOL="zbbak"
 SRC_PLAIN="${SRC_POOL}/plain"
 SRC_ENC="${SRC_POOL}/enc"
+R_TOP="${SRC_POOL}/rec"                                # scenario 7: the recursive tree
+R_ENC="${R_TOP}/enc"; R_INNER="${R_ENC}/inner"; R_PLAIN="${R_TOP}/plain"; R_VOL="${R_TOP}/vol"
+R_LATE="${R_TOP}/late"; R_GONE="${R_TOP}/gone"; R_REPL="${R_TOP}/replica"
+R_RET="120"                                            # seconds: the destination retention (1s:<R_RET>s) stamped on the copies
 TARGET="${BAK_POOL}/zfsbackup"
 DEST="local1"
 BIGFILE="big.bin"
@@ -106,13 +126,14 @@ KEYFILE="/root/zfsb-local.key"
 UNIT="zfsbackup"
 
 # Flags
-KEEP=0; KEEP_POOLS=0; KEEP_VM=0
+KEEP=0; KEEP_POOLS=0; KEEP_VM=0; ONLY_REC=0
 for arg in "$@"; do
     case "$arg" in
         --keep)       KEEP=1; KEEP_POOLS=1; KEEP_VM=1 ;;
         --keep-pools) KEEP_POOLS=1; KEEP_VM=1 ;;
         --keep-vm)    KEEP_VM=1 ;;
         --purge)      ;;     # the default
+        --only-rec)   ONLY_REC=1 ;;  # scenarios 1, 7 and 8 only (the recursive tree), for iterating on 7
         -h|--help)    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
@@ -400,7 +421,15 @@ ck_expr() { jfile /tmp/zfsb-ck.out "$1"; }
 ck_anchor_states() { ck_expr '",".join(sorted(e["subject"] + ":" + e.get("peer", "") + "=" + e["state"] for e in d["entries"] if e["source"] == "anchor"))' | tr -d '[:space:]'; }
 
 loglines() { msh "wc -l < '$LOG'" | tr -d '[:space:]'; }
-log_since() { msh "tail -n +$(( $1 + 1 )) '$LOG'"; }
+# The slice can be tens of thousands of lines: streamed through `multipass exec` stdout on macOS, the host client
+# was seen spinning for hours after the guest command had exited (rc6 checks). Move it with `multipass transfer`.
+log_since() {
+    local out="$WORK/log_since.txt"
+    msh "tail -n +$(( $1 + 1 )) '$LOG' > /tmp/zfsb-log-since.txt; chmod 0644 /tmp/zfsb-log-since.txt" || return 1
+    rm -f "$out"
+    multipass transfer "$LOCAL_VM:/tmp/zfsb-log-since.txt" "$out" >/dev/null 2>&1 || return 1
+    cat "$out"
+}
 
 # config: write_config <snapshot frequency> [<destination retention items, e.g. '"1m": "2m"'>]
 # The destination's retention overrides the dataset's for the COPIES (the config stamped on them); empty = inherit.
@@ -494,6 +523,22 @@ subset_ok() { # subset_ok <source ds>
 }
 copy_token() { local t; t="$(zv receive_resume_token "$(copy_of "$1")")"; printf '%s' "${t:--}"; }
 token_clear() { [ "$(copy_token "$1")" = "-" ]; }
+# scenario 7: the dataset's LOCAL anchor.<dest> (empty when unset or only inherited/received: a child never reads its parent's)
+local_anchor_of() { local v; v="$(zvs "org.zfsbackup:anchor.${DEST}" "$1")"; case "$v" in *" local") printf '%s' "${v% local}" ;; esac; }
+rec_all=("$R_TOP" "$R_ENC" "$R_INNER" "$R_PLAIN" "$R_VOL")      # the datasets of the tree from the start (late/gone join later)
+# a recursive snapshot of the whole tree, taken now (the 2 s sleep keeps names unique); prints the short name
+snap_rec() {
+    local n="" i
+    for i in 1 2 3; do
+        sleep 2
+        n="$(msh "n=autosnap_\$(date -u +%Y%m%d%H%M%S); zfs snapshot -r '$R_TOP'@\$n && echo \$n" | tr -d '[:space:]')"
+        [ -n "$n" ] && break
+    done
+    printf '%s' "$n"
+}
+rec_first_done() { local d; for d in "${rec_all[@]}"; do [ -n "$(snaps "$(copy_of "$d")")" ] && [ -n "$(local_anchor_of "$d")" ] || return 1; done; }
+rec_copies_have() { local d; for d in "$@"; do copy_has "$d" "$REC_N" || return 1; done; }     # every dataset in "$@" has $REC_N with the source's guid
+rec_copy_cfg() { msh "zfs get -H -o value org.zfsbackup:config '$(copy_of "$1")' | base64 -d 2>/dev/null | '$PY' '$JGET_PY' '$2'" | tr -d '[:space:]'; }   # rec_copy_cfg <source ds> '<expr over d>'
 
 # the forced and owned properties of one copy
 check_copy_props() { # check_copy_props <label> <source ds>
@@ -593,6 +638,7 @@ start_daemon
 wait_for 60 daemon_active || fail "(1) the daemon unit is not active"
 check "(1) the daemon is running" "yes" "$(daemon_active && echo yes || echo no)"
 
+if [ "$ONLY_REC" -eq 0 ]; then    # (--only-rec skips scenarios 2-6)
 # ───────────────────────────────── 2 ────────────────────────────────────────
 echo
 step "2 — first full send, then a chain of incremental steps; the copies' path, properties and guids"
@@ -877,16 +923,242 @@ check_has "(6) list destinations still shows $DEST as local" "${DEST} +local +zf
 out="$(cli list datasets)"
 check_has "(6) list datasets shows both datasets sending to $DEST" "${SRC_PLAIN}.*${DEST}" "$out"
 
+fi    # ONLY_REC
 # ───────────────────────────────── 7 ────────────────────────────────────────
 echo
-step "7 — clean exit"
+step "7 — a recursive tree: every descendant is its own copy (raw where encrypted), children come and go, a planted backup copy is left alone"
 stop_daemon
 sleep 3
-check "(7) no zfsbackup daemon/worker process is left" "0" "$(daemon_procs)"
-check "(7) no zfs send/receive process is left" "0" "$(xfer_procs)"
-check "(7) the unit is gone or inactive" "yes" "$(daemon_active && echo no || echo yes)"
+msh "
+    set -e
+    zfs create '$R_TOP'
+    zfs create -o encryption=on -o keyformat=passphrase -o keylocation=file://$KEYFILE '$R_ENC'
+    zfs create '$R_INNER'
+    zfs create '$R_PLAIN'
+    zfs create -V 8M '$R_VOL'
+    for d in '$R_TOP' '$R_ENC' '$R_INNER' '$R_PLAIN'; do
+        dd if=/dev/urandom of=\$(zfs get -H -o value mountpoint \$d)/seed.bin bs=1M count=2 status=none
+    done
+    udevadm settle || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do [ -b /dev/zvol/$R_VOL ] && break; sleep 1; done
+    if [ -b /dev/zvol/$R_VOL ]; then dd if=/dev/urandom of=/dev/zvol/$R_VOL bs=1M count=4 conv=fsync status=none; else echo 'no zvol node: the volume stays empty'; fi
+    zfs list -H -r -o name,type,encryption,keystatus '$R_TOP'
+" || fail "(7) could not create the tree under $R_TOP"
+check "(7) precondition: the encrypted child and the grandchild are encrypted with a loaded key, the plain child is not" "yes/available yes/available off" \
+    "$([ "$(zv encryption "$R_ENC")" != off ] && echo yes)/$(zv keystatus "$R_ENC") $([ "$(zv encryption "$R_INNER")" != off ] && echo yes)/$(zv keystatus "$R_INNER") $(zv encryption "$R_PLAIN")"
+check "(7) precondition: the grandchild inherits the child's encryption root" "$R_ENC" "$(zv encryptionroot "$R_INNER")"
+
+# the whole config is replaced by the recursive dataset alone: the earlier plain/enc datasets stop being sources (their copies stay)
+{
+    cat <<EOF
+# zfsbackup config of test_local_destination.sh (scenario 7: a recursive dataset)
+snapshot_prefix: "autosnap"
+check_interval: "10s"
+prune_interval: "20s"
+destinations:
+  ${DEST}:
+    url: "zfs:${TARGET}"
+datasets:
+  - name: "${R_TOP}"
+    enabled: true
+    frequency: "30s"
+    recursive: true
+    retention:
+      "1s": "1d"
+    remote:
+      - destination: ${DEST}
+        frequency: "20s"
+        retention:
+          "1s": "${R_RET}s"
+EOF
+} > "$WORK/config-rec.yaml"
+put_file "$WORK/config-rec.yaml" "$CFG" 600
+out="$(import_config)"; rc=$?
+printf '%s\n' "$out" | sed 's/^/    CLI: /'
+check "(7) the import of the recursive config exits 0 (no copy lies below the tree: the CLI has nothing to refuse)" "0" "$rc"
+check "(7) ... and keeps the client id" "$CID" "$(cli_to_file /tmp/zfsb-id.json identity show --json; jfile /tmp/zfsb-id.json 'd["client_id"]' | tr -d '[:space:]')"
+MARK7="$(loglines)"
+start_daemon
+wait_for 60 daemon_active
+MAIN7="$(mainpid)"
+
+# 7a: every descendant is sent as a dataset of its own
+if wait_for 360 rec_first_done; then pass "(7a) all five datasets of the tree (parent, enc, enc/inner, plain, vol) got a copy with a snapshot and a local anchor"
+else fail "(7a) not every dataset of the tree reached its copy within 360 s: $(for d in "${rec_all[@]}"; do printf '%s=[%s] ' "${d#$R_TOP}" "$(snaps "$(copy_of "$d")" | count)"; done)"; fi
+for d in "${rec_all[@]}"; do
+    check "(7a) $d: the copy is exactly at <target>/<id>/<pool>/<path>" "yes" "$(exists "$(copy_of "$d")")"
+done
+check "(7a) the plain children and the parent are PLAIN copies (not encrypted)" "off off off" "$(zv encryption "$(copy_of "$R_TOP")") $(zv encryption "$(copy_of "$R_PLAIN")") $(zv encryption "$(copy_of "$R_VOL")")"
+check "(7a) the encrypted child's copy is RAW: encrypted, keystatus unavailable, its own encryption root, not mounted" "yes unavailable $(copy_of "$R_ENC") no" \
+    "$([ "$(zv encryption "$(copy_of "$R_ENC")")" != off ] && echo yes) $(zv keystatus "$(copy_of "$R_ENC")") $(zv encryptionroot "$(copy_of "$R_ENC")") $(zv mounted "$(copy_of "$R_ENC")")"
+check "(7a) the grandchild's copy is RAW too (encrypted, key unavailable)" "yes unavailable" \
+    "$([ "$(zv encryption "$(copy_of "$R_INNER")")" != off ] && echo yes) $(zv keystatus "$(copy_of "$R_INNER")")"
+info "evidence: the grandchild's copy encryptionroot is '$(zv encryptionroot "$(copy_of "$R_INNER")")' (the source's is $R_ENC)"
+check "(7a) the zvol's copy is a volume with readonly=on and volmode=none" "volume on none" "$(zv type "$(copy_of "$R_VOL")") $(zv readonly "$(copy_of "$R_VOL")") $(zv volmode "$(copy_of "$R_VOL")")"
+for d in "$R_TOP" "$R_ENC" "$R_INNER" "$R_PLAIN"; do check_copy_props "7a ${d#$SRC_POOL/}" "$d"; done
+for d in "$R_ENC" "$R_INNER" "$R_PLAIN" "$R_VOL"; do
+    check "(7a) $d: the copy's stamped config names the CHILD and says recursive=false" "$d|False" "$(rec_copy_cfg "$d" '"%s|%s" % (d["name"], d["recursive"])')"
+    check "(7a) $d: ... and carries the destination's retention (1 s / $R_RET s)" "yes" \
+        "$(rec_copy_cfg "$d" '"yes" if [(r["age"], r["keep_for"]) for r in d["retention_rules"]] == [(1.0, '"$R_RET"'.0)] else "no"')"
+done
+check "(7a) the parent's own copy config keeps recursive=true (it is the parent's config)" "True" "$(rec_copy_cfg "$R_TOP" 'd["recursive"]')"
+# the inherited-anchor regression: every child has its OWN local anchor, naming a snapshot on its copy with the source's guid
+for d in "${rec_all[@]}"; do
+    a="$(local_anchor_of "$d")"
+    check "(7a) $d has its own LOCAL anchor.$DEST ($a), and that snapshot is on its copy with the source's guid" "yes" "$([ -n "$a" ] && copy_has "$d" "$a" && echo yes || echo no)"
+done
+rec_log="$(log_since "$MARK7")"
+check_has "(7a) the log shows the parent's full send before the first child's" "Backup complete: ${R_TOP}@" "$rec_log"
+first_parent="$(printf '%s\n' "$rec_log" | grep -nE "Backup complete: ${R_TOP}@" | head -n1 | cut -d: -f1)"
+first_child="$(printf '%s\n' "$rec_log" | grep -nE "Backup complete: ${R_TOP}/[a-z]+(/[a-z]+)?@" | head -n1 | cut -d: -f1)"
+check "(7a) ... and the parent's copy was completed before any child's (parents first)" "yes" "$([ -n "$first_parent" ] && [ -n "$first_child" ] && [ "$first_parent" -lt "$first_child" ] && echo yes || echo no)"
+
+# 7b: a backlog of three recursive snapshots: a chain for every child
+stop_daemon
+sleep 3
+declare -a RC=()
+for i in 1 2 3; do
+    for d in "$R_TOP" "$R_ENC" "$R_INNER" "$R_PLAIN"; do write_mib "$d" "chain$i.bin" 1; done
+    RC+=("$(snap_rec)")
+done
+info "backlog: ${RC[*]}"
+MARK7B="$(loglines)"
+start_daemon
+wait_for 60 daemon_active
+MAIN7="$(mainpid)"          # the supervisor of 7b-7e (7a's was stopped for the backlog)
+REC_N="${RC[2]}"
+if wait_for 300 rec_copies_have "${rec_all[@]}"; then pass "(7b) the newest backlog snapshot ${RC[2]} is on all five copies with the source's guids"
+else fail "(7b) ${RC[2]} did not reach every copy within 300 s: $(for d in "${rec_all[@]}"; do printf '%s=%s ' "${d#$R_TOP}" "$(copy_has "$d" "$REC_N" && echo yes || echo no)"; done)"; fi
+for d in "${rec_all[@]}"; do
+    a="$(local_anchor_of "$d")"
+    check "(7b) $d: the local anchor is on the copy (guid equal) and at or past the newest backlog snapshot by position" "yes" \
+        "$([ -n "$a" ] && copy_has "$d" "$a" && [ "$(idx_in "$d" "$a")" -ge "$(idx_in "$d" "$REC_N")" ] 2>/dev/null && echo yes || echo no)"
+    check "(7b) $d: everything on its copy is the source's own (names and guids)" "yes" "$(subset_ok "$d" && echo yes || echo no)"
+done
+steps_enc="$(log_since "$MARK7B" | grep -cE "Sending incremental ${R_ENC}:" || true)"
+check "(7b) the encrypted child's backlog went out as >= 3 incremental steps ($steps_enc logged)" "yes" "$([ "${steps_enc:-0}" -ge 3 ] && echo yes || echo no)"
+check "(7b) the raw copies are still locked" "unavailable unavailable" "$(zv keystatus "$(copy_of "$R_ENC")") $(zv keystatus "$(copy_of "$R_INNER")")"
+
+# 7c: children created mid-run; one is destroyed again
+msh "
+    set -e
+    zfs create '$R_LATE'; zfs create '$R_GONE'
+    for d in '$R_LATE' '$R_GONE'; do dd if=/dev/urandom of=\$(zfs get -H -o value mountpoint \$d)/seed.bin bs=1M count=2 status=none; done
+" || fail "(7c) could not create the mid-run children"
+MARK7C="$(loglines)"
+late_gone_have_all() { [ -n "$(local_anchor_of "$R_LATE")" ] && [ -n "$(local_anchor_of "$R_GONE")" ] && [ "$(snaps "$(copy_of "$R_GONE")" | count)" -ge 3 ]; }
+if wait_for 420 late_gone_have_all; then pass "(7c) the children created mid-run were discovered and sent: copies with a local anchor, and >= 3 snapshots on gone's copy"
+else fail "(7c) late/gone did not get copies in 420 s (late: [$(snaps "$(copy_of "$R_LATE")" | count)] anchor '$(local_anchor_of "$R_LATE")', gone: [$(snaps "$(copy_of "$R_GONE")" | count)] anchor '$(local_anchor_of "$R_GONE")')"; fi
+check "(7c) late's copy is a plain copy at <target>/<id>/<pool>/<path>, parent first" "yes off" "$(exists "$(copy_of "$R_LATE")") $(zv encryption "$(copy_of "$R_LATE")")"
+check_has "(7c) the first send of gone was a FULL one" "Backup complete: ${R_GONE}@[^ ]+ \\(full\\)" "$(log_since "$MARK7C")"
+check "(7c) gone: its copy's config names it, recursive=false, retention ${R_RET}s" "$R_GONE|False" "$(rec_copy_cfg "$R_GONE" '"%s|%s" % (d["name"], d["recursive"])')"
+G_COPY="$(copy_of "$R_GONE")"
+destroyed=0
+for i in 1 2 3 4 5; do
+    if msh "zfs destroy -r '$R_GONE' 2>&1"; then destroyed=1; break; fi
+    sleep 4
+done
+check "(7c) the source child $R_GONE was destroyed (a child gone mid-run)" "yes" "$([ "$destroyed" -eq 1 ] && [ "$(exists "$R_GONE")" = no ] && echo yes || echo no)"
+wait_for 60 no_xfer          # a send of gone that was already running (the destroy is refused while it runs) has ended
+G_NEWEST="$(snaps "$G_COPY" | tail -n1)"
+G_COPY="$(copy_of "$R_GONE")"; G_COPY_GUID="$(guid_of "$G_COPY")"
+G_COUNT0="$(snaps "$G_COPY" | count)"
+info "gone's copy right after the destroy: $G_COUNT0 snapshots, newest $G_NEWEST"
+only_newest_gone() { [ "$(snaps "$G_COPY" | count)" = "1" ]; }
+if wait_for 420 only_newest_gone; then pass "(7c) the destroyed child's copy was thinned to ONE snapshot by the retention stamped on it ($G_COUNT0 -> 1)"
+else fail "(7c) the copy of the destroyed child still has $(snaps "$G_COPY" | count) snapshots after 420 s: [$(snaps "$G_COPY" | tr '\n' ' ')]"; fi
+check "(7c) ... the one left is its newest, $G_NEWEST (a pruned copy keeps its newest)" "$G_NEWEST" "$(snaps "$G_COPY" | tail -n1)"
+check "(7c) the copy itself still exists (same guid): the daemon never destroys a copy" "$G_COPY_GUID" "$(guid_of "$G_COPY")"
+sleep 45
+check "(7c) after 2 more prune cycles it still holds exactly its newest" "1 $G_NEWEST" "$(snaps "$G_COPY" | count) $(snaps "$G_COPY" | tail -n1)"
+check "(7c) the daemon never restarted (same supervisor pid)" "$MAIN7" "$(mainpid)"
+check_lacks "(7c) no Traceback in the daemon log" "Traceback" "$(log_since "$MARK7")"
+
+# 7d: check grades one anchor per child x destination
+rec_all2=("${rec_all[@]}" "$R_LATE")
+W_N="$(snap_rec)"; REC_N="$W_N"
+rec_wait_all() { rec_copies_have "${rec_all2[@]}"; }
+wait_for 240 rec_wait_all || fail "(7d) the last recursive snapshot $W_N did not reach every copy"
+ck_run --json
+st="$(ck_anchor_states)"
+echo "    entries: $(ck_expr '"; ".join("%s:%s %s=%s" % (e["source"], e["subject"], e.get("peer", ""), e["state"]) for e in d["entries"])')"
+want="$(for d in "${rec_all2[@]}"; do printf '%s:%s=OK\n' "$d" "$DEST"; done | LC_ALL=C sort | paste -sd, -)"
+check "(7d) check --json: one anchor entry per dataset x $DEST (parent, five children), every one OK once caught up" "$want" "$st"
+check "(7d) ... the destroyed child $R_GONE has no entry any more, and its copy is not a check subject" "0" "$(printf '%s\n' "$st" | grep -c "$R_GONE" || true)"
+check "(7d) check: overall state OK, exit 0" "0 OK" "$CK_RC $(ck_expr 'd["state"]' | tr -d '[:space:]')"
+ck_run --nagios
+check "(7d) check --nagios exits 0" "0" "$CK_RC"
+
+# 7e: a backup copy planted below the recursive dataset
+step "7e — a backup copy below the recursive dataset is never snapshotted, sent or pruned"
+stop_daemon
+sleep 35          # the next snapshot is then due the moment the daemon is back
+X_NAME="autosnap_20200101000001"; Y_NAME="autosnap_20200101000002"
+msh "
+    set -e
+    zfs create -o canmount=noauto -o mountpoint=none -o org.zfsbackup:client_id=zfsb-foreign -o org.zfsbackup:source_dataset=otherpool/data '$R_REPL'
+    zfs snapshot -r '$R_TOP'@$X_NAME
+    zfs snapshot \$(zfs list -H -o name -r -t filesystem,volume '$R_TOP' | grep -vE '^${R_REPL}\$' | sed 's/\$/@$Y_NAME/' | tr '\\n' ' ')
+" || fail "(7e) could not plant the copy $R_REPL and the old snapshots"
+REPL_GUID="$(guid_of "$R_REPL")"; REPL_SNAP_GUID="$(guid_of "$R_REPL@$X_NAME")"
+check "(7e) precondition: $R_REPL holds the stray name $X_NAME (from the recursive snapshot) and not $Y_NAME, which the other datasets have" "$X_NAME 1" \
+    "$(snaps "$R_REPL" | tr '\n' ' ' | sed 's/ *$//') $(snaps "$R_REPL" | count)"
+check "(7e) precondition: $X_NAME and $Y_NAME exist on the parent and the children" "yes yes yes" \
+    "$([ "$(exists "$R_TOP@$X_NAME")" = yes ] && echo yes) $([ "$(exists "$R_ENC@$Y_NAME")" = yes ] && echo yes) $([ "$(exists "$R_PLAIN@$X_NAME")" = yes ] && echo yes)"
+MARK7E="$(loglines)"
+start_daemon
+wait_for 60 daemon_active
+replica_logged() { log_since "$MARK7E" | gq -E " ERROR .*${R_REPL}"; }
+wait_for 150 replica_logged
+check_has "(7e) the daemon logs an ERROR naming the copy $R_REPL (and how to move it out)" "ERROR.*${R_REPL}" "$(log_since "$MARK7E")"
+newest_top() { snaps "$R_TOP" | tail -n1; }
+rec_new_snap() { local n; n="$(newest_top)"; [ -n "$n" ] && [ "$n" != "$W_N" ] && [ "$n" != "$X_NAME" ] && [ "$n" != "$Y_NAME" ]; }
+wait_for 150 rec_new_snap
+N7E="$(newest_top)"
+info "the snapshot taken after the plant: $N7E"
+check "(7e) the worker took a new snapshot of the tree after the copy appeared ($N7E)" "yes" "$([ "$N7E" != "$W_N" ] && [ "$N7E" != "$X_NAME" ] && [ "$N7E" != "$Y_NAME" ] && echo yes || echo no)"
+check "(7e) the new snapshot is on the parent and on every source child" "yes" \
+    "$(ok=yes; for d in "$R_TOP" "$R_ENC" "$R_INNER" "$R_PLAIN" "$R_VOL" "$R_LATE"; do [ "$(exists "$d@$N7E")" = yes ] || ok=no; done; echo $ok)"
+check "(7e) ... all of them in ONE transaction (a single atomic zfs snapshot: the same createtxg everywhere)" "1" \
+    "$(msh "for d in '$R_TOP' '$R_ENC' '$R_INNER' '$R_PLAIN' '$R_VOL' '$R_LATE'; do zfs get -H -o value createtxg \"\$d@$N7E\"; done | sort -u | wc -l" | tr -d '[:space:]')"
+check "(7e) NEVER SNAPSHOTTED: the copy $R_REPL has no snapshot but the stray $X_NAME" "$X_NAME" "$(snaps "$R_REPL" | tr '\n' ' ' | sed 's/ *$//')"
+# never pruned, and the rest of the tree is pruned: the old names are far past the 1 d retention
+y_pruned() { [ "$(exists "$R_ENC@$Y_NAME")" = no ] && [ "$(exists "$R_TOP@$Y_NAME")" = no ] && [ "$(exists "$R_PLAIN@$Y_NAME")" = no ]; }
+if wait_for 150 y_pruned; then pass "(7e) $Y_NAME, a name the copy does not hold, was pruned from the parent and the children (the pruner is alive)"
+else fail "(7e) $Y_NAME is still on the source tree after 150 s"; fi
+sleep 65
+check "(7e) NEVER PRUNED: $X_NAME, a name the copy holds, is still on the copy" "yes" "$(exists "$R_REPL@$X_NAME")"
+check "(7e) ... and so is the same name on the parent and the children (a recursive destroy would have taken the copy's too)" "yes yes yes" \
+    "$(exists "$R_TOP@$X_NAME") $(exists "$R_ENC@$X_NAME") $(exists "$R_PLAIN@$X_NAME")"
+check "(7e) the copy's guid, its snapshot's guid and its markers are unchanged" "$REPL_GUID $REPL_SNAP_GUID zfsb-foreign local otherpool/data" \
+    "$(guid_of "$R_REPL") $(guid_of "$R_REPL@$X_NAME") $(zvs org.zfsbackup:client_id "$R_REPL" | tr -d '\n') $(zv org.zfsbackup:source_dataset "$R_REPL")"
+check "(7e) NEVER SENT: no copy of $R_REPL exists under the target" "0" "$(msh "zfs list -H -r -o name '$TARGET' | grep -c '/replica\$' || true" | tr -d '[:space:]')"
+check "(7e) ... nor any dataset under the target whose source_dataset is it" "0" \
+    "$(msh "zfs get -H -r -o value org.zfsbackup:source_dataset '$TARGET' | grep -c '^${R_REPL}\$' || true" | tr -d '[:space:]')"
+check "(7e) the daemon kept sending the other children meanwhile: the newest anchor of the encrypted child is on its copy" "yes" \
+    "$(a="$(local_anchor_of "$R_ENC")"; [ -n "$a" ] && copy_has "$R_ENC" "$a" && echo yes || echo no)"
+ck_run --json
+echo "    entries: $(ck_expr '"; ".join("%s:%s %s=%s" % (e["source"], e["subject"], e.get("peer", ""), e["state"]) for e in d["entries"])')"
+check "(7e) check --json has a WARN 'copies' entry naming $R_REPL" "WARN" \
+    "$(ck_expr '",".join(sorted(set(e["state"] for e in d["entries"] if e["source"] == "copies" and e["subject"] == "'"$R_REPL"'")))' | tr -d '[:space:]')"
+check "(7e) ... the copy is not graded as a child (no anchor entry for it), and the overall exit is WARN (1)" "0 1" \
+    "$(ck_expr 'sum(1 for e in d["entries"] if e["source"] == "anchor" and e["subject"] == "'"$R_REPL"'")' | tr -d '[:space:]') $CK_RC"
+check_lacks "(7e) no Traceback in the daemon log" "Traceback" "$(log_since "$MARK7")"
+echo "    evidence (not asserted): the daemon's lines about the copy"
+log_since "$MARK7E" | grep -E "${R_REPL}" | grep -v " DEBUG " | cut -c1-230 | sort | uniq -c | sort -rn | head -n 5 | sed 's/^/      log: /'
+stop_daemon
+msh "zfs destroy -r '$R_REPL' >/dev/null 2>&1; true" || true
+
+# ───────────────────────────────── 8 ────────────────────────────────────────
+echo
+step "8 — clean exit"
+stop_daemon
+sleep 3
+check "(8) no zfsbackup daemon/worker process is left" "0" "$(daemon_procs)"
+check "(8) no zfs send/receive process is left" "0" "$(xfer_procs)"
+check "(8) the unit is gone or inactive" "yes" "$(daemon_active && echo no || echo yes)"
 dlog="$(msh "cat '$LOG'")"
-check_lacks "(7) no Traceback in the daemon log" "Traceback" "$dlog"
+check_lacks "(8) no Traceback in the daemon log" "Traceback" "$dlog"
 echo "    evidence (not asserted): distinct ERROR/WARNING lines of the whole run, by count"
 printf '%s\n' "$dlog" | grep -E " (ERROR|WARNING) " | sed -E 's/^[0-9: ,.-]+//' | cut -c1-170 | sort | uniq -c | sort -rn | head -n 12 | sed 's/^/      /'
 

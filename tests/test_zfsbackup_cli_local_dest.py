@@ -352,8 +352,10 @@ class TestSetUrlKind:
 
     def test_changing_a_local_target_warns_with_the_old_copy_path(self, run, mixed):
         result = ok(run, mixed, "set", "destinations.loc.url", "zfs:backup/new")
-        (warned,) = warnings_in(result)
+        warned, anchors = warnings_in(result)         # the copy-path warning, then A4's anchor warning
         assert "destinations[loc] changes its local target from 'backup/local' to 'backup/new'" in warned
+        assert "destinations[loc] now points to a different place" in anchors
+        assert "zfs inherit -S org.zfsbackup:anchor.loc tank/a" in result.stderr
         assert "the next send to it is a full send" in warned
         assert "existing copies under backup/local/host-1/ are orphaned" in warned
         assert "zfs rename" in warned
@@ -368,7 +370,8 @@ class TestSetUrlKind:
 
     def test_local_to_https_warns_about_orphaned_copies(self, run, mixed):
         result = ok(run, mixed, "set", "destinations.loc.url", "https://elsewhere:9")
-        (warned,) = warnings_in(result)
+        warned, anchors = warnings_in(result)         # the orphaned-copies warning, then A4's anchor warning
+        assert "destinations[loc] now points to a different place" in anchors
         assert ("destinations[loc] changes from the local target 'backup/local' to the server "
                 "https://elsewhere:9") in warned
         assert "existing copies under backup/local/host-1/ are orphaned" in warned

@@ -67,9 +67,15 @@ class Ledger:
         self.anchor_writes_succeed = True
         self.listings = [list(x) for x in listings]
         self.list_calls = 0
-        mocker.patch.object(manager, 'get_anchor', side_effect=lambda dsi, dest: self.anchor)
+        # The sender's reads: the raising local anchor (`_record_step`, `_settle_up_to_date`, the
+        # rollback permit) and the own pin. `get_anchor` (the pruner's effective read) and
+        # `get_own_anchor` (the due check's swallowing read) are tripwires: a sender reading them
+        # would be crediting a parent's anchor, or swallowing an unreadable one.
+        wrong = AssertionError('the sender read an anchor through the wrong reader')
+        mocker.patch.object(manager, 'get_anchor', side_effect=wrong)
+        mocker.patch.object(manager, 'get_own_anchor', side_effect=wrong)
         mocker.patch.object(manager, 'get_local_anchor', side_effect=lambda dsi, dest: self.anchor)
-        mocker.patch.object(manager, 'get_inflight', side_effect=lambda dsi, dest: self.pin)
+        mocker.patch.object(manager, 'get_own_inflight', side_effect=lambda dsi, dest: self.pin)
         self.set_anchor = mocker.patch.object(manager, 'set_anchor', side_effect=self._set_anchor)
         self.clear_anchor = mocker.patch.object(manager, 'clear_anchor', side_effect=self._clear_anchor)
         self.set_inflight = mocker.patch.object(manager, 'set_inflight', side_effect=self._set_pin)
@@ -511,7 +517,7 @@ class TestTransportOutcomes:
                           common=[NegotiationFailed('server is reloading; retry later', reloading=True)])
         with caplog.at_level(logging.INFO, logger='zfsbackup.chain'):
             assert rig.run() is False
-        assert f'server fake://destination is reloading; skipping {DS} this cycle' in caplog.text
+        assert f'server fake://destination is reloading; skipping {DS} this attempt' in caplog.text
 
     def test_a_zfs_timeout_negotiate_is_not_logged_again(self, rig_factory, caplog):
         rig = rig_factory(listing(S1, S2), common=[
@@ -655,6 +661,148 @@ class TestRecordStep:
         seq.sender._refusal_logged[key] = 'refused'
         record(seq, started(seq, S2, S1))
         assert key not in seq.sender._refusal_logged
+
+
+@pytest.mark.unit
+class TestUnreadableLocalAnchorFailsClosed:
+    """L1: `_record_step` and `_settle_up_to_date` read the anchor with the RAISING `get_local_anchor`
+    (not the swallowing `get_own_anchor`): "could not read" is not "unset". An unreadable anchor
+    must neither skip the never-backwards rule nor let the backstop clear a real anchor."""
+
+    ERROR = 'cannot open pool/data: pool I/O is currently suspended'
+
+    @staticmethod
+    def unreadable(rig, mocker):
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        return mocker.patch.object(rig.manager, 'get_local_anchor',
+                                   side_effect=LocalAnchorUnreadable(TestUnreadableLocalAnchorFailsClosed.ERROR))
+
+    def test_record_step_writes_nothing_keeps_the_pin_and_stops(self, seq, mocker, snapshot_presence):
+        self.unreadable(seq, mocker)
+        seq.ledger.pin = (S1, S2)
+        assert record(seq, started(seq, S2, S1)) == _ANCHOR_FAILED
+        assert seq.events == []                              # no anchor, no clear-anchor, no clear
+        assert seq.ledger.pin == (S1, S2)
+        assert snapshot_presence.calls == []                 # nothing was written, so nothing to confirm
+
+    def test_record_step_never_clears_a_real_anchor_when_there_is_no_base(self, seq, mocker):
+        """The sent-snapshot backstop `clear_anchor`s when it has no base and no remembered anchor:
+        an unreadable anchor reads as no anchor there, so it must not get that far."""
+        self.unreadable(seq, mocker)
+        seq.ledger.anchor = S3
+        assert record(seq, started(seq, S2)) == _ANCHOR_FAILED
+        assert seq.ledger.anchor == S3 and ('clear-anchor',) not in seq.events
+
+    def test_record_step_warns_once_per_episode_and_rearms_on_a_good_read(self, seq, mocker, caplog):
+        patched = self.unreadable(seq, mocker)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.chain'):
+            record(seq, started(seq, S2, S1))
+            record(seq, started(seq, S2, S1))
+        texts = [r.getMessage() for r in caplog.records if 'cannot read the local anchor property' in r.getMessage()]
+        assert len(texts) == 1 and self.ERROR in texts[0] and f'after sending {S2}' in texts[0]
+        patched.side_effect = None
+        patched.return_value = None
+        assert record(seq, started(seq, S2, S1)) == _OK       # a good read ends the episode
+        caplog.clear()
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        patched.side_effect = LocalAnchorUnreadable(self.ERROR)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.chain'):
+            record(seq, started(seq, S2, S1))
+        assert len([r for r in caplog.records if 'cannot read the local anchor property' in r.getMessage()]) == 1
+
+    def test_settle_writes_and_clears_nothing_and_reports_the_cycle_as_not_completed(
+            self, rig_factory, mocker, caplog):
+        rig = rig_factory(listing(S1, S2), common=S2)
+        self.unreadable(rig, mocker)
+        rig.ledger.pin = (S1, S2)
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.chain'):
+            assert rig.run() is False
+        assert rig.ledger.anchors() == [] and rig.ledger.pin == (S1, S2)
+        assert 'clear' not in rig.events and ('clear-anchor',) not in rig.events
+        assert rig.send_snapshot.call_count == 0
+        (rec,) = [r for r in caplog.records if 'cannot read the local anchor property' in r.getMessage()]
+        assert rec.levelno == logging.WARNING and 'the next attempt retries' in rec.getMessage()
+
+    def test_record_step_with_no_base_and_a_gone_snapshot_changes_nothing_and_says_why(
+            self, seq, mocker, snapshot_presence, caplog):
+        """The backstop (`base=None`, the sent snapshot destroyed meanwhile) would `clear_anchor`; with
+        an unreadable anchor it never gets there: no set, no clear, the pin stays, and
+        `last_problem` carries the WARNING for the worker's status record."""
+        snapshot_presence.gone.add(S4)
+        self.unreadable(seq, mocker)
+        seq.ledger.anchor = S2
+        seq.ledger.pin = (S3, S4)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.chain'):
+            assert record(seq, started(seq, S4)) == _ANCHOR_FAILED
+            assert record(seq, started(seq, S4)) == _ANCHOR_FAILED
+        assert seq.events == [] and seq.ledger.anchor == S2 and seq.ledger.pin == (S3, S4)
+        assert snapshot_presence.calls == []
+        seq.ledger.set_anchor.assert_not_called()
+        seq.ledger.clear_anchor.assert_not_called()
+        seq.ledger.clear_inflight.assert_not_called()
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1                              # the second cycle's line is DEBUG
+        problem = seq.sender.last_problem(DS, DEST)
+        assert problem == warnings[0].getMessage() and self.ERROR in problem
+
+    def test_settle_warns_once_has_its_own_latch_and_rearms_on_a_good_read(
+            self, rig_factory, mocker, caplog):
+        rig = rig_factory(listing(S1, S2), common=S2)
+        patched = self.unreadable(rig, mocker)
+        rig.ledger.anchor = 'autosnap_20990101000000'          # names a snapshot this host lacks
+        rig.ledger.pin = (S1, S2)
+        settle_key = (f'{DS} [local anchor to settle]', DEST)
+        permit_key = (f'{DS} [local anchor]', DEST)
+
+        def settle_warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING
+                    and 'the next attempt retries' in r.getMessage()]
+
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.chain'):
+            assert rig.run() is False
+            assert rig.run() is False
+        assert len(settle_warnings()) == 1                     # not repeated next cycle (DEBUG at most)
+        assert settle_key in rig.sender._refusal_logged and permit_key not in rig.sender._refusal_logged
+        assert rig.ledger.set_anchor.call_count == 0 and rig.ledger.clear_anchor.call_count == 0
+        assert rig.ledger.clear_inflight.call_count == 0 and rig.ledger.pin == (S1, S2)
+        assert 'cannot read the local anchor property' in rig.sender.last_problem(DS, DEST)
+
+        patched.side_effect = None                             # a good read ends the episode
+        patched.return_value = S2
+        assert rig.run() is True
+        assert settle_key not in rig.sender._refusal_logged
+
+        from zfsbackup.backup_manager import LocalAnchorUnreadable
+        patched.side_effect = LocalAnchorUnreadable(self.ERROR)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.chain'):
+            assert rig.run() is False
+        assert len(settle_warnings()) == 1                     # a new episode warns again
+
+    def test_the_rollback_permits_latch_does_not_silence_the_settle_warning(self, rig_factory, mocker, caplog):
+        rig = rig_factory(listing(S1, S2), common=S2)
+        self.unreadable(rig, mocker)
+        permit_key = (f'{DS} [local anchor]', DEST)
+        rig.sender._refusal_logged[permit_key] = 'the permit already said something'
+        with caplog.at_level(logging.WARNING, logger='zfsbackup.chain'):
+            assert rig.run() is False
+        assert [r for r in caplog.records if 'the next attempt retries' in r.getMessage()]
+        assert rig.sender._refusal_logged[permit_key] == 'the permit already said something'
+
+    def test_settle_in_a_dry_run_does_not_read_the_anchor(self, rig_factory, mocker):
+        rig = rig_factory(listing(S1, S2), common=S2)
+        patched = self.unreadable(rig, mocker)
+        rig.config.dry_run = True
+        assert rig.run() is True
+        patched.assert_not_called()
+
+    def test_the_sender_reads_neither_the_effective_nor_the_swallowing_anchor(self, seq):
+        """Guards the doubles: `Ledger` makes both raise AssertionError, so a full chain passing means
+        the sender went through the local reader only."""
+        assert seq.run() is True
+        assert seq.manager.get_local_anchor.call_count >= 1
+        seq.manager.get_anchor.assert_not_called()
+        seq.manager.get_own_anchor.assert_not_called()
 
 
 @pytest.mark.unit
@@ -836,3 +984,65 @@ class TestNoTransportImports:
             'requests': 'True', 'websocket': 'True', 'zfsbackup.identity': 'True',
             'zfsbackup.remote': 'True', 'zfsbackup.chain': 'True',
         }
+
+
+@pytest.mark.unit
+class TestLastProblemOwnRefusal:
+    """B3 review (CC 3): senders of one destination share the `REFUSALS` table, so a sibling's pop or
+    replacement between this call's refusal and its classification must not erase the status text.
+    `last_problem` reads the call's OWN message first (`_call_refusal_messages`); the shared table is only
+    for a key this call recorded no message for; `_forget_refusal` ends a refusal in both places."""
+
+    KEY = (DS, DEST)
+
+    def sender(self, rig_factory):
+        rig = rig_factory()
+        rig.sender._log_refusal_once(self.KEY, 'refused: not enrolled')
+        return rig.sender
+
+    def test_the_own_message_is_reported(self, rig_factory):
+        assert self.sender(rig_factory).last_problem(DS, DEST) == 'refused: not enrolled'
+
+    def test_a_siblings_pop_cannot_erase_it(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        sender = self.sender(rig_factory)
+        sender._memory.pop(REFUSALS, self.KEY)                       # another sender's good answer
+        assert sender.last_problem(DS, DEST) == 'refused: not enrolled'
+
+    def test_a_siblings_replacement_cannot_change_it(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        sender = self.sender(rig_factory)
+        sender._memory.put(REFUSALS, self.KEY, 'a different refusal')
+        assert sender.last_problem(DS, DEST) == 'refused: not enrolled'
+
+    def test_the_warning_variant_is_kept_too(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        rig = rig_factory()
+        rig.sender._log_warning_once(self.KEY, 'will heal')
+        rig.sender._memory.pop(REFUSALS, self.KEY)
+        assert rig.sender.last_problem(DS, DEST) == 'will heal'
+
+    def test_forget_refusal_ends_it_in_the_memory_and_in_the_call(self, rig_factory):
+        from zfsbackup.sendmemory import REFUSALS
+        sender = self.sender(rig_factory)
+        assert sender._forget_refusal(self.KEY) == 'refused: not enrolled'
+        assert sender.last_problem(DS, DEST) is None
+        assert self.KEY not in sender._call_refusals and self.KEY not in sender._call_refusal_messages
+        assert sender._memory.get(REFUSALS, self.KEY) is None
+
+    def test_forgetting_what_is_not_there_is_harmless(self, rig_factory):
+        assert rig_factory().sender._forget_refusal(self.KEY) is None
+
+    def test_a_key_without_an_own_message_falls_back_to_the_shared_table(self, rig_factory):
+        """`(None, destination)`: a refusal an EARLIER call on this manager logged."""
+        from zfsbackup.sendmemory import REFUSALS
+        rig = rig_factory()
+        rig.sender._memory.put(REFUSALS, (None, DEST), 'earlier refusal')
+        rig.sender._call_refusals.add((None, DEST))
+        assert rig.sender.last_problem(DS, DEST) == 'earlier refusal'
+
+    def test_the_next_call_starts_with_no_own_messages(self, rig_factory):
+        rig = rig_factory(listing(S1))
+        rig.sender._log_refusal_once(self.KEY, 'refused')
+        rig.run()
+        assert self.KEY not in rig.sender._call_refusal_messages

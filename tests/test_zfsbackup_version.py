@@ -442,6 +442,82 @@ class TestPyproject:
 
 
 @pytest.mark.unit
+class TestCheckUnitStartTimeout:
+    """`packaging/systemd/zfsbackup-check.service` carries a start timeout (a `Type=oneshot` unit has none by
+    default, so a hung pool would hang it for ever): twice `check`'s 60 s time limit plus a 30 s margin. The
+    `.deb` renders the same unit through the sed lines of `debian/rules`; the timeout must survive that. (The
+    equality with `check_view.DEFAULT_TIME_LIMIT` is in `test_zfsbackup_cli_check.py`.)"""
+
+    UNIT = REPO / "packaging" / "systemd" / "zfsbackup-check.service"
+    RULES = REPO / "debian" / "rules"
+
+    @staticmethod
+    def settings(text: str) -> dict:
+        """`{section: [(key, value), ...]}` of the non-comment lines of a unit file."""
+        out, section = {}, None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                out.setdefault(section, [])
+                continue
+            key, _, value = line.partition("=")
+            out[section].append((key, value))
+        return out
+
+    def render_for_the_deb(self) -> str:
+        """The unit as `execute_before_dh_installsystemd` writes it: the `-e 's|$(VAR)|text|g'` expressions of the
+        `for u in zfsbackup-check.service ...` loop, applied in order, with the variables of the rules file."""
+        rules = self.RULES.read_text()
+        variables = dict(re.findall(r"^(\w+)\s*=\s*(\S+)\s*$", rules, re.M))
+        loop = re.search(r"for u in zfsbackup-check\.service.*?done", rules, re.S)
+        assert loop, "debian/rules no longer renders zfsbackup-check.service in a loop"
+        text = self.UNIT.read_text()
+        expressions = re.findall(r"-e 's\|\$\((\w+)\)\|\$\((\w+)\)\|g'|-e 's\|\$\((\w+)\)\|([^|$]*)\|g'", loop.group(0))
+        assert expressions, "the sed expressions of debian/rules could not be read"
+        for old_var, new_var, old_var2, literal in expressions:
+            if old_var:
+                text = text.replace(variables[old_var], variables[new_var])
+            else:
+                text = text.replace(variables[old_var2], literal)
+        return text
+
+    def test_the_start_timeout_is_set_in_the_service_section(self):
+        parsed = self.settings(self.UNIT.read_text())
+        service = dict(parsed["Service"])
+        assert service["Type"] == "oneshot"
+        assert "TimeoutStartSec" not in dict(parsed["Unit"])
+        assert re.fullmatch(r"\d+", service["TimeoutStartSec"]), "plain seconds, not infinity, 0 or 2min"
+        assert int(service["TimeoutStartSec"]) == 150
+
+    def test_the_timeout_leaves_room_for_the_time_limit_the_unit_runs_with(self):
+        """Twice the limit plus 30 s: a `--time-limit` in ExecStart must not outgrow the timeout."""
+        service = dict(self.settings(self.UNIT.read_text())["Service"])
+        limit = re.search(r"--time-limit[ =](\d+(?:\.\d+)?)", service["ExecStart"])
+        seconds = float(limit.group(1)) if limit else 60.0
+        assert int(service["TimeoutStartSec"]) >= 2 * seconds + 30
+
+    def test_the_unit_still_writes_the_textfile_and_does_not_restart(self):
+        service = dict(self.settings(self.UNIT.read_text())["Service"])
+        assert "check --prometheus --output" in service["ExecStart"]
+        assert "Restart" not in service
+
+    def test_the_deb_rendering_keeps_the_timeout_and_changes_the_paths(self):
+        rendered = self.render_for_the_deb()
+        service = dict(self.settings(rendered)["Service"])
+        assert service["TimeoutStartSec"] == "150" and service["Type"] == "oneshot"
+        assert service["ExecStart"].startswith("/usr/bin/zfsbackup-config ")
+        assert service["Environment"] == "ZFSBACKUP_CHECK_OUTPUT=/var/lib/prometheus/node-exporter/zfsbackup.prom"
+        assert not [line for line in rendered.splitlines() if "/opt/" in line and not line.startswith("#")]
+
+    def test_the_rendering_helper_really_changes_the_unit(self):
+        """Guards the helper: a no-op rendering would make the previous test vacuous."""
+        assert self.render_for_the_deb() != self.UNIT.read_text()
+
+
+@pytest.mark.unit
 class TestLibzfseasyProject:
     def test_it_is_a_self_contained_project(self):
         for name in ("pyproject.toml", "README.md", "LICENSE", "libzfseasy/__init__.py"):

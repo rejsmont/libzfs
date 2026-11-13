@@ -79,8 +79,8 @@ from zfsbackup.identity import (
 from zfsbackup.logsetup import PEER_LOGGER
 from zfsbackup import receiver
 from zfsbackup.protocol import (
-    PROTOCOL_HEADER, PROTOCOL_REFUSAL_REASON, PROTOCOL_VERSION, SUPPORTED_PROTOCOLS,
-    parse_protocol_header,
+    NAME_TOO_LONG_REASON, PROTOCOL_HEADER, PROTOCOL_REFUSAL_REASON, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOLS, parse_protocol_header,
 )
 from zfsbackup.remote import HTTP_TIMEOUT, RESUME_TOKEN_TIMEOUT, WS_IDLE_TIMEOUT
 
@@ -3836,7 +3836,11 @@ def create_app(
         `"server_newer_unknown": true` instead of the two fields above. 400
         `{"error"}` for a body that is not a JSON object, a missing or mistyped field, an undecodable or empty
         `config` (`BAD_CONFIG_ERROR`), an invalid dataset name, or a value
-        libzfseasy refuses to store (`BAD_PROPERTY_ERROR`); 409 when the
+        libzfseasy refuses to store (`BAD_PROPERTY_ERROR`), and, with
+        `"reason": "name_too_long"` (`protocol.NAME_TOO_LONG_REASON`), a
+        snapshot whose full name `<server dataset>@<snapshot>` would be over
+        ZFS's 255 characters (never retryable; the client logs it once per
+        episode and sends nothing); 409 when the
         server dataset belongs to another client id or client dataset, or
         when it, or an existing ancestor up to `<target>/<id>`, has no local
         `org.zfsbackup:client_id` (an operator's dataset is never adopted
@@ -3864,6 +3868,25 @@ def create_app(
             isinstance(s, str) for s in client_snapshots
         ):
             return _bad('snapshots: must be a list of snapshot names')
+        # A copy whose snapshots could never exist (`<copy>@<snapshot>` over
+        # ZFS's 255 characters; a recursive dataset's children have longer
+        # names than any configured one) is refused before anything is
+        # written: 400 with a `reason`, WARNING once per dataset and episode.
+        too_long = receiver.copy_snapshot_name_problem(server_dataset, client_snapshots)
+        if too_long is not None:
+            key = (server_dataset, NAME_TOO_LONG_REASON)
+            if key in _refused_noted:
+                logger.debug("negotiate from client %s for %r refused: %s", client_id, dataset, too_long)
+            else:
+                if len(_refused_noted) > 1024:
+                    _refused_noted.clear()
+                _refused_noted.add(key)
+                logger.warning(
+                    "negotiate from client %s for %r refused (%s): %s",
+                    client_id, dataset, NAME_TOO_LONG_REASON, too_long,
+                )
+            return jsonify({'error': too_long, 'reason': NAME_TOO_LONG_REASON}), 400
+        _refused_noted.discard((server_dataset, NAME_TOO_LONG_REASON))
         try:
             ds_config_canonical = canonical_dataset_config(data.get('config'))
         except ValueError as e:

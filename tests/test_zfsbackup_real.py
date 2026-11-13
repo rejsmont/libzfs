@@ -904,7 +904,7 @@ class TestRealPruneHeldAndCloned:
             retried = [c.args[0][0].short for c in destroy.call_args_list[1:]]
             assert pinned not in retried and olds[6] not in retried
             assert len([m for m in _prune_records(caplog, logging.INFO)
-                        if 'became an anchor or in-flight snapshot' in m]) == 2
+                        if 'it became protected' in m]) == 2
         finally:
             subprocess.run([_zfs_cmd(), 'release', 'keep', f'{source_fs.name}@{late}'], capture_output=True)
 
@@ -1165,7 +1165,7 @@ class TestRealSendReceive:
         assert e2e.cycle() is True
 
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         assert _zfs_get(e2e.source.name, f'{PROP_INFLIGHT_PREFIX}{DEST}') == '-'
 
     def test_server_dataset_is_stamped_with_its_owner(self, e2e):
@@ -1431,7 +1431,7 @@ class TestRealSendReceive:
         self._assert_replicated(e2e, s1, s2)
         assert any(f'incremental from {s1}' in m for m in e2e.log_lines())
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         assert (_zfs_get(f'{e2e.server_ds}@{s2}', 'logicalreferenced')
                 == _zfs_get(f'{e2e.source.name}@{s2}', 'logicalreferenced'))
 
@@ -1461,7 +1461,7 @@ class TestRealSendReceive:
 
         assert e2e.server_snaps() == before
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
 
     # -- resume after a killed stream ----------------------------------------
     def _kill_a_first_send(self, e2e, snapshot_hours_ago=3, data_mib=24, after=4 * MIB):
@@ -1482,7 +1482,7 @@ class TestRealSendReceive:
         assert e2e.server_snaps() == {}
         assert e2e.manager.get_anchor(e2e.dsi, DEST) is None
         # The pin survives a failed send: both ends stay protected from the pruner.
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) == ('', s1)
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) == ('', s1)
         assert any('Transfer failed' in m for m in e2e.log_lines())
 
     def test_resume_after_a_killed_stream_completes_the_snapshot(self, e2e):
@@ -1497,7 +1497,7 @@ class TestRealSendReceive:
         self._assert_replicated(e2e, s1)
         assert e2e.server_prop('receive_resume_token') == '-'
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s1
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         assert (_zfs_get(f'{e2e.server_ds}@{s1}', 'logicalreferenced')
                 == _zfs_get(f'{e2e.source.name}@{s1}', 'logicalreferenced'))
 
@@ -1514,7 +1514,7 @@ class TestRealSendReceive:
         assert set(e2e.server_snaps()) == {s1, s2}
         self._assert_replicated(e2e, s1, s2)
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
 
     def test_a_token_for_a_destroyed_snapshot_is_discarded_for_a_fresh_send(self, e2e):
         s1 = self._kill_a_first_send(e2e, snapshot_hours_ago=3)
@@ -1533,36 +1533,38 @@ class TestRealSendReceive:
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == s2
 
     # -- the worker's scheduling -----------------------------------------------
-    def _worker(self, e2e):
-        from zfsbackup.stopflag import StopFlag
-        from zfsbackup.workers import RemoteBackupWorker
+    @staticmethod
+    def _send_pair(e2e):
+        """What one sender thread of the remote worker does for the pair (`sendpair.send_pair`: the due
+        check on the dataset's own anchor, then `backup_dataset`), over the e2e manager."""
+        from zfsbackup.sendpair import send_pair
 
-        worker = RemoteBackupWorker(
-            e2e.manager.config, StopFlag(), tls_dir=e2e.client_tls, client_id=CLIENT_ID
-        )
-        worker._remote_manager = e2e.remote_mgr
-        return worker
+        e2e.remote_mgr.begin_cycle()
+        never = lambda: False  # noqa: E731
+        return send_pair(e2e.manager, e2e.dsi, e2e.dsi.config.remote[0], e2e.remote_mgr, never, never)
 
     def test_fresh_anchor_skips_the_backup_in_the_worker(self, e2e):
+        from zfsbackup.sendpair import PAIR_NOT_DUE
+
         e2e.write('data.bin', 1)
         s1 = e2e.snapshot(3)
         assert e2e.cycle() is True
         e2e.snapshot(2)     # newer, but the anchor (3h) is younger than the 24h frequency
 
-        self._worker(e2e)._process_dataset(e2e.manager, e2e.dsi)
+        assert self._send_pair(e2e).kind == PAIR_NOT_DUE
 
         assert list(e2e.server_snaps()) == [s1]
 
     def test_stale_anchor_makes_the_worker_send(self, e2e):
+        from zfsbackup.sendpair import PAIR_DONE
+
         e2e.write('data.bin', 1)
         s1 = e2e.snapshot(3)
         assert e2e.cycle() is True
         s2 = e2e.snapshot(2)
         e2e.dsi.config.remote[0].frequency = timedelta(minutes=1)   # anchor is 3h old
 
-        worker = self._worker(e2e)
-        worker._remote_manager.begin_cycle()
-        worker._process_dataset(e2e.manager, e2e.dsi)
+        assert self._send_pair(e2e).kind == PAIR_DONE
 
         assert set(e2e.server_snaps()) == {s1, s2}
         self._assert_replicated(e2e, s1, s2)
@@ -2241,7 +2243,7 @@ class TestRealChain(_ChainTests):
 
         self.assert_on_the_server(e2e, [first] + more)
         assert e2e.manager.get_anchor(e2e.dsi, DEST) == more[-1]
-        assert e2e.manager.get_inflight(e2e.dsi, DEST) is None
+        assert e2e.manager.get_own_inflight(e2e.dsi, DEST) is None
         lines = e2e.log_lines()
         assert any(f'Sending 4 snapshots of {e2e.source.name} to {DEST}' in m for m in lines)
         for prev, name in zip([first] + more, more):
@@ -2669,3 +2671,531 @@ class TestRealNoRollback(_ChainTests):
         assert e2e.server_snaps() == before
         assert any('refused' in m for m in self.errors(e2e, mark))
         assert e2e.server_prop('receive_resume_token') == '-'
+
+
+# ---------------------------------------------------------------------------
+# A2c: the snapshot of a recursive dataset keeps out of the backup copies below it
+# ---------------------------------------------------------------------------
+
+def _recursive_manager(dataset, **kwargs):
+    """`(manager, dsi)` for the RECURSIVE `dataset` (hourly; retention interval 1h / keep 2h)."""
+    config = BackupConfig(
+        datasets=[DatasetConfig(
+            name=dataset, frequency=timedelta(hours=1), recursive=True,
+            retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=2))],
+        )],
+        snapshot_prefix='autosnap', **kwargs,
+    )
+    manager = DatasetManager(config)
+    return manager, manager.datasets[0]
+
+
+def _mark_as_copy(dataset):
+    """The markers a server's or a local destination's copy carries (local values)."""
+    _zfs_run('set', f'{PROP_CLIENT_ID}=h1', f'{PROP_SOURCE_DATASET}=pool/x', dataset)
+
+
+class TestRealSnapshotSkipsCopies:
+    """`DatasetManager.create_snapshot` of a recursive dataset with a marked backup copy below it: ONE atomic
+    `zfs snapshot` of the sources, none in the copy, and `zfs destroy -r` by the pruner that leaves the copy's
+    names alone. Needs `create`/`set`/`snapshot`/`destroy` on the test pool; skips (never errors) otherwise.
+
+    NOT RUN in the authoring session (no pool on the author's machine): run it with `pytest -m real_zfs`."""
+
+    @staticmethod
+    def tree(source_fs):
+        """`R/c`, `R/c/g` (sources) and the marked copy `R/bk` with `R/bk/inner`; -> `(c, g, copy, inner)`."""
+        root = source_fs.name
+        names = (f'{root}/c', f'{root}/c/g', f'{root}/bk', f'{root}/bk/inner')
+        for name in names:
+            _zfs_run('create', name)
+        _mark_as_copy(names[2])
+        return names
+
+    def test_the_sources_get_one_snapshot_in_one_txg_and_the_copy_gets_none(self, source_fs, caplog):
+        c, g, copy, inner = self.tree(source_fs)
+        manager, dsi = _recursive_manager(source_fs.name)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            created = manager.create_snapshot(dsi)
+        assert created is not None and manager.last_snapshot_error is None
+        short = created.name
+        for dataset in (source_fs.name, c, g):
+            assert list_real_snapshot_names_exact(dataset) == [short], dataset
+        txgs = {_txg(dataset, short) for dataset in (source_fs.name, c, g)}
+        assert len(txgs) == 1, f'one atomic snapshot, one txg: {txgs}'
+        assert list_real_snapshot_names(copy) == [], 'nothing in the copy or below it'
+        assert list_real_snapshot_names_exact(inner) == []
+        assert len([m for m in _prune_records(caplog, logging.ERROR) if 'is a backup copy' in m]) == 1
+
+    def test_a_collision_fails_the_cycle_and_the_copy_error_is_logged_once(self, source_fs, caplog):
+        c, g, copy, inner = self.tree(source_fs)
+        manager, dsi = _recursive_manager(source_fs.name)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            assert manager.create_snapshot(dsi) is not None
+            assert manager.create_snapshot(dsi) is None           # the same hourly slot: the name exists, zfs refuses
+        assert manager.last_snapshot_error is not None and 'exist' in manager.last_snapshot_error
+        assert list_real_snapshot_names(copy) == [] and list_real_snapshot_names_exact(inner) == []
+        assert len(list_real_snapshot_names_exact(source_fs.name)) == 1
+        assert len([m for m in _prune_records(caplog, logging.ERROR) if 'is a backup copy' in m]) == 1
+
+    def test_without_a_copy_it_is_the_plain_recursive_snapshot(self, source_fs):
+        root = source_fs.name
+        _zfs_run('create', f'{root}/c')
+        manager, dsi = _recursive_manager(root)
+        created = manager.create_snapshot(dsi)
+        assert created is not None
+        assert list_real_snapshot_names(root) == [created.name, created.name]
+
+    def test_the_pruners_recursive_destroy_keeps_what_the_copy_holds(self, source_fs, caplog):
+        c, g, copy, inner = self.tree(source_fs)
+        # older versions (or the fallback) put every name into the copy too: `snapshot -r`, oldest first
+        olds = [snap_name_at(3 + i) for i in reversed(range(6))]
+        for name in olds:
+            zfs.snapshot(source_fs, name, recursive=True)
+        fresh = snap_name_at(0.2)
+        zfs.snapshot(source_fs, fresh, recursive=True)
+        for name in olds[:3]:                                   # the copy has lost these (the source never sent them)
+            _zfs_run('destroy', f'{copy}@{name}')
+            _zfs_run('destroy', f'{inner}@{name}')
+        manager, dsi = _recursive_manager(source_fs.name)
+        with mock.patch('zfsbackup.backup_manager.zfs.destroy', wraps=zfs.destroy) as destroy:
+            with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+                result = manager.prune_snapshots(dsi)
+        assert result.ok, result
+        assert destroy.call_args_list and all(call.kwargs.get('recursive') for call in destroy.call_args_list)
+        for dataset in (copy, inner):
+            assert set(olds[3:]) <= set(list_real_snapshot_names_exact(dataset)), \
+                f'{dataset}: a recursive destroy took a name from the copy'
+        assert set(olds[3:]) <= set(list_real_snapshot_names_exact(source_fs.name)), 'kept for the copy'
+        for dataset in (source_fs.name, c, g):
+            assert not set(olds[:3]) & set(list_real_snapshot_names_exact(dataset)), \
+                f'{dataset}: the names the copy lacks were not pruned'
+        errors = [m for m in _prune_records(caplog, logging.ERROR) if 'a recursive destroy' in m]
+        assert len(errors) == 1
+        # M1: the ERROR's discriminator is true: a stray `snapshot -r` left in the copy has the SAME createtxg as
+        # the source's snapshot of that name (one atomic command), which is how it is told from received history
+        assert f'zfs get -H -o name,value createtxg {source_fs.name}@<name>' in errors[0]
+        assert f'zfs get -r -t snapshot -H -o name,value createtxg {copy}' in errors[0]     # the copy and everything below it
+        # (the wording is pinned in test_zfsbackup_prune_backup_copies.py: "destroy" survives only as the reason for the
+        # protection, never as advice to destroy anything in the copy)
+        assert 'must never be destroyed' in errors[0] and 'its source does not have' not in errors[0]
+        for name in olds[3:]:
+            assert _txg(copy, name) == _txg(source_fs.name, name), 'a stray is the same txg as its source'
+
+    def test_a_name_libzfseasy_cannot_represent_inside_the_copy_keeps_the_atomic_snapshot(self, source_fs, caplog):
+        """A dataset name with a LEADING space is legal in zfs and refused by libzfseasy (an inner space is accepted).
+        Inside a copy it is never read (the walk around the copies), so the cycle still takes the ONE atomic
+        snapshot of the sources."""
+        c, g, copy, inner = self.tree(source_fs)
+        _zfs_run('create', f'{copy}/ lead')
+        manager, dsi = _recursive_manager(source_fs.name)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            created = manager.create_snapshot(dsi)
+        assert created is not None and manager.last_snapshot_error is None
+        for dataset in (source_fs.name, c, g):
+            assert list_real_snapshot_names_exact(dataset) == [created.name], dataset
+        assert len({_txg(dataset, created.name) for dataset in (source_fs.name, c, g)}) == 1
+        assert list_real_snapshot_names(copy) == [], 'nothing in the copy: not the plain `snapshot -r`'
+        assert not [m for m in _prune_records(caplog, logging.ERROR) if 'Cannot keep the backup copies out' in m]
+        assert manager.last_snapshot_note == f'1 backup copy below was not snapshotted: {copy}'
+
+    def test_a_name_libzfseasy_cannot_represent_outside_the_copies_falls_back_and_recovers(self, source_fs, caplog):
+        """Outside the copies it must not be missed, so the cycle falls back to `zfs snapshot -r` (which also
+        snapshots into the copy: the stated trade), says so once, and the first cycle after the name is gone is
+        atomic again."""
+        c, g, copy, inner = self.tree(source_fs)
+        odd = f'{c}/ lead'            # a leading space: legal in zfs, not representable in libzfseasy
+        _zfs_run('create', odd)
+        manager, dsi = _recursive_manager(source_fs.name)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            first = manager.create_snapshot(dsi)
+            assert first is not None
+            assert len([m for m in _prune_records(caplog, logging.ERROR) if 'Cannot keep the backup copies out' in m]) == 1
+            assert first.name in list_real_snapshot_names_exact(odd), 'the whole tree, the odd name too'
+            assert first.name in list_real_snapshot_names_exact(copy), 'the stated trade: the copy got one too'
+            assert manager.last_snapshot_note.startswith('backup copies below could not be told apart')
+            _zfs_run('destroy', '-r', odd)
+            _zfs_run('destroy', '-r', f'{source_fs.name}@{first.name}')
+            manager._generate_snapshot_name = lambda dsi_: snap_name_at(0.5)
+            again = manager.create_snapshot(dsi)
+        assert again is not None and again.name not in list_real_snapshot_names(copy)
+        assert [m for m in _prune_records(caplog, logging.INFO) if 'can be told apart again' in m]
+        assert manager.last_snapshot_note == f'1 backup copy below was not snapshotted: {copy}'
+
+    def test_a_dataset_that_only_inherits_a_marker_is_snapshotted_alone_with_one_error(self, source_fs, caplog):
+        """The recursive dataset itself carries the marker (a LOCAL one on it is the same situation as one
+        inherited from above): every child inherits it, so only the dataset gets the snapshot, with ONE ERROR."""
+        root = source_fs.name
+        for name in (f'{root}/c', f'{root}/c/g'):
+            _zfs_run('create', name)
+        _mark_as_copy(root)                                   # the children inherit it: covered by one message
+        manager, dsi = _recursive_manager(root)
+        with caplog.at_level(logging.INFO, logger='zfsbackup.backup_manager'):
+            created = manager.create_snapshot(dsi)
+        assert created is not None
+        assert list_real_snapshot_names(root) == [created.name], 'the dataset alone'
+        assert len([m for m in _prune_records(caplog, logging.ERROR) if 'itself sits inside a backup copy' in m]) == 1
+        assert not [m for m in _prune_records(caplog, logging.ERROR) if ' is a backup copy (' in m]
+        assert manager.last_snapshot_note.startswith(f'{source_fs.name} sits inside a backup copy')
+
+    def test_the_snapshot_worker_and_the_pruner_together_leave_the_copy_alone(self, source_fs):
+        c, g, copy, inner = self.tree(source_fs)
+        manager, dsi = _recursive_manager(source_fs.name)
+        for name in [snap_name_at(h) for h in (6, 5, 4, 3)]:
+            _zfs_run('snapshot', f'{source_fs.name}@{name}', f'{c}@{name}', f'{g}@{name}')
+        manager.create_snapshot(dsi)
+        manager.prune_snapshots(dsi)
+        assert list_real_snapshot_names(copy) == []
+        assert list_real_snapshot_names_exact(inner) == []
+
+
+def _receive_with_properties(snapshot, target):
+    """`zfs send -p snapshot | zfs receive target` (the user properties arrive RECEIVED); skips when not permitted."""
+    TestRealForgedReceivedProperty._receive(snapshot, target)
+
+
+class TestRealInheritDashS:
+    """`zfs inherit -S <prop> <ds>` against a pool (every option BEFORE the property, so it also works where
+    getopt stops at the first operand: macOS, FreeBSD, illumos): it reverts a LOCAL override to the RECEIVED
+    value (so the pruner keeps protecting what the sender anchored) and leaves a received-only value in place; a
+    plain inherit would hide the received value. `clear_anchor` / `clear_inflight` /
+    `clear_zfsbackup_properties` use it for `anchor.*` and `inflight.*`, a plain inherit for the config. A
+    received-only anchor or pin is therefore not touched and not reported as cleared.
+
+    NOT RUN in the authoring session (no pool on the author's machine): run it with `pytest -m real_zfs`."""
+
+    ANCHOR = f'{PROP_ANCHOR_PREFIX}d'
+    PIN = f'{PROP_INFLIGHT_PREFIX}d'
+
+    @staticmethod
+    def _received_copy(source_fs, target_root, props):
+        """A dataset received from `source_fs` carrying `props` as RECEIVED values; -> its name."""
+        for prop, value in props.items():
+            _zfs_run('set', f'{prop}={value}', source_fs.name)
+        short = snap_name_at(0.1)
+        zfs.snapshot(source_fs, short)
+        rx = f'{target_root}/rx'
+        _receive_with_properties(f'{source_fs.name}@{short}', rx)
+        return rx
+
+    def _manager(self, dataset):
+        config = BackupConfig(datasets=[DatasetConfig(name=dataset)], snapshot_prefix='autosnap')
+        manager = DatasetManager(config)
+        return manager, manager.datasets[0]
+
+    def test_a_local_override_goes_back_to_the_received_anchor(self, source_fs, target_root):
+        rx = self._received_copy(source_fs, target_root, {self.ANCHOR: 'snapA'})
+        try:
+            assert _zfs_get_source(rx, self.ANCHOR) == 'received', 'the premise'
+            _zfs_run('set', f'{self.ANCHOR}=mine', rx)
+            assert _zfs_get_source(rx, self.ANCHOR) == 'local'
+            manager, dsi = self._manager(rx)
+            manager.clear_anchor(dsi, 'd')
+            assert _zfs_get_source(rx, self.ANCHOR) == 'received'
+            assert _zfs_get(rx, self.ANCHOR) == 'snapA' and _zfs_get_local(rx, self.ANCHOR) is None
+            assert manager.get_anchors(dsi) >= {'snapA'}, 'still protected'
+        finally:
+            _destroy_quietly(rx)
+
+    def test_a_local_pin_goes_back_to_the_received_pin(self, source_fs, target_root):
+        rx = self._received_copy(source_fs, target_root, {self.PIN: 'a,b'})
+        try:
+            _zfs_run('set', f'{self.PIN}=c,d', rx)
+            manager, dsi = self._manager(rx)
+            assert manager.clear_inflight(dsi, 'd') is True
+            assert _zfs_get_source(rx, self.PIN) == 'received' and _zfs_get(rx, self.PIN) == 'a,b'
+        finally:
+            _destroy_quietly(rx)
+
+    def test_a_received_only_anchor_is_left_in_place_and_not_reported_cleared(self, source_fs, target_root):
+        rx = self._received_copy(source_fs, target_root, {self.ANCHOR: 'snapA'})
+        try:
+            manager, dsi = self._manager(rx)
+            manager.clear_anchor(dsi, 'd')
+            assert _zfs_get_source(rx, self.ANCHOR) == 'received' and _zfs_get(rx, self.ANCHOR) == 'snapA'
+            from zfsbackup.backup_manager import clear_zfsbackup_properties
+            assert clear_zfsbackup_properties(Filesystem(rx), config=False, anchors=True) == [], \
+                'a received-only anchor is still set, so it is not "cleared" (and no command ran for it)'
+            assert _zfs_get_source(rx, self.ANCHOR) == 'received' and _zfs_get(rx, self.ANCHOR) == 'snapA'
+        finally:
+            _destroy_quietly(rx)
+
+    def test_a_local_override_of_a_received_anchor_is_reported_cleared_and_reverts(self, source_fs, target_root):
+        rx = self._received_copy(source_fs, target_root, {self.ANCHOR: 'snapA'})
+        try:
+            _zfs_run('set', f'{self.ANCHOR}=mine', rx)
+            from zfsbackup.backup_manager import clear_zfsbackup_properties
+            assert clear_zfsbackup_properties(Filesystem(rx), config=False, anchors=True) == [self.ANCHOR]
+            assert _zfs_get_source(rx, self.ANCHOR) == 'received' and _zfs_get(rx, self.ANCHOR) == 'snapA'
+        finally:
+            _destroy_quietly(rx)
+
+    def test_a_received_config_is_reported_cleared_by_its_plain_inherit(self, source_fs, target_root):
+        """The config is never protection: it keeps the plain inherit, which acts on a received value too (it
+        masks it) and is returned whenever it was set."""
+        rx = self._received_copy(source_fs, target_root, {PROP_CONFIG: 'cfg'})
+        try:
+            assert _zfs_get_source(rx, PROP_CONFIG) == 'received', 'the premise'
+            from zfsbackup.backup_manager import clear_zfsbackup_properties
+            assert clear_zfsbackup_properties(Filesystem(rx), config=True, anchors=False) == [PROP_CONFIG]
+            assert _zfs_get_source(rx, PROP_CONFIG) != 'local'
+        finally:
+            _destroy_quietly(rx)
+
+    def test_a_purely_local_anchor_is_removed(self, source_fs):
+        _zfs_run('set', f'{self.ANCHOR}=x', f'{PROP_INFLIGHT_PREFIX}d=a,b', source_fs.name)
+        from zfsbackup.backup_manager import clear_zfsbackup_properties
+        cleared = clear_zfsbackup_properties(Filesystem(source_fs.name), config=False, anchors=True)
+        assert cleared == [self.ANCHOR, self.PIN]
+        assert _zfs_get_source(source_fs.name, self.ANCHOR) == '-'
+        assert _zfs_get_source(source_fs.name, self.PIN) == '-'
+
+    def test_the_config_keeps_a_plain_inherit(self, source_fs):
+        _zfs_run('set', f'{PROP_CONFIG}=cfg', source_fs.name)
+        from zfsbackup.backup_manager import clear_zfsbackup_properties
+        assert clear_zfsbackup_properties(Filesystem(source_fs.name), config=True, anchors=False) == [PROP_CONFIG]
+        assert _zfs_get_source(source_fs.name, PROP_CONFIG) == '-'
+
+
+# ---------------------------------------------------------------------------
+# Parallel senders (plan Track B, item B4): concurrent chains from one dataset to two local destinations
+#
+# The REAL `RemoteBackupWorker.run()` -- its scheduler, its sender threads (`sendloop.SendLoop`), the real
+# `LocalBackupManager` -- sends one source dataset to TWO `zfs:` destinations at the same time: real
+# `zfs send | zfs receive` into each, the chains of the two destinations interleaving on the same source
+# (anchors, pins and snapshots of one dataset written by two threads). Nothing is faked; the only addition
+# is an observer around `LocalBackupManager.backup_dataset` that makes the first two calls of a phase meet
+# at a barrier (both senders are inside the chain together, so the test cannot pass with a serial loop) and
+# records how many were in flight.
+#
+# Phase 1: the first full of one snapshot to each destination. Phase 2: three more snapshots, a chain of
+# three `-i` steps to each, concurrently. Then: both copies complete and guid-equal, both anchors on the
+# newest snapshot, no pin left, and the pruner protecting BOTH anchors (one is moved back, the pruner keeps
+# the snapshot it names as well as the newest). The recursive variant does the same for a parent, its
+# descendants (expanded into pairs of their own, behind their ancestor's confirmed copy) and both destinations.
+#
+# Needs the pool's mountpoints and the two `zfs` children of the pump on THIS machine: under `MULTIPASS_VM` the
+# stream would travel host -> `multipass exec` -> guest and the receive never sees its EOF (the run hangs), so
+# the tests skip there like the other local-destination tests; run pytest inside the VM
+# (`scenarios/test_openzfs_matrix.sh --extra tests/test_zfsbackup_real.py` does).
+# ---------------------------------------------------------------------------
+
+PAR_CLIENT = 'par-client'
+PAR_DESTS = ('one', 'two')
+
+
+def _par_write(dataset, name, mib=1):
+    """`mib` MiB of incompressible data into `dataset`'s mountpoint, so the incremental steps carry something.
+    Best effort: a pool whose mountpoint this account cannot write still sends (empty) snapshots."""
+    mountpoint = _zfs_get(dataset, 'mountpoint')
+    if not mountpoint or mountpoint in ('-', 'none', 'legacy'):
+        return
+    cmd = ['dd', 'if=/dev/urandom', f'of={mountpoint}/{name}', 'bs=1048576', f'count={mib}']
+    for argv in (cmd, ['sudo', '-n'] + cmd):
+        if subprocess.run(argv, capture_output=True).returncode == 0:
+            return
+
+
+class _ParWorld:
+    """One source tree, two target datasets, the config, and the loop."""
+
+    def __init__(self, src, children, dsts, recursive, tmp_path, monkeypatch, caplog):
+        self.src, self.children, self.dsts = src, children, dsts
+        self.tree = [src] + [f'{src}/{c}' for c in children]
+        self.recursive = recursive
+        self.tmp_path, self.monkeypatch, self.caplog = tmp_path, monkeypatch, caplog
+        (tmp_path / 'config.db').write_bytes(b'')
+        self.sdir = tmp_path / 'config.db.status'
+        from zfsbackup.health import ensure_status_dir
+        ensure_status_dir(self.sdir)
+        self.config = BackupConfig(
+            datasets=[DatasetConfig(
+                name=src, recursive=recursive, frequency=timedelta(hours=1),
+                # nothing older than an hour is kept but what an anchor or the newest protects
+                retention_rules=[RetentionRule(timedelta(hours=1), timedelta(hours=1))],
+                remote=[RemoteDatasetConfig(destination=d) for d in PAR_DESTS],
+            )],
+            destinations={d: Destination(url=f'zfs:{dst}') for d, dst in zip(PAR_DESTS, dsts)},
+            snapshot_prefix='autosnap',
+        )
+        self.worker = None
+        self.observed = None
+
+    # -- the source's history ------------------------------------------------------------------
+    def history(self, hours_ago):
+        """One data file per dataset and one (recursive) snapshot per entry, oldest first; -> the names."""
+        names = []
+        for hours in hours_ago:
+            for ds in self.tree:
+                _par_write(ds, f'f{hours}.bin')
+            name = snap_name_at(hours)
+            _zfs_run('snapshot', '-r', f'{self.src}@{name}')
+            names.append(name)
+        return names
+
+    # -- the loop -----------------------------------------------------------------------------
+    def expected_pairs(self):
+        return {(ds, d) for ds in self.tree for d in PAR_DESTS}
+
+    def run(self, limit=900.0):
+        """One incarnation of the real remote worker (`run_worker_until_sent`), stopped once every pair has
+        been attempted successfully in THIS incarnation and nothing is running; a pair that fails stops it
+        at once. -> the observer (`max_inflight`, `broken`, `pairs`)."""
+        import threading
+
+        from _sendloop_support import run_worker_until_sent, stretch
+        from zfsbackup import local as local_module
+        from zfsbackup.stopflag import StopFlag
+        from zfsbackup.workers import RemoteBackupWorker
+
+        worker = RemoteBackupWorker(self.config, StopFlag(), status_dir=self.sdir, client_id=PAR_CLIENT)
+        self.worker = worker
+        obs = type('Observed', (), {})()
+        obs.lock, obs.inflight, obs.max_inflight, obs.calls, obs.pairs = threading.Lock(), 0, 0, 0, []
+        obs.broken = False
+        obs.barrier = threading.Barrier(2, timeout=30.0 * stretch())
+
+        real_backup = local_module.LocalBackupManager.backup_dataset
+
+        def observed_backup(manager, dsi, remote_cfg, should_stop=None):
+            with obs.lock:
+                obs.inflight += 1
+                obs.max_inflight = max(obs.max_inflight, obs.inflight)
+                number = obs.calls
+                obs.calls += 1
+                obs.pairs.append((dsi.name, remote_cfg.destination))
+            try:
+                if number < 2:
+                    # the first two sends of the phase are two destinations of one dataset: both must be
+                    # inside the chain at once, or the loop is not running them in parallel
+                    try:
+                        obs.barrier.wait()
+                    except threading.BrokenBarrierError:
+                        obs.broken = True
+                return real_backup(manager, dsi, remote_cfg, should_stop)
+            finally:
+                with obs.lock:
+                    obs.inflight -= 1
+
+        run_worker_until_sent(
+            worker, self.monkeypatch, self.expected_pairs(), limit=limit,
+            extra_patches=lambda mp: mp.setattr(local_module.LocalBackupManager, 'backup_dataset', observed_backup),
+        )
+        self.observed = obs
+        return obs
+
+    # -- what is where ------------------------------------------------------------------------
+    def copy_of(self, dst, ds):
+        return f'{dst}/{PAR_CLIENT}/{ds}'
+
+    def assert_complete(self, names):
+        """Every dataset of the tree, in both copies: the same snapshots with the same guids as the source;
+        both anchors on the newest, no pin."""
+        newest = names[-1]
+        for ds in self.tree:
+            local = _snapshot_guids(ds)
+            assert set(names) <= set(local)
+            for dst in self.dsts:
+                copy = _snapshot_guids(self.copy_of(dst, ds))
+                assert copy == local, f'{self.copy_of(dst, ds)}: {sorted(copy)} != {sorted(local)}'
+            for d in PAR_DESTS:
+                assert _zfs_get_local(ds, f'{PROP_ANCHOR_PREFIX}{d}') == newest, (ds, d)
+                assert _zfs_get_local(ds, f'{PROP_INFLIGHT_PREFIX}{d}') is None, f'a pin is left on {ds} ({d})'
+
+    def assert_recorded(self):
+        from zfsbackup.health import read_worker_status
+        records = {(r.dataset, r.destination): r for r in read_worker_status(self.sdir, 'remote-backup-worker').records
+                   if r.kind == 'send'}
+        assert set(records) == self.expected_pairs()
+        assert all(r.result == 'ok' and r.consecutive_failures == 0 and not r.incomplete for r in records.values())
+
+    def assert_no_errors(self):
+        bad = [r.getMessage() for r in self.caplog.records
+               if r.levelno >= logging.ERROR and r.name.startswith('zfsbackup')]
+        assert not bad, bad
+
+
+class _ParallelChains:
+    """Subclasses set `RECURSIVE` and `CHILDREN` (paths below the source, parents first)."""
+
+    RECURSIVE = False
+    CHILDREN = ()
+
+    @pytest.fixture
+    def par(self, auto_zfs_pool, tmp_path, monkeypatch, caplog):
+        import os
+
+        if auto_zfs_pool is None:
+            pytest.skip('ZFS pool not available — install ZFS and grant NOPASSWD sudo for zpool/zfs')
+        if os.environ.get('MULTIPASS_VM'):
+            pytest.skip('the local pump streams between two zfs children of THIS machine: run pytest inside '
+                        'the VM that owns the pool')
+        pool = auto_zfs_pool.name
+        src = f'{pool}/zfsbackup_psrc'
+        dsts = [f'{pool}/zfsbackup_pdst1', f'{pool}/zfsbackup_pdst2']
+        for name in [src, *dsts]:
+            _destroy_quietly(name)               # a leftover of a crashed run
+        caplog.set_level(logging.DEBUG, logger='zfsbackup')
+        try:
+            _zfs_run('create', src)
+            for child in self.CHILDREN:
+                _zfs_run('create', f'{src}/{child}')
+            for dst in dsts:
+                _zfs_run('create', '-o', 'canmount=off', dst)       # a target as the operator makes it
+            yield _ParWorld(src, self.CHILDREN, dsts, self.RECURSIVE, tmp_path, monkeypatch, caplog)
+        finally:
+            for name in [src, *dsts]:
+                _destroy_quietly(name)
+
+    def test_two_destinations_get_their_chains_at_the_same_time_and_both_copies_are_complete(self, par):
+        from _sendloop_support import age_status
+
+        first = par.history([8])
+        obs = par.run()
+        assert not obs.broken, 'the two senders were never inside the chain together'
+        assert obs.max_inflight >= 2
+        for dst in par.dsts:
+            assert set(_snapshot_guids(par.copy_of(dst, par.src))) == set(first), 'the first full is the newest only'
+        par.assert_complete(first)
+
+        more = par.history([6, 4, 2])
+        age_status(par.worker)                       # a later incarnation: its slot has come again
+        obs = par.run()
+        assert not obs.broken, 'the two chains were never run together'
+        assert obs.max_inflight >= 2
+        names = first + more
+        par.assert_complete(names)
+        par.assert_recorded()
+        par.assert_no_errors()
+        # each destination really got a chain of three incremental steps
+        lines = [r.getMessage() for r in par.caplog.records if r.name.startswith('zfsbackup.local')]
+        for d in PAR_DESTS:
+            assert any(f'Sending 3 snapshots of {par.src} to {d}' in m for m in lines), d
+
+        # the pruner: BOTH anchors protect. One destination is behind (its anchor is the second snapshot),
+        # the other is current; nothing but those two snapshots and the newest may survive.
+        behind = names[1]
+        target = par.children[0] if par.children else None
+        holder = par.src if target is None else f'{par.src}/{target}'
+        _zfs_run('set', f'{PROP_ANCHOR_PREFIX}{PAR_DESTS[1]}={behind}', holder)
+        from zfsbackup.backup_manager import DatasetManager
+        manager = DatasetManager(par.config)
+        manager.prune_snapshots(manager.datasets[0])
+        for ds in par.tree:
+            assert set(_snapshot_guids(ds)) == {behind, names[-1]}, ds
+        # and the copies are untouched by a prune of the source
+        for dst in par.dsts:
+            for ds in par.tree:
+                assert set(_snapshot_guids(par.copy_of(dst, ds))) == set(names), (dst, ds)
+
+
+class TestRealParallelChainsFlat(_ParallelChains):
+    """One dataset, two `zfs:` destinations: two senders at once."""
+
+
+class TestRealParallelChainsRecursive(_ParallelChains):
+    """A recursive parent with a tree below it, both destinations: the parent's two pairs first (concurrently),
+    then every descendant's pairs behind its ancestor's confirmed copy, up to four senders at once."""
+
+    RECURSIVE = True
+    CHILDREN = ('a', 'a/b', 'c')

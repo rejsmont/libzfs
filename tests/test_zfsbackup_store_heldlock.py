@@ -4,7 +4,7 @@
 - ``write_config(..., lock=held)``     a multi-step edit holds the writer lock across its side
                                        effects and hands it in; ``require_writer_lock_held``
                                        is what makes that safe;
-- the anchor-name WARNING              a destination name that cannot be a ZFS user-property
+- the destination-name REFUSAL        a destination name that cannot be a ZFS user-property
                                        suffix (``validate_config`` / import / ``write_config``);
 - the reworded never-prune load warning (the same text as ``validate_config``'s, no ``id=``).
 
@@ -410,8 +410,13 @@ class TestWriteConfigWithAHeldLock:
         assert result.generation == gen + 1
 
 
-class TestDestinationNameWarning:
-    PROBLEM_NAMES = ["bad name", "a/b", "a@b", "café", "a=b"]
+class TestDestinationNameRefusal:
+    """A destination name that cannot form `org.zfsbackup:anchor.<name>` and
+    `org.zfsbackup:inflight.<name>` is REFUSED (user decision 2026-11-11), not warned."""
+
+    PROBLEM_NAMES = ["bad name", "a/b", "a@b", "caf\u00e9", "a=b"]
+    PREFIXES = ("org.zfsbackup:anchor.", "org.zfsbackup:inflight.")
+    LIMIT = 255 - len("org.zfsbackup:inflight.")                   # 232
 
     def config_with(self, destination):
         return BackupConfig(
@@ -421,51 +426,132 @@ class TestDestinationNameWarning:
         )
 
     @pytest.mark.parametrize("name", PROBLEM_NAMES)
-    def test_validate_config_warns_and_does_not_refuse(self, name):
-        warnings = validate_config(self.config_with(name))
-        matching = [w for w in warnings if w.startswith(f"destinations[{name}]: the name cannot hold a ZFS anchor")]
-        assert len(matching) == 1
-        assert "anchors can never be stored for it" in matching[0]
-        assert "not protected from pruning" in matching[0]
-        assert destination_name_problem(name) in matching[0]
+    def test_validate_config_refuses(self, name):
+        with pytest.raises(ValueError) as caught:
+            validate_config(self.config_with(name))
+        message = str(caught.value)
+        assert message.startswith(f"destinations[{name}]: the name cannot form the ZFS properties "
+                                  "org.zfsbackup:anchor.<name> and org.zfsbackup:inflight.<name> (")
+        assert "anchors and send pins can never be stored for it" in message
+        assert "would not be protected from pruning" in message
+        assert destination_name_problem(name) in message
 
-    @pytest.mark.parametrize("name", ["offsite", "dc.two", "a-b_c:d", "X1", "x" * 200])
-    def test_a_usable_name_is_silent(self, name):
-        assert [w for w in validate_config(self.config_with(name)) if "ZFS anchor" in w] == []
-
-    def test_too_long(self):
-        name = "x" * 300
-        warned = [w for w in validate_config(self.config_with(name)) if "ZFS anchor" in w]
-        assert len(warned) == 1 and "too long" in warned[0]
-
-    def test_each_bad_destination_warns_once(self):
+    def test_the_empty_name_is_refused(self):
         config = BackupConfig(
             datasets=[DatasetConfig(name="tank/x", frequency=Duration("1h"))],
-            destinations={"bad one": Destination("https://a"), "bad/two": Destination("https://b"),
-                          "good": Destination("https://c")},
+            destinations={"": Destination("https://h")},
         )
-        warned = [w for w in validate_config(config) if "ZFS anchor" in w]
-        assert len(warned) == 2
+        with pytest.raises(ValueError, match=r"destinations\[\]: the name cannot form.*it is empty"):
+            validate_config(config)
 
-    def test_write_config_reports_it_in_the_result(self, seeded):
+    @pytest.mark.parametrize("name", ["offsite", "dc.two", "a-b_c:d", "X1", "x" * 200])
+    def test_a_usable_name_is_accepted_silently(self, name):
+        assert [w for w in validate_config(self.config_with(name)) if "destinations[" in w] == []
+
+    def test_too_long(self):
+        with pytest.raises(ValueError, match="too long"):
+            validate_config(self.config_with("x" * 300))
+
+    def test_the_first_bad_destination_is_the_one_reported(self):
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="tank/x", frequency=Duration("1h"))],
+            destinations={"good": Destination("https://c"), "bad one": Destination("https://a")},
+        )
+        with pytest.raises(ValueError, match=r"destinations\[bad one\]"):
+            validate_config(config)
+
+    def test_a_disabled_dataset_does_not_exempt_the_name(self):
         config = self.config_with("bad name")
-        result = write_config(seeded, config, expected_generation=0)
-        assert any("destinations[bad name]" in w for w in result.warnings)
-        assert result.warnings == tuple(validate_config(config))
-        assert "bad name" in read_config(seeded).config.destinations      # stored regardless
-        dispose_all()
+        config.datasets[0].enabled = False
+        with pytest.raises(ValueError, match=r"destinations\[bad name\]"):
+            validate_config(config)
 
-    def test_import_logs_it_once(self, tmp_path, caplog):
+    def test_the_boundary_232_is_accepted_233_refused(self):
+        validate_config(self.config_with("x" * self.LIMIT))
+        with pytest.raises(ValueError, match="too long"):
+            validate_config(self.config_with("x" * (self.LIMIT + 1)))
+
+    def test_write_config_raises_and_writes_nothing(self, seeded):
+        before = read_config(seeded)
+        dispose_all()
+        with pytest.raises(ValueError, match=r"destinations\[bad name\]"):
+            write_config(seeded, self.config_with("bad name"), expected_generation=before.generation)
+        after = read_config(seeded)
+        dispose_all()
+        assert after.generation == before.generation
+        assert after.config == before.config
+        assert "bad name" not in after.config.destinations
+
+    def test_write_config_refuses_before_taking_the_writer_lock(self, seeded):
+        # Another holder of the lock would make a write that got as far as the
+        # lock raise ConfigBusy; the name is refused first.
+        with writer_lock(seeded):
+            with pytest.raises(ValueError, match=r"destinations\[bad name\]"):
+                write_config(seeded, self.config_with("bad name"), expected_generation=0, lock_timeout=0.2)
+
+    def test_write_config_refuses_before_the_generation_check(self, seeded):
+        # a stale expected_generation would be a ConfigConflict; the name wins
+        with pytest.raises(ValueError, match=r"destinations\[bad name\]"):
+            write_config(seeded, self.config_with("bad name"), expected_generation=99)
+
+    def test_import_refuses_and_leaves_the_database_untouched(self, tmp_path, seeded, caplog):
         source = tmp_path / "in.yaml"
         source.write_text(
             'destinations:\n  "bad name":\n    url: "https://b"\n'
             'datasets:\n  - name: "tank/x"\n    remote:\n      - destination: "bad name"\n'
         )
-        resolved = resolve_config_path(str(tmp_path / "store" / "config.db"))
+        db_file = seeded.resolved_path
+        before = read_config(seeded)
+        dispose_all()
+        listing_before = sorted(p.name for p in db_file.parent.iterdir())
+        bytes_before = db_file.read_bytes()
         with caplog.at_level(logging.WARNING):
-            import_yaml(source, resolved)
-        warned = [r.getMessage() for r in caplog.records if "ZFS anchor" in r.getMessage()]
-        assert len(warned) == 1 and "destinations[bad name]" in warned[0]
+            with pytest.raises(ValueError, match=r"destinations\[bad name\]"):
+                import_yaml(source, seeded)
+        after = read_config(seeded)
+        dispose_all()
+        assert after.generation == before.generation and after.config == before.config
+        assert sorted(p.name for p in db_file.parent.iterdir()) == listing_before
+        assert db_file.read_bytes() == bytes_before
+        assert [r for r in caplog.records if "cannot form the ZFS" in r.getMessage()] == []
+
+    def test_a_refused_first_import_creates_nothing(self, tmp_path):
+        source = tmp_path / "in.yaml"
+        source.write_text(
+            'destinations:\n  "bad/name":\n    url: "https://b"\n'
+            'datasets:\n  - name: "tank/x"\n'
+        )
+        resolved_path = resolve_config_path(str(tmp_path / "store" / "config.db"))
+        with pytest.raises(ValueError, match=r"destinations\[bad/name\]"):
+            import_yaml(source, resolved_path)
+        assert not (tmp_path / "store").exists()
+
+    @pytest.mark.parametrize("length", [LIMIT - 1, LIMIT])
+    def test_the_longest_accepted_names_form_storable_properties(self, length):
+        # libzfseasy's own validator is the arbiter: the limits cannot drift.
+        from libzfseasy.types import Validate
+
+        name = "x" * length
+        assert destination_name_problem(name) is None
+        for prefix in self.PREFIXES:
+            Validate.attribute(prefix + name)
+
+    def test_every_accepted_name_at_the_boundary_passes_attribute_validation(self):
+        from libzfseasy.types import Validate
+
+        for ch in ("a", "Z", "0", "-", "_", ".", ":"):
+            name = ch * self.LIMIT
+            assert destination_name_problem(name) is None
+            for prefix in self.PREFIXES:
+                Validate.attribute(prefix + name)
+
+    def test_the_first_refused_length_is_one_libzfseasy_would_refuse(self):
+        from libzfseasy.types import Validate
+
+        name = "x" * (self.LIMIT + 1)
+        assert destination_name_problem(name) is not None
+        with pytest.raises(ValueError):
+            Validate.attribute("org.zfsbackup:inflight." + name)
 
     def test_the_function_is_public_and_the_cli_uses_the_same_one(self):
         from zfsbackup.cli import dotpath
@@ -486,7 +572,8 @@ class TestDestinationNameWarning:
         assert fragment in destination_name_problem(name)
 
     def test_the_length_boundary_is_the_whole_property_name(self):
-        limit = 256 - len("org.zfsbackup:anchor.")
+        limit = 255 - len("org.zfsbackup:inflight.")
+        assert limit == 232
         assert destination_name_problem("x" * limit) is None
         assert destination_name_problem("x" * (limit + 1)) is not None
 

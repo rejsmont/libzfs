@@ -30,6 +30,8 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 import types
 from datetime import timedelta
 from types import SimpleNamespace
@@ -54,7 +56,7 @@ from _stream_support import (
 )
 from test_zfsbackup_chain import S1, S2, S3, S4, Ledger, listing, sinfo
 from test_zfsbackup_chain import Rig as ChainRig
-from test_zfsbackup_local_dest_config import HTTPS, LOCAL, Dsi
+from test_zfsbackup_local_dest_config import HTTPS, LOCAL
 from test_zfsbackup_local_dest_config import Rig as WorkerRig
 from test_zfsbackup_local_dest_config import sdir  # noqa: F401  (fixture)
 from test_zfsbackup_chain import DEST as CHAIN_DEST, DS as CHAIN_DS
@@ -71,8 +73,8 @@ from zfsbackup.config import (
 )
 from zfsbackup.local import LocalBackupManager, _Budget, _LocalTarget
 from zfsbackup.health import StatusWriter
+from zfsbackup.sendmemory import TOKEN_SKIPS, SendMemory
 from zfsbackup.receiver import OwnerVerdict
-from zfsbackup.workers import RemoteBackupWorker
 
 pytestmark = pytest.mark.unit
 
@@ -320,7 +322,7 @@ class TestReadyTransport:
         assert self.ready(rig) is None
         (warning,) = messages(caplog, logging.WARNING)
         assert warning.startswith(f'local backup to {DEST} skipped: zfs did not answer within 60 s')
-        assert f'while checking the target {TARGET}' in warning and 'the next cycle retries' in warning
+        assert f'while checking the target {TARGET}' in warning and 'the next attempt retries' in warning
 
     def test_an_expired_budget_is_the_same_timeout(self, rig, caplog, mocker):
         mocker.patch.object(local, 'LOCAL_ZFS_BUDGET', 0.0)
@@ -754,6 +756,496 @@ class TestNegotiateUnsettledAncestors:
         assert messages(caplog, logging.WARNING) == []
 
 
+class TestNegotiateClaim:
+    """B3: two senders of unrelated datasets under one `zfs:` target can both find the same container
+    missing. The one that creates it claims the missing ancestors in the shared `SendMemory`
+    (`claim`, all or nothing, never blocking); another sender that needs one of them gets a RETRYABLE
+    `NegotiationFailed` (like the server's 503 for an unsettled ancestor) instead of "dataset already
+    exists" (an ERROR and a hard failure). The claim is released on every path.
+
+    Mutation-checked (scratch copy): no claim at all fails 3 tests here; no re-look under the claim 1;
+    no release in the `finally` 2."""
+
+    def sibling(self, rig):
+        return rig.dsi_for('pool2/other')
+
+    def test_the_missing_ancestors_are_claimed_all_together_and_released_after(self, rig):
+        mem = rig.mgr._memory
+        seen = []
+        real_claim, real_release = mem.claim, mem.release
+        mem.claim = lambda names: (seen.append(('claim', list(names))), real_claim(names))[1]
+        mem.release = lambda names: (seen.append(('release', list(names))), real_release(names))[1]
+        rig.negotiate()
+        assert [(k, sorted(n)) for k, n in seen] == [('claim', [BASE, PARENT]), ('release', [BASE, PARENT])]
+        assert real_claim([BASE, PARENT]) is True, 'nothing is left claimed'
+
+    def test_a_held_ancestor_is_a_retryable_failure_that_creates_nothing(self, rig, caplog):
+        rig.mgr._memory.claim([PARENT])                    # another sender is creating it right now
+        with pytest.raises(NegotiationFailed) as raised:
+            rig.negotiate()
+        assert raised.value.reloading is True and raised.value.zfs_timeout is False
+        assert str(raised.value) == f'local copy is busy: another send is creating {BASE}', 'names the outermost'
+        assert rig.host.of('create') == []
+        assert messages(caplog, logging.ERROR) == []
+        assert rig.mgr._memory.claim([PARENT]) is False, 'the other sender still holds it: we released nothing'
+
+    def test_a_refused_claim_takes_none_of_the_names(self, rig):
+        rig.mgr._memory.claim([PARENT])
+        with pytest.raises(NegotiationFailed):
+            rig.negotiate()
+        assert rig.mgr._memory.claim([BASE]) is True, 'all or nothing: BASE was not taken'
+
+    def test_two_siblings_creating_the_same_container(self, rig, caplog):
+        """The second negotiate starts while the first is in the middle of its `zfs create`: it waits (retryable),
+        it neither fails hard nor creates the container twice; once the first is done it settles quietly."""
+        outcomes = []
+        real_create = rig.lib.create
+
+        def create(ds, properties=None, mount=True, **kw):
+            if not outcomes:
+                try:
+                    rig.negotiate(dsi=self.sibling(rig))
+                except NegotiationFailed as e:
+                    outcomes.append(e)
+            return real_create(ds, properties=properties, mount=mount, **kw)
+
+        rig.lib.create = create
+        rig.negotiate()
+        (error,) = outcomes
+        assert error.reloading is True and 'another send is creating' in str(error)
+        rig.lib.create = real_create
+        creates = [c[1] for c in rig.host.of('create')]
+        assert creates == [BASE, PARENT], 'each container created once'
+        assert messages(caplog, logging.ERROR) == []
+
+    def test_what_the_sibling_created_between_the_look_and_the_claim_is_not_created_again(self, rig):
+        """Look, claim, look again UNDER the claim: the other sender may have created and released a container
+        since the first look."""
+        mem = rig.mgr._memory
+        real_claim = mem.claim
+
+        def claim(names):
+            rig.host.add(BASE, props={PROP_CLIENT_ID: CLIENT})
+            rig.host.add(PARENT, props={PROP_CLIENT_ID: CLIENT})
+            return real_claim(names)
+
+        mem.claim = claim
+        rig.negotiate()                                      # no "already exists"
+        assert rig.host.of('create') == []
+        assert real_claim([BASE, PARENT]) is True
+
+    def test_the_claim_is_released_when_a_create_fails(self, rig):
+        real_create = rig.lib.create
+
+        def create(ds, properties=None, mount=True, **kw):
+            if str(ds) == PARENT:
+                raise OSError('pool is full')
+            return real_create(ds, properties=properties, mount=mount, **kw)
+
+        rig.lib.create = create
+        with pytest.raises(NegotiationFailed):
+            rig.negotiate()
+        assert rig.mgr._memory.claim([BASE, PARENT]) is True
+
+    def test_the_claim_is_released_when_the_negotiate_is_cut_by_a_timeout(self, rig):
+        real_create = rig.lib.create
+
+        def create(ds, properties=None, mount=True, **kw):
+            raise ZFSTimeoutError('create timed out')
+
+        rig.lib.create = create
+        with pytest.raises(NegotiationFailed):
+            rig.negotiate()
+        assert rig.mgr._memory.claim([BASE, PARENT]) is True
+
+    def test_an_existing_copy_and_a_dry_run_claim_nothing(self, mocker):
+        rig = LocalRig(mocker)
+        rig.owned_copy()
+        claims = []
+        real = rig.mgr._memory.claim
+        rig.mgr._memory.claim = lambda names: (claims.append(list(names)), real(names))[1]
+        rig.negotiate()
+        dry = LocalRig(mocker, dry_run=True)
+        dry.mgr._memory.claim = lambda names: claims.append(list(names)) or True
+        dry.negotiate()
+        assert claims == []
+
+    def test_ancestors_that_exist_need_no_claim(self, rig):
+        rig.host.add(BASE, props={PROP_CLIENT_ID: CLIENT})
+        rig.host.add(PARENT, props={PROP_CLIENT_ID: CLIENT})
+        claims = []
+        real = rig.mgr._memory.claim
+        rig.mgr._memory.claim = lambda names: (claims.append(list(names)), real(names))[1]
+        rig.negotiate()
+        assert claims == []
+
+
+def owner_reads(host, name):
+    """The `get -s local org.zfsbackup:client_id` reads `name` saw (event `value`), in order."""
+    return [e for e in host.of('value') if e[1] == name and e[2] == PROP_CLIENT_ID]
+
+
+def after_first_owner_read(rig, name, action):
+    """Run `action()` right after the FIRST local client-id read of `name` returned (what that read
+    saw stays what it saw: the dataset changes under the caller, as when another sender's `zfs create
+    -o` finishes). -> a dict whose `n` counts the reads."""
+    state = {'n': 0}
+    real = rig.lib.get.value
+
+    def value(ds, prop, sources=None):
+        out = real(ds, prop, sources=sources)
+        if str(ds) == name and prop == PROP_CLIENT_ID:
+            state['n'] += 1
+            if state['n'] == 1:
+                action()
+        return out
+
+    rig.lib.get.value = value
+    return state
+
+
+def count_claims(rig):
+    """Record every `SendMemory.claim` / `release` attempt of the rig's manager; -> the list."""
+    mem = rig.mgr._memory
+    seen = []
+    real_claim, real_release = mem.claim, mem.release
+    mem.claim = lambda names: (seen.append(('claim', list(names))), real_claim(names))[1]
+    mem.release = lambda names: (seen.append(('release', list(names))), real_release(names))[1]
+    return seen
+
+
+class TestNegotiateUnownedAncestor:
+    """B4 (found by scenario 3 of `scenarios/test_parallel_senders.sh`): two senders send siblings to one
+    `zfs:` target whose container tree is missing. One claims the missing containers and runs `zfs create
+    -u -o client_id=...`; on OpenZFS 2.2.2 the new dataset is listed (`zfs list`) before `zfs get -s local`
+    returns the property, so the other's first look saw an UNOWNED container and refused for good (the
+    ownership ERROR). An ancestor that shows no local client id is therefore never refused on the first
+    look: `_recheck_unowned` re-reads it under its claim (or directly when this call holds the claim).
+
+    | first read | claim of the ancestor      | outcome                                        |
+    | ours       | any                        | proceed, no extra call                         |
+    | other      | any                        | the "another client's" refusal, no re-read     |
+    | none       | held by another sender     | retryable busy, no log                         |
+    | none       | free, re-read ours         | proceed                                        |
+    | none       | free, re-read other        | the "another client's" refusal                 |
+    | none       | free, re-read none         | the unowned refusal                            |
+    | none       | free, gone on re-read      | missing: claim and create                      |
+    | none       | held by THIS call          | direct re-read, no claim attempt               |
+
+    Mutation-checked (scratch copy of the tree; failures in this file): the re-read dropped fails 10
+    tests (9 here, the stress test below), the busy branch dropped 4 (3 here and the stress test), the
+    release skipped 10 (9 here and the stress test), the claim attempted even when the name is `held`
+    3."""
+
+    def unowned_parent(self, rig, base_owned=True):
+        if base_owned:
+            rig.host.add(BASE, props={PROP_CLIENT_ID: CLIENT})
+        rig.host.add(PARENT, props={})
+
+    def become(self, rig, props):
+        return lambda: rig.host.datasets[PARENT].props.update(props)
+
+    def test_an_owned_ancestor_adds_no_zfs_call_and_no_claim(self, rig):
+        rig.host.add(BASE, props={PROP_CLIENT_ID: CLIENT})
+        rig.host.add(PARENT, props={PROP_CLIENT_ID: CLIENT})
+        seen = count_claims(rig)
+        rig.negotiate()
+        assert seen == []
+        assert rig.host.events == [
+            ('exists', COPY),
+            ('exists', PARENT), ('value', PARENT, PROP_CLIENT_ID, 'local'),
+            ('value', PARENT, 'receive_resume_token', None),
+            ('exists', BASE), ('value', BASE, PROP_CLIENT_ID, 'local'),
+            ('value', BASE, 'receive_resume_token', None),
+        ], 'the owned path: one look per ancestor, nothing else'
+        assert len(owner_reads(rig.host, PARENT)) == 1 and len(owner_reads(rig.host, BASE)) == 1
+
+    def test_the_real_race_the_property_reads_back_on_the_second_look(self, rig, caplog):
+        self.unowned_parent(rig)
+        after_first_owner_read(rig, PARENT, self.become(rig, {PROP_CLIENT_ID: CLIENT}))
+        assert rig.negotiate() is None
+        assert [e[:2] for e in rig.host.events if e[0] in ('exists', 'value')][:5] == [
+            ('exists', COPY), ('exists', PARENT), ('value', PARENT), ('exists', PARENT), ('value', PARENT),
+        ], 'exists, get, exists, get'
+        assert rig.host.of('create') == [], 'a container another sender made is not created again'
+        assert messages(caplog, logging.ERROR) == [] and messages(caplog, logging.WARNING) == []
+        assert rig.mgr._memory.claim([PARENT]) is True, 'the claim was released'
+
+    def test_it_is_claimed_for_the_re_read_and_only_that_ancestor(self, rig):
+        self.unowned_parent(rig)
+        after_first_owner_read(rig, PARENT, self.become(rig, {PROP_CLIENT_ID: CLIENT}))
+        seen = count_claims(rig)
+        rig.negotiate()
+        assert seen == [('claim', [PARENT]), ('release', [PARENT])]
+
+    def test_a_held_claim_is_a_retryable_busy_without_a_log_or_a_second_read(self, rig, caplog):
+        self.unowned_parent(rig)
+        rig.mgr._memory.claim([PARENT])                      # another sender is creating it
+        with pytest.raises(NegotiationFailed) as raised:
+            rig.negotiate()
+        assert raised.value.reloading is True and raised.value.zfs_timeout is False
+        assert str(raised.value) == f'local copy is busy: another send is creating {PARENT}'
+        assert messages(caplog, logging.WARNING) == [] and messages(caplog, logging.ERROR) == []
+        assert len(owner_reads(rig.host, PARENT)) == 1, 'it did not look again behind the other sender'
+        assert rig.host.of('create') == [] and rig.host.of('set') == []
+        assert rig.mgr._memory.claim([PARENT]) is False, 'the other sender still holds it'
+        assert rig.key() not in rig.mgr._server_info
+
+    def test_busy_then_the_creator_finishes_and_the_retry_proceeds(self, rig, caplog):
+        self.unowned_parent(rig)
+        rig.mgr._memory.claim([PARENT])
+        with pytest.raises(NegotiationFailed):
+            rig.negotiate()
+        rig.host.datasets[PARENT].props[PROP_CLIENT_ID] = CLIENT
+        rig.mgr._memory.release([PARENT])
+        assert rig.negotiate() is None
+        assert messages(caplog, logging.ERROR) == []
+
+    def test_a_second_look_that_shows_another_client_is_the_other_clients_refusal(self, rig, caplog):
+        self.unowned_parent(rig)
+        after_first_owner_read(rig, PARENT, self.become(rig, {PROP_CLIENT_ID: OTHER_CLIENT}))
+        with pytest.raises(NegotiationFailed, match="another host's backup") as raised:
+            rig.negotiate()
+        assert raised.value.reloading is False
+        assert str(raised.value).startswith(PARENT)
+        (error,) = messages(caplog, logging.ERROR)
+        assert f'{DS} -> {DEST}: {PARENT}' in error
+        assert rig.host.of('create') == []
+        assert rig.mgr._memory.claim([PARENT]) is True
+
+    def test_another_client_on_the_first_look_is_refused_with_no_re_read_and_no_claim(self, rig):
+        rig.host.add(BASE, props={PROP_CLIENT_ID: CLIENT})
+        rig.host.add(PARENT, props={PROP_CLIENT_ID: OTHER_CLIENT})
+        seen = count_claims(rig)
+        with pytest.raises(NegotiationFailed, match="another host's backup"):
+            rig.negotiate()
+        assert seen == [] and len(owner_reads(rig.host, PARENT)) == 1
+
+    def test_still_unowned_on_the_second_look_is_the_unowned_refusal(self, rig, caplog):
+        self.unowned_parent(rig)
+        for _ in range(2):
+            with pytest.raises(NegotiationFailed) as raised:
+                rig.negotiate()
+        assert raised.value.reloading is False
+        assert f'{PARENT} already exists on this host and is not recorded as a backup' in str(raised.value)
+        (error,) = messages(caplog, logging.ERROR)
+        assert f'{DS} -> {DEST}: {PARENT} already exists on this host and is not recorded as a backup' in error
+        assert len(owner_reads(rig.host, PARENT)) == 4, 'two looks per negotiate'
+        assert rig.host.of('create') == [] and rig.host.of('set') == []
+        assert rig.mgr._memory.claim([PARENT]) is True
+
+    def test_gone_on_the_second_look_is_a_missing_container_that_is_created(self, rig):
+        self.unowned_parent(rig)
+        after_first_owner_read(rig, PARENT, lambda: rig.host.datasets.pop(PARENT))
+        seen = count_claims(rig)
+        assert rig.negotiate() is None
+        assert [c[1] for c in rig.host.of('create')] == [PARENT]
+        assert rig.host.datasets[PARENT].props[PROP_CLIENT_ID] == CLIENT
+        assert seen == [
+            ('claim', [PARENT]), ('release', [PARENT]),      # the re-read
+            ('claim', [PARENT]), ('release', [PARENT]),      # the creation
+        ]
+
+    def test_the_claim_this_call_holds_is_not_asked_for_again(self, rig):
+        """`held` are this call's own claims (the claim is not reentrant): the second look after
+        `claim(missing)` re-reads directly. A claim attempt on a name this call holds would fail and make
+        the negotiate wait for itself."""
+        # BASE and PARENT are missing on the first look; by the second (after the claim) the other
+        # sender has made them, PARENT's property not yet readable.
+        mem = rig.mgr._memory
+        real_claim = mem.claim
+        attempts = []
+
+        def claim(names):
+            attempts.append(list(names))
+            if len(attempts) == 1:
+                rig.host.add(BASE, props={PROP_CLIENT_ID: CLIENT})
+                rig.host.add(PARENT, props={})
+                after_first_owner_read(rig, PARENT, self.become(rig, {PROP_CLIENT_ID: CLIENT}))
+            return real_claim(names)
+
+        mem.claim = claim
+        assert rig.negotiate() is None
+        assert [sorted(a) for a in attempts] == [[BASE, PARENT]], 'one claim, for the missing containers; none for the re-read'
+        assert rig.host.of('create') == []
+        assert len(owner_reads(rig.host, PARENT)) == 2
+        assert real_claim([BASE, PARENT]) is True
+
+    def test_ancestors_state_with_a_held_name_re_reads_without_a_claim(self, rig):
+        self.unowned_parent(rig)
+        after_first_owner_read(rig, PARENT, self.become(rig, {PROP_CLIENT_ID: CLIENT}))
+        mem = rig.mgr._memory
+        assert mem.claim([PARENT]) is True                   # this call's own claim
+        seen = count_claims(rig)
+        out = rig.mgr._ancestors_state(_Budget(), COPY, BASE, CLIENT, held=[PARENT])
+        assert out == (None, [], None)
+        assert seen == []
+        assert mem.claim([PARENT]) is False, 'and still held: the re-read did not release it'
+
+    def test_ancestors_state_with_a_held_name_that_is_gone_reports_it_missing(self, rig):
+        self.unowned_parent(rig)
+        after_first_owner_read(rig, PARENT, lambda: rig.host.datasets.pop(PARENT))
+        assert rig.mgr._memory.claim([PARENT]) is True
+        out = rig.mgr._ancestors_state(_Budget(), COPY, BASE, CLIENT, held=[PARENT])
+        assert out == (None, [PARENT], None)
+
+    def test_ancestors_state_names_the_busy_ancestor_as_creating(self, rig):
+        self.unowned_parent(rig)
+        rig.mgr._memory.claim([PARENT])
+        unsettled, missing, conflict = rig.mgr._ancestors_state(_Budget(), COPY, BASE, CLIENT)
+        assert (unsettled, missing, conflict) == ((PARENT, 'creating'), [], None)
+
+    @pytest.mark.parametrize('kind', ['exists', 'value'])
+    def test_a_timeout_in_the_re_read_is_the_retryable_zfs_timeout(self, rig, caplog, kind):
+        self.unowned_parent(rig)
+        state = {'n': 0}
+        real_exists, real_value = rig.lib.exists, rig.lib.get.value
+
+        def exists(ds):
+            if kind == 'exists' and str(ds) == PARENT:
+                state['n'] += 1
+                if state['n'] == 2:                          # the first look is #1
+                    raise ZFSTimeoutError('exists timed out')
+            return real_exists(ds)
+
+        def value(ds, prop, sources=None):
+            if kind == 'value' and str(ds) == PARENT and prop == PROP_CLIENT_ID:
+                state['n'] += 1
+                if state['n'] == 2:
+                    raise ZFSTimeoutError('get timed out')
+            return real_value(ds, prop, sources=sources)
+
+        rig.lib.exists, rig.lib.get.value = exists, value
+        with pytest.raises(NegotiationFailed) as raised:
+            rig.negotiate()
+        assert raised.value.zfs_timeout is True and raised.value.reloading is True
+        assert str(raised.value) == 'local copy is busy: zfs timed out'
+        assert messages(caplog, logging.ERROR) == []
+        assert rig.host.of('create') == []
+        assert rig.mgr._memory.claim([PARENT]) is True, 'released on the timeout path'
+
+    def test_a_failure_in_the_re_read_releases_the_claim(self, rig, caplog):
+        self.unowned_parent(rig)
+        state = {'n': 0}
+        real_value = rig.lib.get.value
+
+        def value(ds, prop, sources=None):
+            if str(ds) == PARENT and prop == PROP_CLIENT_ID:
+                state['n'] += 1
+                if state['n'] == 2:
+                    raise OSError('i/o error')
+            return real_value(ds, prop, sources=sources)
+
+        rig.lib.get.value = value
+        with pytest.raises(NegotiationFailed, match='i/o error'):
+            rig.negotiate()
+        assert rig.mgr._memory.claim([PARENT]) is True
+
+    def test_the_claim_is_released_after_every_outcome(self, rig):
+        """Proceed, other client, unowned, gone: none leaves a name in the shared claims."""
+        for after, expect in (
+            (self.become(rig, {PROP_CLIENT_ID: CLIENT}), None),
+            (self.become(rig, {PROP_CLIENT_ID: OTHER_CLIENT}), NegotiationFailed),
+            (lambda: None, NegotiationFailed),
+            (lambda: rig.host.datasets.pop(PARENT), None),
+        ):
+            rig.host.datasets.clear()
+            rig.host.add(TARGET)
+            self.unowned_parent(rig)
+            after_first_owner_read(rig, PARENT, after)
+            if expect is None:
+                rig.negotiate()
+            else:
+                with pytest.raises(expect):
+                    rig.negotiate()
+            assert rig.mgr._memory.claim([BASE, PARENT, COPY]) is True
+            rig.mgr._memory.release([BASE, PARENT, COPY])
+
+
+class _CreateShowsFirstLib(FakeLib):
+    """`zfs create -u -o client_id=...` as OpenZFS 2.2.2 answers it to a concurrent reader: the dataset is
+    listed (`exists`) first and its local property reads back only later."""
+
+    def create(self, ds, properties=None, mount=True, **kw):
+        name = str(ds)
+        self.host._note('create', name, dict(properties or {}), mount, dict(kw))
+        if name in self.host.datasets:
+            raise Exception(f"cannot create '{name}': dataset already exists")
+        self.host.add(name, props={})
+        time.sleep(0.002)
+        self.host.datasets[name].props.update(properties or {})
+
+
+@pytest.fixture
+def tiny_switch_interval():
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-5)
+    yield
+    sys.setswitchinterval(old)
+
+
+class TestNegotiateSiblingsConcurrently:
+    """Real threads, one shared `SendMemory`, a host where a created container is listed before its
+    property reads back: no ownership ERROR, one `zfs create` per container, every pair gets through
+    (after a retryable busy where it met a container being created)."""
+
+    ROUNDS = 25
+    SENDERS = 6
+    ATTEMPTS = 600
+
+    def test_siblings_under_a_missing_container_tree(self, mocker, caplog, tiny_switch_interval):
+        busy_seen = 0
+        for round_no in range(self.ROUNDS):
+            rig = LocalRig(mocker)
+            lib = _CreateShowsFirstLib(rig.host)
+            mocker.patch('zfsbackup.local.zfs', lib)
+            memory = SendMemory()
+            managers = [
+                LocalBackupManager(rig.config, rig.manager, client_id=CLIENT, memory=memory)
+                for _ in range(self.SENDERS)
+            ]
+            names = [f"{'pool' if i % 2 == 0 else 'tank'}/d{i}" for i in range(self.SENDERS)]
+            barrier = threading.Barrier(self.SENDERS)
+            failures, retries = [], []
+
+            def sender(i):
+                try:
+                    barrier.wait(30)
+                    dsi = rig.dsi_for(names[i])
+                    for _ in range(self.ATTEMPTS):
+                        try:
+                            managers[i]._negotiate(rig.transport, CLIENT, dsi, LISTING, DEST)
+                            return
+                        except NegotiationFailed as e:
+                            if not e.reloading:
+                                failures.append(f'{names[i]}: hard failure: {e}')
+                                return
+                            retries.append(str(e))
+                            time.sleep(0.0005)
+                    failures.append(f'{names[i]}: never got through')
+                except BaseException as e:  # noqa: BLE001
+                    failures.append(f'{names[i]}: {e!r}')
+
+            pool = [threading.Thread(target=sender, args=(i,), daemon=True) for i in range(self.SENDERS)]
+            for t in pool:
+                t.start()
+            for t in pool:
+                t.join(60)
+            assert not any(t.is_alive() for t in pool), 'a sender is stuck'
+            assert failures == [], f'round {round_no}: {failures}'
+            creates = [c[1] for c in rig.host.of('create')]
+            assert sorted(creates) == sorted([BASE, f'{BASE}/pool', f'{BASE}/tank']), (
+                f'round {round_no}: each container created exactly once: {creates}')
+            assert memory.claim([BASE, f'{BASE}/pool', f'{BASE}/tank']) is True, 'every claim released'
+            for name in (BASE, f'{BASE}/pool', f'{BASE}/tank'):
+                assert rig.host.datasets[name].props[PROP_CLIENT_ID] == CLIENT
+            busy_seen += len(retries)
+            assert all('another send is creating' in r or 'waiting for' in r for r in retries)
+        assert messages(caplog, logging.ERROR) == [] and messages(caplog, logging.WARNING) == []
+        # The window really was hit: at least one sender had to wait over the rounds.
+        assert busy_seen > 0
+
+
 class TestNegotiateAlwaysFillsTheServerInfo:
     """A missing value fails OPEN in the chain (`absent` reads as a server that predates B-2b), so
     every successful negotiate sets all three, in every shape of copy."""
@@ -929,7 +1421,7 @@ class TestNegotiateFailures:
         (warning,) = messages(caplog, logging.WARNING)
         assert warning == (
             f'{DS} -> {DEST}: zfs did not answer within 60 s on this host; skipping this '
-            'destination this cycle (a hung or suspended pool leaves zfs processes in '
+            'destination this attempt (a hung or suspended pool leaves zfs processes in '
             'uninterruptible sleep)'
         )
         assert rig.mgr.last_problem(DS, DEST) == (
@@ -1032,7 +1524,7 @@ class TestFetchResumeToken:
         assert rig.mgr._token_skips[rig.key()] == 1
         assert rig.mgr.last_problem(DS, DEST) == f'resume token check failed: cannot read the resume token of {COPY}: I/O error'
         (warning,) = messages(caplog, logging.WARNING)
-        assert warning.startswith(f'cannot read the resume token of {COPY}: I/O error; skipping this cycle')
+        assert warning.startswith(f'cannot read the resume token of {COPY}: I/O error; skipping this attempt')
         assert 'rather than risk discarding its partial progress with a fresh send' in warning
 
     def test_the_third_skip_in_a_row_is_an_error_naming_the_local_abort(self, rig, caplog):
@@ -1042,7 +1534,7 @@ class TestFetchResumeToken:
         for _ in range(chain_module.RESUME_TOKEN_SKIP_ERROR_AFTER):
             self.fetch(rig)
         (error,) = messages(caplog, logging.ERROR)
-        assert 'the resume-token check has skipped the last 3 cycles in a row' in error
+        assert 'the resume-token check has skipped the last 3 attempts in a row' in error
         assert "If the local copy's partial receive of this dataset is no longer wanted, abort it on this host" in error
         assert f'`zfs receive -A {COPY}`' in error
         assert 'server' not in error
@@ -1400,7 +1892,7 @@ class TestStreamStepRefusals:
             f'{DS} -> {DEST}: nothing received (type_mismatch): {COPY} is a volume on this host and '
             'the stream is a filesystem, so nothing is received (this host holds a dataset of the '
             'other kind under that name: `zfs rename` it to a name outside the local target; the '
-            'next cycle sends a full stream)'
+            'next attempt sends a full stream)'
         )
 
     def test_the_compound_stream_message(self, rig, step, caplog):
@@ -1999,7 +2491,7 @@ class TestBackupDatasetThroughTheLocalTransport:
         rig.negotiate(dsi=rig.dsi_for('pool'))              # the parent's first backup is pending
         with caplog.at_level(logging.INFO, logger='zfsbackup.local'):
             assert rig.mgr.backup_dataset(rig.dsi, RemoteDatasetConfig(destination=DEST)) is False
-        assert f'local target {TARGET} is busy: waiting for {PARENT}; skipping {DS} this cycle' in \
+        assert f'local target {TARGET} is busy: waiting for {PARENT}; skipping {DS} this attempt' in \
             messages(caplog, logging.INFO)
         assert rig.host.start_calls == []
 
@@ -2015,7 +2507,7 @@ class TestTargetVanished:
     destination is skipped quietly for the rest of the cycle."""
 
     GONE = ('local destination here: the target dataset bk/backups is gone (its pool exported or '
-            'destroyed?); skipping this destination for the rest of this cycle. Import the pool, or '
+            'destroyed?); skipping this destination for the rest of this attempt. Import the pool, or '
             'recreate the target (`zfs create -o canmount=off bk/backups`)')
 
     def test_a_failed_negotiate_with_the_target_gone_is_one_quiet_message(self, rig, caplog):
@@ -2241,9 +2733,9 @@ class TestChainWordingOverTheLocalTransport:
             "source dataset does not have (extra_a), for example after a rollback or an in-place "
             "restore of this dataset, or snapshots taken in the local copy. Sending would make the "
             "local copy destroy them, so nothing is sent. To keep them, on this host: "
-            f"zfs rename {COPY} <a name outside the backup target> (the next cycle sends a full "
+            f"zfs rename {COPY} <a name outside the backup target> (the next attempt sends a full "
             "stream; see README 'Local destinations'). If they are expendable: "
-            f"zfs destroy {COPY}@extra_a (the next cycle continues)."
+            f"zfs destroy {COPY}@extra_a (the next attempt continues)."
         )
         assert 'Rejoining' not in error
 
@@ -2255,7 +2747,7 @@ class TestChainWordingOverTheLocalTransport:
             f"{DS} -> {DEST}: the local copy {COPY} holds snapshots but none of them is a snapshot "
             "the source dataset still has, and a full stream cannot replace it, so nothing is sent. "
             "To keep the local copy, on this host: "
-            f"zfs rename {COPY} <a name outside the backup target> (the next cycle sends a full "
+            f"zfs rename {COPY} <a name outside the backup target> (the next attempt sends a full "
             "stream; see README 'Local destinations')."
         )
 
@@ -2268,7 +2760,7 @@ class TestChainWordingOverTheLocalTransport:
             f"{DS} -> {DEST}: the local copy {COPY} is a raw copy but this dataset is now sent "
             "plain; nothing is sent. On this host, move the old copy aside with "
             f"`zfs rename {COPY} <a name outside the backup target>` (see README 'Local "
-            "destinations'); the next cycle sends a full plain stream"
+            "destinations'); the next attempt sends a full plain stream"
         )
 
     def test_an_untrusted_listing_names_the_local_copy(self, rig, sends, caplog):
@@ -2276,7 +2768,7 @@ class TestChainWordingOverTheLocalTransport:
         rig.host.untrusted.add(COPY)
         assert self.backup(rig) is False
         warnings = messages(caplog, logging.WARNING)
-        assert f'{DS} -> {DEST}: the local copy {COPY} could not list which of its snapshots are newer than {S1}, so nothing is sent and no anchor is written this cycle; the next cycle retries' in warnings
+        assert f'{DS} -> {DEST}: the local copy {COPY} could not list which of its snapshots are newer than {S1}, so nothing is sent and no anchor is written this attempt; the next attempt retries' in warnings
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2366,7 +2858,7 @@ class TestRemoteMessagesAreUnchanged:
             f"{CHAIN_DS} -> {CHAIN_DEST}: the server copy srv/c/pool/data is a raw copy but this "
             "dataset is now sent plain; nothing is sent. On the server, move the old copy aside "
             "with `zfs rename srv/c/pool/data <a name outside the backup target>` (see README "
-            "'Renaming a server copy aside'); the next cycle sends a full plain stream"
+            "'Renaming a server copy aside'); the next attempt sends a full plain stream"
         ]
 
     def test_no_common_snapshot_on_a_non_empty_copy(self, crig, caplog):
@@ -2377,7 +2869,7 @@ class TestRemoteMessagesAreUnchanged:
             f"{CHAIN_DS} -> {CHAIN_DEST}: the server copy srv/c/pool/data holds snapshots but none "
             "of them is a snapshot this host still has, and a full stream cannot replace it, so "
             "nothing is sent. To keep the server copy, on the server: zfs rename srv/c/pool/data "
-            "<a name outside the backup target> (the next cycle sends a full stream; see README "
+            "<a name outside the backup target> (the next attempt sends a full stream; see README "
             "'Renaming a server copy aside'). See README 'Rejoining'"
         ]
 
@@ -2394,9 +2886,9 @@ class TestRemoteMessagesAreUnchanged:
             f"than {S1} that this host does not have (extra_a), for example after a rollback or an "
             "in-place restore of this dataset, or snapshots taken on the server. Sending would "
             "make the server destroy them, so nothing is sent. To keep them, on the server: "
-            "zfs rename srv/c/pool/data <a name outside the backup target> (the next cycle sends a "
+            "zfs rename srv/c/pool/data <a name outside the backup target> (the next attempt sends a "
             "full stream; see README 'Renaming a server copy aside'). If they are expendable: "
-            "zfs destroy srv/c/pool/data@extra_a (the next cycle continues). See README 'Rejoining'"
+            "zfs destroy srv/c/pool/data@extra_a (the next attempt continues). See README 'Rejoining'"
         ]
 
     def test_an_unknown_newer_list(self, crig, caplog):
@@ -2408,7 +2900,7 @@ class TestRemoteMessagesAreUnchanged:
         assert messages_of(caplog, logging.WARNING) == [
             f"{CHAIN_DS} -> {CHAIN_DEST}: the server copy srv/c/pool/data could not list which of "
             f"its snapshots are newer than {S1}, so nothing is sent and no anchor is written this "
-            "cycle; the next cycle retries"
+            "attempt; the next attempt retries"
         ]
 
     def test_the_third_skipped_token_check(self, crig, caplog):
@@ -2417,11 +2909,11 @@ class TestRemoteMessagesAreUnchanged:
             for _ in range(3):
                 crig.sender._token_skipped(crig.dsi, CHAIN_DEST, 'HTTP 500')
         assert messages_of(caplog) == [
-            f"{CHAIN_DS} -> {CHAIN_DEST}: the resume-token check has skipped the last 3 cycles in "
+            f"{CHAIN_DS} -> {CHAIN_DEST}: the resume-token check has skipped the last 3 attempts in "
             "a row (HTTP 500); nothing is sent for this dataset until it passes, so the "
             "destination is falling behind. See the WARNINGs above for the cause. If the server's "
             "partial receive of this dataset is no longer wanted, abort it on the server with "
-            "`zfs receive -A srv/c/pool/data`; the next cycle then sends fresh"
+            "`zfs receive -A srv/c/pool/data`; the next attempt then sends fresh"
         ]
 
     def test_the_placeholder_when_the_copy_is_not_known(self, crig, caplog):
@@ -2434,7 +2926,7 @@ class TestRemoteMessagesAreUnchanged:
         crig.sender.common = [NegotiationFailed('server is busy: another stream', reloading=True)]
         with caplog.at_level(logging.INFO, logger='zfsbackup.chain'):
             assert crig.run() is False
-        assert 'server fake://destination is busy: another stream; skipping pool/data this cycle' in \
+        assert 'server fake://destination is busy: another stream; skipping pool/data this attempt' in \
             messages_of(caplog, logging.INFO)
 
     def test_a_snapshot_destroyed_while_it_was_sent(self, crig, caplog, snapshot_presence):
@@ -2447,7 +2939,7 @@ class TestRemoteMessagesAreUnchanged:
         assert messages_of(caplog) == [
             f"{CHAIN_DS}@{S2} was destroyed while it was being sent to {CHAIN_DEST}; the server has "
             f"it but this host no longer does. Putting the anchor back on {S1}. Stopping; the next "
-            "cycle negotiates again"
+            "attempt negotiates again"
         ]
 
     def test_up_to_date_is_already_on_the_server(self, crig, caplog):
@@ -2676,86 +3168,107 @@ NOTE = 'resume token check failed'
 
 
 @pytest.fixture
-def wrig(mocker, sdir):
+def wrig(monkeypatch, sdir):
     """Worker rig: one dataset sent to a local and an https destination (local first)."""
-    return WorkerRig(mocker, sdir, {'here': LOCAL, 'off': HTTPS})
+    return WorkerRig(monkeypatch, sdir, {'here': LOCAL, 'off': HTTPS})
 
 
-class TestWorkerBuildsTheLocalManager:
-    def test_remote_only_configs_never_build_it(self, mocker, sdir):
-        rig = WorkerRig(mocker, sdir, {'off': HTTPS})
-        worker = rig.run(rig.worker(client_id='cid'), cycles=2)
-        rig.lbm_class.assert_not_called()
-        assert worker._local_manager is None
+class TestWorkerBuildsTheManagers:
+    """The remote worker imports the transport CLASSES once, in `_before_loop` (after the version check,
+    never mid-run), and every send builds its OWN manager from them (`_new_sender`, lazily, after R-2),
+    over the worker's one `SendMemory`, and closes it."""
 
-    def test_a_declared_local_destination_builds_it_even_when_no_dataset_uses_it_yet(self, mocker, sdir):
-        """Built whenever the configuration has one: `zfsbackup.local` is imported at start-up,
-        right after the version check, never in the middle of a cycle."""
-        rig = WorkerRig(mocker, sdir, {'here': LOCAL, 'off': HTTPS}, uses=['off'])
-        worker = rig.worker()
+    def test_remote_only_configs_never_import_the_local_class(self, monkeypatch, sdir):
+        rig = WorkerRig(monkeypatch, sdir, {'off': HTTPS})
+        rig.run()
+        assert rig.rig.worker._local_cls is None
+        assert {kind for kind, _ in rig.rig.built} == {'remote'}
+
+    def test_a_declared_local_destination_imports_it_even_when_no_dataset_uses_it_yet(self, monkeypatch, sdir):
+        """Imported whenever the configuration has one: `zfsbackup.local` is imported at start-up,
+        right after the version check, never in the middle of a send."""
+        rig = WorkerRig(monkeypatch, sdir, {'here': LOCAL, 'off': HTTPS}, uses=['off'])
+        worker = rig.rig.worker
         worker._before_loop(rig.config, rig.manager)
-        rig.lbm_class.assert_called_once()
-        assert worker._local_manager is rig.lbm
+        assert worker._local_cls is not None
+        rig.run()
+        assert {kind for kind, _ in rig.rig.built} == {'remote'}, 'imported, but nothing used it'
 
-    def test_a_disabled_dataset_using_it_still_builds_it(self, wrig):
+    def test_a_disabled_dataset_using_it_still_imports_it(self, wrig):
         wrig.config.datasets[0].enabled = False
-        worker = wrig.worker()
+        worker = wrig.rig.worker
         worker._before_loop(wrig.config, wrig.manager)
-        assert worker._local_manager is wrig.lbm
+        assert worker._local_cls is not None
 
-    def test_an_enabled_dataset_using_it_builds_it_in_before_loop_with_the_client_id(self, wrig):
-        worker = wrig.worker(client_id='cid')
-        worker._before_loop(wrig.config, wrig.manager)
-        wrig.lbm_class.assert_called_once_with(wrig.config, wrig.manager, client_id='cid')
-        assert worker._local_manager is wrig.lbm
-        wrig.lbm.begin_cycle.assert_called_once_with()
-
-    def test_it_is_built_before_the_first_send(self, wrig):
-        wrig.lbm_class.side_effect = lambda *a, **k: (wrig.order.append(('built',)) or wrig.lbm)
+    def test_an_enabled_dataset_using_it_builds_a_sender_with_the_client_id_and_the_memory(self, wrig):
         wrig.run()
-        assert wrig.order[0] == ('built',)
-        assert wrig.lbm_class.call_count == 1
+        (kw,) = [kw for kind, kw in wrig.rig.built if kind == 'local']
+        assert kw['client_id'] == 'client1' and kw['memory'] is wrig.rig.memory
+        assert 'tls_dir' not in kw, 'a local destination has no TLS identity'
+        # two remote managers: the send's, and the throwaway one of the certificate reminder
+        remote = [kw for kind, kw in wrig.rig.built if kind == 'remote']
+        assert len(remote) == 2
+        assert all(kw['client_id'] == 'client1' and kw['memory'] is wrig.rig.memory and 'tls_dir' in kw for kw in remote)
 
-    def test_the_remote_manager_is_always_built_in_before_loop(self, mocker, sdir):
-        rig = WorkerRig(mocker, sdir, {'here': LOCAL})
-        rig.worker(client_id='cid')._before_loop(rig.config, rig.manager)
-        rig.rbm_class.assert_called_once()
-        assert rig.rbm_class.call_args.kwargs['client_id'] == 'cid'
+    def test_the_remote_class_is_always_imported_in_before_loop(self, monkeypatch, sdir):
+        rig = WorkerRig(monkeypatch, sdir, {'here': LOCAL})
+        rig.rig.worker._before_loop(rig.config, rig.manager)
+        assert rig.rig.worker._remote_cls is not None
 
-    def test_there_is_no_lazy_build_a_missing_manager_is_an_error_not_an_import(self, mocker, sdir, caplog):
-        rig = WorkerRig(mocker, sdir, {'off': HTTPS})
-        worker = rig.worker()
+    def test_there_is_no_lazy_import_a_missing_class_is_an_error_not_an_import(self, monkeypatch, sdir, caplog):
+        rig = WorkerRig(monkeypatch, sdir, {'off': HTTPS})
+        worker = rig.rig.worker
         worker._before_loop(rig.config, rig.manager)
+        config = BackupConfig(datasets=[], destinations={'here': LOCAL})
+        manager = DatasetManager(config, memory=worker._mem())
         with caplog.at_level(logging.ERROR, logger='zfsbackup.workers'):
-            with pytest.raises(RuntimeError, match='local backup manager was not built at start-up'):
-                worker._local_backup_manager(rig.manager)
-        assert any('not importing zfsbackup.local mid-cycle' in r.getMessage() for r in caplog.records
+            with pytest.raises(RuntimeError, match='local backup manager was not imported at start-up'):
+                worker._new_sender(manager, 'here')
+        assert any('not importing zfsbackup.local mid-run' in r.getMessage() for r in caplog.records
                    if r.levelno == logging.ERROR)
-        rig.lbm_class.assert_not_called()
+        assert [kind for kind, _ in rig.rig.built] == []
 
-    def test_the_built_manager_is_the_one_every_send_uses(self, wrig):
-        worker = wrig.worker()
-        worker._before_loop(wrig.config, wrig.manager)
-        assert worker._local_backup_manager(wrig.manager) is wrig.lbm
-        assert worker._local_backup_manager(wrig.manager) is wrig.lbm
-        wrig.lbm_class.assert_called_once()
+    def test_a_pair_whose_class_was_not_imported_fails_alone_and_is_recorded(self, wrig, monkeypatch):
+        """`_before_loop` did not import the local class (a double): the local pair fails with the
+        reason, the remote pair is unaffected."""
+        worker = wrig.rig.worker
+        real = worker._before_loop
 
-    def test_begin_cycle_runs_on_both_managers_at_the_top_of_every_cycle(self, wrig):
-        worker = wrig.worker()
-        worker._before_loop(wrig.config, wrig.manager)
-        wrig.lbm.begin_cycle.reset_mock()
-        for n in (1, 2, 3):
-            worker._get_datasets(wrig.manager)
-            assert wrig.rbm.begin_cycle.call_count == n
-            assert wrig.lbm.begin_cycle.call_count == n
+        def before(config, manager):
+            real(config, manager)
+            worker._local_cls = None
 
-    def test_without_a_local_manager_begin_cycle_builds_none(self, mocker, sdir):
-        rig = WorkerRig(mocker, sdir, {'off': HTTPS})
-        worker = rig.worker()
-        worker._before_loop(rig.config, rig.manager)
-        worker._get_datasets(rig.manager)
-        rig.rbm.begin_cycle.assert_called_once_with()
-        rig.lbm_class.assert_not_called()
+        monkeypatch.setattr(worker, '_before_loop', before)
+        wrig.run()
+        records = wrig.records()
+        assert records[('send', 'pool/a', 'here')].result == 'error'
+        assert 'local backup manager was not imported at start-up' in records[('send', 'pool/a', 'here')].last_error
+        assert records[('send', 'pool/a', 'off')].result == 'ok'
+
+    def test_every_send_builds_its_own_manager_over_the_shared_memory_and_closes_it(self, monkeypatch, sdir):
+        rig = WorkerRig(monkeypatch, sdir, {'here': LOCAL}, names=('pool/a', 'pool/b'))
+        rig.run()
+        built = [kw for kind, kw in rig.rig.built if kind == 'local']
+        assert len(built) == 2 and all(kw['memory'] is rig.rig.memory for kw in built)
+        assert len(rig.lbm.close.call_args_list) == 2    # a list append is atomic, `call_count += 1` is not
+
+    def test_a_manager_that_does_not_share_the_memory_is_refused_not_trusted(self, wrig, monkeypatch):
+        """A manager built without the worker's memory would silently lose `COPY_CONFIRMED`, and R-2
+        would hold the children for ever: `_shares_memory` raises (it is not an `assert`)."""
+        wrig.lbm._memory = SendMemory()
+        monkeypatch.setattr(
+            'zfsbackup.local.LocalBackupManager',
+            lambda config, manager, **kw: wrig.lbm,
+        )
+        wrig.run()
+        rec = wrig.records()[('send', 'pool/a', 'here')]
+        assert rec.result == 'error' and "does not share the worker's SendMemory" in rec.last_error
+        assert wrig.records()[('send', 'pool/a', 'off')].result == 'ok'
+
+    def test_begin_cycle_is_never_called_on_either_manager(self, wrig):
+        wrig.run()
+        wrig.rbm.begin_cycle.assert_not_called()
+        wrig.lbm.begin_cycle.assert_not_called()
 
     def test_the_local_module_is_imported_only_when_a_local_destination_is_configured(self):
         code = (
@@ -2782,25 +3295,23 @@ class TestWorkerBuildsTheLocalManager:
         assert proc.stdout.split() == ['False', 'True']
 
 
+
 class TestWorkerDispatch:
-    def test_only_a_destination_that_is_exactly_local_goes_to_the_local_manager(self, mocker, sdir):
-        rig = WorkerRig(mocker, sdir, {'off': HTTPS})
-        rig.config.destinations['odd'] = SimpleNamespace(is_local='yes', url='zfs:x/y')
-        rig.manager.datasets = [Dsi('pool/a', ['odd'])]
-        worker = rig.worker()
-        worker._before_loop(rig.config, rig.manager)
-        worker._send_to_destinations(rig.manager, rig.manager.datasets[0], [])
+    def test_only_a_destination_that_is_exactly_local_goes_to_the_local_manager(self, monkeypatch, sdir):
+        rig = WorkerRig(
+            monkeypatch, sdir,
+            {'off': HTTPS, 'odd': SimpleNamespace(is_local='yes', url='zfs:x/y')}, uses=['odd'],
+        )
+        rig.run()
         rig.lbm.backup_dataset.assert_not_called()
         assert rig.rbm.backup_dataset.call_count == 1
 
-    def test_the_interval_counts_local_destinations_like_any_other(self, wrig):
+    def test_the_period_counts_local_destinations_like_any_other(self, wrig):
         wrig.config.datasets[0].remote[0].frequency = timedelta(minutes=20)       # the local one
-        assert wrig.worker()._get_interval(wrig.config) == 20 * 60
+        wrig.run()
+        assert wrig.rig.loop.schedule.spec(('pool/a', 'here')).effective_period == 20 * 60
 
-    def test_record_send_takes_the_manager_that_ran_it(self, wrig):
-        import inspect
-        parameter = inspect.signature(RemoteBackupWorker._record_send).parameters['sender']
-        assert parameter.default is None
+    def test_each_pair_records_the_account_of_the_manager_that_ran_it(self, wrig):
         wrig.lbm.backup_dataset.side_effect = None
         wrig.lbm.backup_dataset.return_value = False
         wrig.lbm.last_problem.return_value = 'local says no'
@@ -2812,24 +3323,29 @@ class TestWorkerDispatch:
         assert records[('send', 'pool/a', 'here')].last_error == 'local says no'
         assert records[('send', 'pool/a', 'off')].last_error == 'remote says no'
 
-    def test_datasets_are_sent_parents_first_to_both_kinds(self, mocker, sdir):
+    def test_an_ancestor_is_sent_before_its_descendants_to_both_kinds(self, monkeypatch, sdir):
         rig = WorkerRig(
-            mocker, sdir, {'here': LOCAL, 'off': HTTPS},
-            names=('pool/a/b/c', 'pool/a', 'pool/z', 'pool/a/b'),
+            monkeypatch, sdir, {'here': LOCAL, 'off': HTTPS},
+            names=('pool/a/b/c', 'pool/a', 'pool/z', 'pool/a/b'), serial=True,
         )
         rig.run()
-        order = [name for _, name, _ in rig.order]
-        assert order == [
-            'pool/a', 'pool/a', 'pool/z', 'pool/z', 'pool/a/b', 'pool/a/b', 'pool/a/b/c', 'pool/a/b/c']
-        assert [kind for kind, _, _ in rig.order] == ['local', 'remote'] * 4
+        assert len(rig.order) == 8
+        for destination in ('here', 'off'):
+            seen = [name for _, name, dest in rig.order if dest == destination]
+            assert sorted(seen) == sorted(['pool/a/b/c', 'pool/a', 'pool/z', 'pool/a/b'])
+            assert seen.index('pool/a') < seen.index('pool/a/b') < seen.index('pool/a/b/c')
+        assert {(kind, dest) for kind, _, dest in rig.order} == {('local', 'here'), ('remote', 'off')}
 
-    def test_a_sender_is_asked_once_per_destination_per_dataset_per_cycle(self, wrig):
-        wrig.run(cycles=3)
-        assert len(wrig.lbm.backup_dataset.call_args_list) == 3
-        assert len(wrig.rbm.backup_dataset.call_args_list) == 3
+    def test_a_sender_is_asked_once_per_destination_per_dataset_per_run(self, wrig):
+        wrig.run()
+        assert len(wrig.lbm.backup_dataset.call_args_list) == 1
+        assert len(wrig.rbm.backup_dataset.call_args_list) == 1
 
 
-class TestWorkerSeedsTheSkipCountsBySender:
+class TestWorkerSeedsTheSkipCountsPerPair:
+    """`_before_loop` seeds the shared memory's `TOKEN_SKIPS` per (dataset, destination) from the previous
+    incarnation's status file: the managers share the memory, so there is nothing to hand each one."""
+
     def seed(self, sdir, *rows):
         w = StatusWriter(sdir, 'remote-backup-worker')
         for dataset, dest, failures in rows:
@@ -2837,43 +3353,153 @@ class TestWorkerSeedsTheSkipCountsBySender:
                 w.record('send', dataset, dest, ok=False, error=f'{NOTE}: x')
         w.flush(force=True)
 
+    def counts(self, rig):
+        return {d: rig.rig.memory.count(TOKEN_SKIPS, ('pool/a', d)) for d in ('here', 'off')}
+
     def test_the_note_is_the_one_the_chain_writes(self):
         assert chain_module.TOKEN_SKIP_NOTE == NOTE
 
-    def test_each_manager_gets_only_the_counts_of_its_own_destinations(self, wrig, sdir):
+    def test_each_pair_gets_its_own_count(self, wrig, sdir):
         self.seed(sdir, ('pool/a', 'here', 2), ('pool/a', 'off', 3))
         wrig.run()
-        wrig.rbm.seed_token_skips.assert_called_once_with({('pool/a', 'off'): 3})
-        wrig.lbm.seed_token_skips.assert_called_once_with({('pool/a', 'here'): 2})
+        assert self.counts(wrig) == {'here': 2, 'off': 3}
 
-    def test_local_counts_alone_never_reach_the_remote_manager(self, wrig, sdir):
+    def test_local_counts_alone_seed_only_the_local_pair(self, wrig, sdir):
         self.seed(sdir, ('pool/a', 'here', 2))
         wrig.run()
-        wrig.rbm.seed_token_skips.assert_not_called()
-        wrig.lbm.seed_token_skips.assert_called_once_with({('pool/a', 'here'): 2})
+        assert self.counts(wrig) == {'here': 2, 'off': 0}
 
-    def test_remote_counts_alone_never_reach_the_local_manager(self, wrig, sdir):
+    def test_remote_counts_alone_seed_only_the_remote_pair(self, wrig, sdir):
         self.seed(sdir, ('pool/a', 'off', 2))
         wrig.run()
-        wrig.rbm.seed_token_skips.assert_called_once_with({('pool/a', 'off'): 2})
-        wrig.lbm.seed_token_skips.assert_not_called()
+        assert self.counts(wrig) == {'here': 0, 'off': 2}
 
-    def test_local_counts_without_any_local_destination_configured_go_to_the_remote_manager(
-            self, mocker, sdir):
-        """A record naming a destination that is not declared as local is not a local count (the
-        record is for the remote worker's old life); no local manager exists to take it."""
-        rig = WorkerRig(mocker, sdir, {'off': HTTPS}, uses=['off'])
-        self.seed(sdir, ('pool/a', 'off', 2))
-        rig.run()
-        rig.lbm_class.assert_not_called()
-        rig.rbm.seed_token_skips.assert_called_once_with({('pool/a', 'off'): 2})
-
-    def test_other_failures_do_not_seed_either_manager(self, wrig, sdir):
+    def test_other_failures_do_not_seed(self, wrig, sdir):
         w = StatusWriter(sdir, 'remote-backup-worker')
         for dest in ('here', 'off'):
             for _ in range(4):
                 w.record('send', 'pool/a', dest, ok=False, error='connection refused')
         w.flush(force=True)
         wrig.run()
-        wrig.rbm.seed_token_skips.assert_not_called()
-        wrig.lbm.seed_token_skips.assert_not_called()
+        assert self.counts(wrig) == {'here': 0, 'off': 0}
+
+
+# ---------------------------------------------------------------------------------------------
+# A2: a copy whose snapshots could never exist (full name over 255 characters)
+# ---------------------------------------------------------------------------------------------
+
+
+class TestNegotiateNameTooLong:
+    """`<target>/<client>/<dataset>@<snapshot>` over ZFS's 255 characters is refused in `_negotiate`
+    before anything is asked of or written to zfs: ERROR once per episode, `NegotiationFailed`."""
+
+    SNAP = LISTING[0].name                                   # 23 characters
+
+    @staticmethod
+    def dsi_with_copy_length(rig, copy_length):
+        name = 'pool/' + 'a' * (copy_length - len(BASE) - 1 - len('pool/'))
+        dsi = rig.dsi_for(name)
+        assert len(f'{BASE}/{name}') == copy_length
+        return dsi
+
+    def fits(self, rig):
+        return self.dsi_with_copy_length(rig, 255 - 1 - len(self.SNAP))
+
+    def too_long(self, rig):
+        return self.dsi_with_copy_length(rig, 255 - len(self.SNAP))
+
+    def test_exactly_255_is_negotiated(self, rig):
+        assert rig.negotiate(dsi=self.fits(rig)) is None
+        assert rig.host.of('create'), 'it went on to create the ancestors'
+
+    def test_256_is_refused_before_any_zfs_command(self, rig, caplog):
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.local'):
+            with pytest.raises(NegotiationFailed, match='256-character name'):
+                rig.negotiate(dsi=self.too_long(rig))
+        assert rig.host.events == [], 'not even an existence check, let alone a write'
+        (error,) = messages(caplog, logging.ERROR)
+        assert 'nothing is sent' in error and 'shorten the dataset name' in error
+
+    def over_by_one(self):
+        """The listing plus one snapshot whose name is a character longer than the others."""
+        return [SimpleNamespace(name=self.SNAP + 'x')] + LISTING
+
+    def test_the_longest_snapshot_name_decides(self, rig):
+        with pytest.raises(NegotiationFailed):
+            rig.negotiate(dsi=self.fits(rig), snaps=self.over_by_one())
+        assert rig.host.events == []
+
+    def test_one_error_per_episode_and_a_new_one_after_a_success(self, rig, caplog):
+        dsi = self.fits(rig)
+        with caplog.at_level(logging.DEBUG, logger='zfsbackup.local'):
+            for _ in range(3):
+                with pytest.raises(NegotiationFailed):
+                    rig.negotiate(dsi=dsi, snaps=self.over_by_one())
+            assert len(messages(caplog, logging.ERROR)) == 1
+            assert rig.negotiate(dsi=dsi) is None                 # the same pair negotiates: episode over
+            with pytest.raises(NegotiationFailed):
+                rig.negotiate(dsi=dsi, snaps=self.over_by_one())
+        assert len(messages(caplog, logging.ERROR)) == 2
+
+    def test_through_backup_dataset_nothing_is_written_and_the_problem_is_reported(self, rig):
+        dsi = self.too_long(rig)
+        assert rig.mgr.backup_dataset(dsi, RemoteDatasetConfig(destination=DEST)) is False
+        assert not rig.host.of('create') and not rig.host.of('set') and not rig.host.of('start-receive')
+        assert '256-character' in rig.mgr.last_problem(dsi.name, DEST)
+
+
+
+# ---------------------------------------------------------------------------------------------
+# A2: `copy_confirmed` on the local manager (what the parent-first rule of recursive datasets reads)
+# ---------------------------------------------------------------------------------------------
+
+
+class TestCopyConfirmedLocal:
+    """The copy under the local target is CONFIRMED in this incarnation when a negotiate found it and the
+    call returned True, or a stream committed. No anchor is evidence, and a dry run confirms nothing."""
+
+    def backup(self, rig):
+        return rig.mgr.backup_dataset(rig.dsi, RemoteDatasetConfig(destination=DEST))
+
+    def confirmed(self, rig):
+        return rig.mgr.copy_confirmed(DS, DEST)
+
+    def test_nothing_is_confirmed_at_first(self, rig):
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.confirmed(rig) is False
+
+    def test_an_existing_up_to_date_copy_confirms_without_a_stream(self, rig, sends):
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.backup(rig) is True and sends.calls == []
+        assert self.confirmed(rig) is True
+
+    def test_a_first_full_send_that_commits_confirms(self, rig, sends, streams):
+        commits(rig, streams, S3)
+        assert self.backup(rig) is True
+        assert self.confirmed(rig) is True
+
+    def test_a_committed_stream_confirms_even_if_the_chain_then_fails(self, rig, sends, streams):
+        rig.owned_copy(copy_rows(S1))
+        commits(rig, streams, S2)
+        rig.host.receives.append(streams.receive(rc=1, stderr='cannot receive: no space', events=rig.host.events))
+        assert self.backup(rig) is False
+        assert self.confirmed(rig) is True
+
+    def test_a_failing_first_receive_confirms_nothing(self, rig, sends, streams):
+        rig.host.receives.append(streams.receive(rc=1, stderr='cannot receive: no space', events=rig.host.events))
+        assert self.backup(rig) is False
+        assert self.confirmed(rig) is False
+
+    def test_a_dry_run_confirms_nothing(self, mocker, streams, snapshot_presence):
+        rig = LocalRig(mocker, dry_run=True)
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.backup(rig) is True
+        assert self.confirmed(rig) is False
+
+    def test_a_copy_that_has_gone_unsets_the_confirmation(self, rig, sends, streams):
+        rig.owned_copy(copy_rows(S1, S2, S3))
+        assert self.backup(rig) is True and self.confirmed(rig) is True
+        del rig.host.datasets[COPY]                                   # the copy was lost
+        rig.host.receives.append(streams.receive(rc=1, stderr='cannot receive: boom', events=rig.host.events))
+        assert self.backup(rig) is False
+        assert self.confirmed(rig) is False

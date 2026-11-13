@@ -9,6 +9,16 @@ Description=ZFS Backup health check (Prometheus textfile)
 
 [Service]
 Type=oneshot
+# A hung pool must not hang this unit for ever (Type=oneshot has no start
+# timeout by default). `check` bounds its own zfs reads (a time limit for the
+# whole run, 60 s by default, and 10 s per zfs command, except the batched reads
+# of a large tree, which may use what is left of the 60 s; the run overshoots its
+# limit by a few seconds at most). What it did not get to is reported as one WARN
+# entry, never as silence, so the unit gets twice the
+# limit plus a margin before systemd kills it: 2 x 60 s + 30 s. If you raise
+# the check's time limit in ExecStart, raise this to at least twice that plus 30.
+# A unit killed by this timeout fails and leaves the previous file in place.
+TimeoutStartSec=150
 Environment=ZFSBACKUP_CHECK_OUTPUT=/var/lib/node_exporter/textfile_collector/zfsbackup.prom
 ExecStart=/opt/zfsbackup/venv/bin/zfsbackup-config -c /var/lib/zfsbackup/config.db check --prometheus --output ${ZFSBACKUP_CHECK_OUTPUT}
 # With --output, `check` exits 0 once the file is written, whatever the verdict:

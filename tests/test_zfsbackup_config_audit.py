@@ -1659,11 +1659,17 @@ class TestSpaceInsideAComponentEndToEnd:
             via_import(tmp_path, path)
 
     def test_non_ascii_other_values_are_still_fine(self, tmp_path):
-        # Only dataset NAMES are ASCII-bound (they reach `zfs`); a destination
-        # name and URL are free text and still round-trip.
-        data = make(destinations={"d\u00e9p\u00f4t": {"url": "https://127.0.0.1:9/caf\u00e9"}})
+        # Dataset and destination NAMES are ASCII-bound (they reach `zfs`: a
+        # destination name is part of a ZFS property name); a URL path is not
+        # and still round-trips.
+        data = make(destinations={"depot": {"url": "https://127.0.0.1:9/caf\u00e9"}})
         loaded = via_import(tmp_path, write(tmp_path, data))
-        assert loaded.destinations["d\u00e9p\u00f4t"].url == "https://127.0.0.1:9/caf\u00e9"
+        assert loaded.destinations["depot"].url == "https://127.0.0.1:9/caf\u00e9"
+
+    def test_a_non_ascii_destination_name_is_refused(self, tmp_path):
+        data = make(destinations={"d\u00e9p\u00f4t": {"url": "https://127.0.0.1:9/"}})
+        with pytest.raises(ValueError, match="destinations\\[d\u00e9p\u00f4t\\].*cannot form the ZFS properties"):
+            via_import(tmp_path, write(tmp_path, data))
 
 
 # -- through the CLI --------------------------------------------------------------

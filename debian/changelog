@@ -1,3 +1,18 @@
+zfsbackup (1.0.0~rc6-1) unstable; urgency=medium
+
+  * Sixth release candidate of 1.0.0.
+  * Recursive datasets send every descendant as its own copy; backup
+    copies inside a recursive tree are never snapshotted, sent or pruned
+    as sources.
+  * The remote worker sends up to 4 pairs at once (2 per destination),
+    each on its own schedule, with retries and catch-up after restarts.
+  * check grades the children of recursive datasets under a time limit
+    and caps --nagios output; zfsbackup-check.service gets
+    TimeoutStartSec=150.
+  * Destination names that cannot form ZFS property names are refused.
+
+ -- Radoslaw Kamil Ejsmont <radoslaw@ejsmont.net>  Thu, 12 Nov 2026 12:00:00 +0000
+
 zfsbackup (1.0.0~rc5-1) unstable; urgency=medium
 
   * Fifth release candidate of 1.0.0.

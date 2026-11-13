@@ -14,6 +14,7 @@ must say `false` for both: the check runs BEFORE those imports.
 import json
 import os
 import sys
+import time
 
 from _reload_workers import GatedSnapshotWorker, _ForcedMethodWatch
 from zfsbackup.workers import ApiWorker, PruningWorker, RemoteBackupWorker, SnapshotWorker
@@ -59,20 +60,83 @@ class ProbeGatedSnapshotWorker(Probe, GatedSnapshotWorker):
     `release_path` exists) with the probe: for the "no skew, runs normally" cases."""
 
 
+class _GateDsi:
+    """Picklable-by-construction stand-in for a configured `DatasetInfo` (only what `SendLoop` reads)."""
+
+    def __init__(self, name, destination):
+        from datetime import timedelta
+        from types import SimpleNamespace
+        self.name = name
+        self.expanded_from = None
+        self.config = SimpleNamespace(
+            remote=[SimpleNamespace(destination=destination, frequency=None)],
+            frequency=timedelta(hours=1), recursive=False,
+        )
+
+
+class _GateManager:
+    """The scheduler's own `DatasetManager` of `GatedRemoteWorker`: it lists the configured datasets."""
+
+    def __init__(self, names, destination, config):
+        self.config = config
+        self.datasets = [_GateDsi(n, destination) for n in names]
+
+
 class GatedRemoteWorker(_ForcedMethodWatch, RemoteBackupWorker):
-    """A remote worker (`drains_for_upgrade`) over the same gated datasets as
-    `GatedSnapshotWorker`: `start:<name>`, block until `release_path` exists, `done:<name>`.
-    `_before_loop` (which imports `zfsbackup.remote`) does nothing."""
+    """A remote worker (`drains_for_upgrade`) over gated pairs: the REAL scheduler loop and sender threads
+    (`sendloop.SendLoop`), each sender's `backup_dataset` doing `start:<name>`, block until `release_path`
+    exists, `done:<name>` (appended to `<record_dir>/events`). Three pairs to ONE destination, so the cap of
+    two senders per destination leaves the third waiting: a drain must not start it. Every pair is due at
+    once (`fraction` 0); `_before_loop` (which imports `zfsbackup.remote`) does nothing; `_new_kit` is the
+    one factory the loop builds a sender from."""
 
     record_dir = None
     release_path = None
-    names = GatedSnapshotWorker.names
-    _get_datasets = GatedSnapshotWorker._get_datasets
+    names = ("pool/a", "pool/b", "pool/c")
+    destination = "d"
     _note = GatedSnapshotWorker._note
-    _process_dataset = GatedSnapshotWorker._process_dataset
+
+    def run(self):
+        from zfsbackup import workers
+        from zfsbackup.sendschedule import SendSchedule
+        # In THIS process only (a spawned or forked child; the module is never patched in the parent).
+        workers.SendSchedule = lambda client_id, check: SendSchedule(
+            client_id, check, fraction=lambda *a: 0.0
+        )
+        super().run()
 
     def _before_loop(self, config, manager):
         pass
+
+    def _new_manager(self, config):
+        return _GateManager(self.names, self.destination, config)
+
+    def _new_kit(self, template, remote_cfg):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from zfsbackup.sendloop import SenderKit
+        worker = self
+        manager = MagicMock(name="manager")
+        manager.get_own_anchor.return_value = None
+        manager.config.dry_run = False
+        dsi = SimpleNamespace(name=template.name, config=template.config, expanded_from=None)
+
+        class Sender:
+            def backup_dataset(self, dsi, remote_cfg, should_stop=None):
+                worker._note(f"start:{dsi.name}")
+                deadline = time.monotonic() + 60
+                while not os.path.exists(worker.release_path) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                worker._note(f"done:{dsi.name}")
+                return True
+
+            def last_problem(self, dataset, destination):
+                return None
+
+            def last_retryable(self, dataset, destination):
+                return False
+
+        return SenderKit(manager, dsi, Sender)
 
 
 PROBES = {

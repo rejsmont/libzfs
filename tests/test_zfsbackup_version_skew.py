@@ -2592,7 +2592,7 @@ class TestExitReasonUpgrade:
         mocker.patch.object(w, "_hold_workers_lock")
         mocker.patch.object(w, "_open_status", return_value=None)
         before = mocker.patch.object(w, "_before_loop")
-        mocker.patch.object(w, "_get_datasets", side_effect=_Halt)      # never loop for ever
+        mocker.patch.object(w, "_run_loop", side_effect=_Halt)          # never loop for ever
         setup(w, epoch)
         try:
             w.run()
@@ -2609,7 +2609,7 @@ class TestExitReasonUpgrade:
         mocker.patch.object(w, "_hold_workers_lock")
         mocker.patch.object(w, "_open_status", return_value=None)
         before = mocker.patch.object(w, "_before_loop")
-        mocker.patch.object(w, "_get_datasets", side_effect=_Halt)
+        mocker.patch.object(w, "_run_loop", side_effect=_Halt)
         with pytest.raises(_Halt):
             w.run()
         before.assert_called_once()
@@ -2710,14 +2710,16 @@ class TestRealWorkerProcesses:
     def test_a_remote_worker_finishes_its_dataset_for_a_drain_and_exits_0_not_3(self, started, method):
         epoch = ReloadEpoch()
         worker, rec, _ = started(GatedRemoteWorker, method, None, epoch=epoch)
-        assert wait_until(lambda: "start:pool/a" in _events(rec), 60)
+        assert wait_until(lambda: {"start:pool/a", "start:pool/b"} <= set(_events(rec)), 60)
         epoch.set(EPOCH_UPGRADE_DRAIN)
         time.sleep(workers_module.STOP_POLL * 3)
-        assert worker.is_alive(), "a drain never interrupts the dataset in hand"
+        assert worker.is_alive(), "a drain never interrupts the sends in hand (it joins every sender)"
         (rec / "release").touch()
         worker.join(30)
         assert worker.exitcode == 0
-        assert _events(rec) == ["start:pool/a", "done:pool/a"], "no further dataset is started"
+        events = _events(rec)
+        assert sorted(events) == ["done:pool/a", "done:pool/b", "start:pool/a", "start:pool/b"], \
+            "both sends in hand finish; the third pair (held by the per-destination cap) is never started"
 
     def test_a_snapshot_worker_ignores_a_drain_and_keeps_working_until_stopped(self, started, method):
         epoch = ReloadEpoch()

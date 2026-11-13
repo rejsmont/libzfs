@@ -1721,6 +1721,40 @@ class TestMapperSaveConfig:
         loaded = load_config(session)
         assert loaded.destinations["offsite"] == ConfigDestination(url="https://offsite/pool")
 
+    @pytest.mark.parametrize("name", ["bad name", "a/b", "caf\u00e9", "", "x" * 233])
+    def test_a_destination_name_that_cannot_form_the_anchor_properties_is_refused(self, session, name):
+        config = self._two_dest_config()
+        save_config(session, config)
+        session.commit()
+        generation = session.query(GlobalSettings).one().generation
+        bad = self._two_dest_config()
+        bad.destinations = {name: ConfigDestination(url="https://offsite/pool")}
+        bad.datasets[0].remote = [RemoteDatasetConfig(destination=name)]
+        with pytest.raises(ValueError, match="the name cannot form the ZFS properties"):
+            save_config(session, bad)
+        session.rollback()
+        assert session.query(GlobalSettings).one().generation == generation
+        assert [d.name for d in session.query(Destination)] == ["offsite"]
+        assert load_config(session) == config
+
+    def test_the_longest_usable_destination_name_round_trips(self, session):
+        name = "d" * 232
+        config = self._two_dest_config()
+        config.destinations = {name: ConfigDestination(url="https://offsite/pool")}
+        config.datasets[0].remote = [RemoteDatasetConfig(destination=name)]
+        save_config(session, config)
+        session.commit()
+        assert load_config(session) == config
+
+    def test_an_already_stored_unusable_name_still_loads(self, session):
+        """Read paths never validate the name, so `export`, `list` and the rename that fixes it work."""
+        save_config(session, self._two_dest_config())
+        session.commit()
+        session.execute(text("INSERT INTO destinations (name, url) VALUES ('bad name', 'https://x/pool')"))
+        session.commit()
+        loaded = load_config(session)
+        assert sorted(loaded.destinations) == ["bad name", "offsite"]
+
     def test_exact_duplicate_retention_rules_are_deduped(self, session):
         config = _minimal_backup_config(
             retention_rules=[
@@ -5131,9 +5165,18 @@ class TestDbGenerationRace:
         a_has_read = threading.Event()
         b_has_read = threading.Event()
 
+        # Each writer keeps a strong reference to the row it read. The
+        # session's identity map is weak: without one, the object can be
+        # collected and `save_config`'s own `session.get` re-SELECTs -- and,
+        # with no transaction open yet, sees whatever was committed by then.
+        # If the other writer had already committed (a slow wake-up on a
+        # loaded CI runner), that read is fresh and both increments land, so
+        # the race this control reproduces never happened. Holding the row
+        # makes `save_config` use exactly the stale value asserted below.
         def writer_a():
             with session_scope(file_db_url) as s:
-                a_read_generation["value"] = s.get(GlobalSettings, 1).generation
+                row = s.get(GlobalSettings, 1)
+                a_read_generation["value"] = row.generation
                 a_has_read.set()
                 # Wait for B to also read before either of us writes --
                 # this is the race window `BEGIN IMMEDIATE` exists to
@@ -5141,13 +5184,16 @@ class TestDbGenerationRace:
                 # snapshot, so both threads can freely interleave here.
                 b_has_read.wait(timeout=5)
                 save_config(s, _minimal_backup_config(name="tank/a"))
+                del row
 
         def writer_b():
             a_has_read.wait(timeout=5)
             with session_scope(file_db_url) as s:
-                b_read_generation["value"] = s.get(GlobalSettings, 1).generation
+                row = s.get(GlobalSettings, 1)
+                b_read_generation["value"] = row.generation
                 b_has_read.set()
                 save_config(s, _minimal_backup_config(name="tank/b"))
+                del row
 
         thread_a = _run_and_capture(writer_a)
         thread_b = _run_and_capture(writer_b)

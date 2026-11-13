@@ -64,14 +64,36 @@ def list_lines(names: Iterable[str], ptype: str = 'filesystem') -> List[str]:
 OWN_SOURCES = ('local', 'received')
 
 
+def _source_wanted(source: str, wanted: Sequence[str]) -> bool:
+    """`-s inherited` matches every `inherited from <dataset>` source, the way zfs filters."""
+    return source in wanted or (source.startswith('inherited from ') and 'inherited' in wanted)
+
+
 def source_lines(name: str, props: Iterable[Prop], sources: Optional[str] = 'local,received',
-                 ptype: str = 'filesystem') -> List[str]:
+                 ptype: str = 'filesystem', requested: Optional[Sequence[str]] = None,
+                 unset_rows: bool = False) -> List[str]:
     """`zfs get -H -o name,property,source [-s sources] -t T all <name>` for one object: `name<TAB>property<TAB>
     source`. With `-s` zfs prints only the properties from those sources and NO `type` row; without it, the
-    `type` row first."""
+    `type` row first.
+
+    `requested` is the explicit property list of `property_sources(properties=[...])` (the argv carries the
+    comma-joined names where `all` would be): zfs then prints exactly the requested properties, in that order and
+    with no `type` row, and an unset one as a source `-` row (`name<TAB>prop<TAB>-`). Real zfs prints that `-`
+    row only without `-s`; `unset_rows=True` prints it with `-s` too, to prove the reader ignores it."""
     wanted = sources.split(',') if sources else None
+    if requested is not None:
+        props = list(props)
+        out = []
+        for prop in requested:
+            hits = [(p, v, sr) for p, v, sr in props
+                    if p == prop and (wanted is None or _source_wanted(sr, wanted))]
+            if hits:
+                out += hits
+            elif wanted is None or unset_rows:
+                out.append((prop, '', '-'))
+        return physical(f'{name}\t{p}\t{sr}\n' for p, _, sr in out)
     rows = [] if wanted else [('type', '', '-')]   # (the value column does not exist in this output)
-    rows += [(p, v, s) for p, v, s in props if wanted is None or s in wanted]
+    rows += [(p, v, s) for p, v, s in props if wanted is None or _source_wanted(s, wanted)]
     return physical(f'{name}\t{p}\t{s}\n' for p, _, s in rows)
 
 
@@ -95,8 +117,27 @@ def reads(name: str, props: Iterable[Prop], ptype: str = 'filesystem', also: Seq
     )
 
 
+#: THE argv (after the binary) of the backup-copy read `DatasetManager._copy_roots` runs. Every test that asserts
+#: it goes through `copy_read_argv`, so a change of the read (e.g. the explicit property list instead of `all`) is
+#: one edit here.
+COPY_READ_PROPERTIES = 'org.zfsbackup:client_id,org.zfsbackup:source_dataset'
+
+
+def copy_read_argv(dataset: str) -> List[str]:
+    """The backup-copy read of `dataset`: value-free (`name,property,source`), every marker source, filesystems and
+    volumes, recursive."""
+    return ['get', '-H', '-o', 'name,property,source', '-s', 'local,received,inherited', '-r',
+            '-t', 'filesystem,volume', COPY_READ_PROPERTIES, dataset]
+
+
+def argv_depth(argv: List[str]) -> Optional[int]:
+    """The `-d N` of a get/list argv (`zfs list -d 1`: the roots and N levels below them), else None."""
+    return int(argv[argv.index('-d') + 1]) if '-d' in argv else None
+
+
 def parse_argv(argv: List[str]):
-    """`(columns, recursive, types, sources, positional)` of a get/list argv, flags in any order."""
+    """`(columns, recursive, types, sources, positional)` of a get/list argv, flags in any order. A `-d N` is
+    skipped (read it with `argv_depth`)."""
     columns, recursive, types, sources, rest = None, False, None, None, []
     i = 1
     while i < len(argv):
@@ -105,6 +146,8 @@ def parse_argv(argv: List[str]):
             pass
         elif arg == '-r':
             recursive = True
+        elif arg == '-d':
+            i += 1
         elif arg in ('-o', '-t', '-s'):
             i += 1
             if arg == '-o':
@@ -125,7 +168,8 @@ class ZfsWorld:
     """A `zfs` as the property readers see it, installed as `Popen`'s side effect: a world of datasets
     (`name -> (type, [(property, value, source), ...])`, in the order zfs would print them) answering, by argv,
 
-    * `get -H -o name,property,source [-s S] [-r] [-t T] all <ds>...` (phase 1: no value; `-s` drops the `type` row);
+    * `get -H -o name,property,source [-s S] [-r] [-t T] all <ds>...` (phase 1: no value; `-s` drops the `type` row;
+      `-s inherited` matches every `inherited from <dataset>`);
     * `get -H -o name,property,value,source[,received] [-r] [-t T] <props> <ds>...` (`all`, or an explicit list
       printed as `name`, `type`, then each requested property, unset ones as `-`);
     * `get -H -o value [-s SOURCE] <prop> <ds>` (what `zfs.get.value` runs: the value as printed, unset `-`);
@@ -145,6 +189,9 @@ class ZfsWorld:
         #: `fn(argv)` runs as every zfs call starts, before it is answered (inject a race between the two phases:
         #: change `self.datasets` when the argv is the second exec).
         self.on_exec: Optional[Callable[[List[str]], None]] = None
+        #: print a source `-` row for every unset property of an explicit-list discovery, even under `-s`
+        #: (real zfs does it only without `-s`): the reader must ignore them.
+        self.unset_rows = False
         mock_subprocess.side_effect = self._popen
 
     # -- building the world ------------------------------------------------------------------
@@ -198,14 +245,23 @@ class ZfsWorld:
         proc.returncode = rc
         return proc
 
-    def _scope(self, targets: List[str], recursive: bool, types: Optional[str]):
+    def _scope(self, targets: List[str], recursive: bool, types: Optional[str], depth: Optional[int] = None):
+        """The names `zfs list|get` would print: each target and, `recursive` or within `depth` levels, what is
+        below it (`-d N` is the target plus N levels)."""
         wanted = None if types in (None, 'all') else set(types.split(','))
         names = []
         for target in targets:
             if target not in self.datasets:
                 return None, f"cannot open '{target}': dataset does not exist"
             for name, (ptype, _) in self.datasets.items():
-                if name == target or (recursive and name.startswith(target + '/')):
+                base = name.split('@')[0] if ptype == 'snapshot' else name      # a snapshot lives under its dataset
+                below = base.startswith(target + '/')
+                if depth is not None and below:
+                    below = base[len(target) + 1:].count('/') < depth
+                    include = below
+                else:
+                    include = recursive and below
+                if base == target or include:
                     if (wanted is None or ptype in wanted) and name not in names:
                         names.append(name)
         return names, ''
@@ -222,16 +278,17 @@ class ZfsWorld:
         if verb in ('get', 'list') and '-o' in argv:
             columns, recursive, types, sources, rest = parse_argv(argv)
             if verb == 'get' and columns == 'name,property,source':          # property_sources (phase 1)
-                assert rest[0] == 'all', argv
+                requested = None if rest[0] == 'all' else rest[0].split(',')
                 names, error = self._scope(rest[1:], recursive, types)
                 if names is None:
                     return self._proc([], rc=1, stderr=error)
                 return self._proc(physical(
                     line for n in names
-                    for line in source_lines(n, self.datasets[n][1], sources, self.datasets[n][0])))
+                    for line in source_lines(n, self.datasets[n][1], sources, self.datasets[n][0],
+                                             requested=requested, unset_rows=self.unset_rows)))
             if verb == 'list':
                 assert columns == 'name,type', argv
-                names, error = self._scope(rest, recursive, types)
+                names, error = self._scope(rest, recursive, types, argv_depth(argv))
                 if names is None:
                     return self._proc([], rc=1, stderr=error)
                 return self._proc([f'{n}\t{self.datasets[n][0]}\n' for n in names])
@@ -289,6 +346,8 @@ class GetReader:
         self.source_calls: List[List[str]] = []     # the argv of every phase-1 discovery (`-o name,property,source`)
         self.verify_calls: List[List[str]] = []     # the argv of every name-only cross-check `zfs list`
         self.datasets = set()
+        #: see `ZfsWorld.unset_rows`
+        self.unset_rows = False
 
     def _props_of(self, name: str):
         return self.props.get(name, [])
@@ -324,12 +383,13 @@ class GetReader:
     def _sources(self, cmd):
         """Phase 1: `zfs get -H -o name,property,source [-s S] [-r] -t T all <ds>`."""
         columns, recursive, types, sources, (properties, root) = parse_argv(cmd[1:])
-        assert properties == 'all', cmd
+        requested = None if properties == 'all' else properties.split(',')
         self.source_calls.append(list(cmd))
         self._note_discover(root, recursive, cmd)
         lines = []
         for name in self._scope(root, recursive):
-            lines += source_lines(name, self._props_of(name), sources)
+            lines += source_lines(name, self._props_of(name), sources, requested=requested,
+                                  unset_rows=self.unset_rows)
         return lines
 
     def _get(self, cmd):

@@ -213,17 +213,48 @@ def host_client_id(database: Path):
         dispose_all()
 
 
+def plant_destination_name(database: Path, old: str, new: str) -> None:
+    """Rename the destination `old` to `new` with direct SQL, bypassing `validate_config`
+    (which now refuses a name that cannot form the ZFS anchor and pin properties), so a test can
+    exercise what the CLI and the daemon do with a bad name already STORED (an older release, a
+    hand-edited database). Through the store's own engine, so foreign keys are the real ones: the
+    new destination row is inserted, the dataset remotes repointed, the old row deleted. Does not
+    bump the generation."""
+    from sqlalchemy import text
+
+    from zfsbackup.config.store import db as store_db
+
+    url = store_db.url_for_path(database)
+    try:
+        with store_db.session_scope(url) as session:
+            session.execute(
+                text("INSERT INTO destinations (name, url, server_fingerprint) "
+                     "SELECT :new, url, server_fingerprint FROM destinations WHERE name = :old"),
+                {"new": new, "old": old},
+            )
+            session.execute(
+                text("UPDATE dataset_remotes SET destination_name = :new WHERE destination_name = :old"),
+                {"new": new, "old": old},
+            )
+            session.execute(text("DELETE FROM destinations WHERE name = :old"), {"old": old})
+    finally:
+        dispose_all()
+
+
 def write_yaml(directory: Path, text: str, name: str = "in.yaml") -> Path:
     path = directory / name
     path.write_text(text)
     return path
 
 
-def make_db(run: Cli, database: Path, text: str = RICH_YAML, *, name: str = "in.yaml") -> Path:
-    """Import `text` into a new database at `database`."""
+def make_db(
+    run: Cli, database: Path, text: str = RICH_YAML, *, name: str = "in.yaml", force: bool = False
+) -> Path:
+    """Import `text` into a new database at `database` (`force`: `import --force`, for a fixture that
+    plants backup copies below a recursive dataset BEFORE the import, which the import refuses)."""
     # `db` lives in tmp_path/cfg/, which the import creates: write the source beside it.
     source = write_yaml(database.parent.parent, text, name)
-    result = run("import", source, "-c", database)
+    result = run("import", source, "-c", database, *(["--force"] if force else []))
     assert result.exit_code == 0, result.stderr
     return database
 
@@ -333,6 +364,7 @@ class FakeZfs:
         )
         self.wrapper.chmod(0o755)
         self._fail: list = []
+        self._slow: dict = {}
 
     def env(self) -> dict:
         return {
@@ -341,11 +373,28 @@ class FakeZfs:
             "FAKEZFS_STATE": str(self.state_path),
             "FAKEZFS_LOG": str(self.log_path),
             "FAKEZFS_FAIL": json.dumps(self._fail),
+            "FAKEZFS_SLOW_READ": json.dumps(self._slow),
         }
 
     def add(self, name: str, props: dict = None) -> "FakeZfs":
         state = self.state
         state[name] = dict(props or {})
+        self._save(state)
+        return self
+
+    def set_prop(
+        self, name: str, prop: str, value: str, source: str = "local", *, received: str = None
+    ) -> "FakeZfs":
+        """One property with a chosen source (`local`, `received` or `inherited from X`);
+        the dataset is created when it is not there yet. `received=R` on a LOCAL value gives
+        a property that also has a received value R underneath (what `inherit -S` reverts to)."""
+        state = self.state
+        if received is not None:
+            assert source == "local"
+            entry = {"value": value, "source": "local", "received": received}
+        else:
+            entry = value if source == "local" else {"value": value, "source": source}
+        state.setdefault(name, {})[prop] = entry
         self._save(state)
         return self
 
@@ -364,9 +413,33 @@ class FakeZfs:
     def props(self, name: str):
         return self.state.get(name)
 
+    def value(self, name: str, prop: str):
+        """The effective value of one property (what `zfs get -o value` prints) or None."""
+        raw = (self.state.get(name) or {}).get(prop)
+        return raw["value"] if isinstance(raw, dict) else raw
+
+    def source(self, name: str, prop: str):
+        """`local`, `received`, `inherited from X`, or None when unset."""
+        raw = (self.state.get(name) or {}).get(prop)
+        if raw is None:
+            return None
+        return raw.get("source", "local") if isinstance(raw, dict) else "local"
+
     @property
     def calls(self) -> list:
         return [json.loads(line) for line in self.log_path.read_text().splitlines()]
+
+    def clear_calls(self) -> "FakeZfs":
+        """Forget the calls so far (a fixture's `import` of a recursive dataset now looks at ZFS)."""
+        self.log_path.write_text("")
+        return self
+
+    def slow_read(self, seconds: float, dataset: str = "*") -> "FakeZfs":
+        """Every `list`/`get` of `dataset` (`*`: any) sleeps `seconds` after it is logged (a hung
+        pool, for the timeouts of the backup-copy check)."""
+        self._slow[dataset] = seconds
+        self._monkeypatch.setenv("FAKEZFS_SLOW_READ", json.dumps(self._slow))
+        return self
 
     def calls_of(self, *commands: str) -> list:
         return [c for c in self.calls if c and c[0] in commands]
@@ -386,7 +459,22 @@ def fake_zfs(tmp_path, monkeypatch) -> FakeZfs:
 
 
 ANCHOR = "org.zfsbackup:anchor."
+INFLIGHT = "org.zfsbackup:inflight."
 CONFIG_PROP = "org.zfsbackup:config"
+
+
+def inherit_command(prop: str, dataset: str, *, recursive: bool = False) -> str:
+    """The `zfs inherit` line the CLI prints for `prop` on `dataset`: `-S` for an
+    anchor or a pin (it clears only the LOCAL value and leaves a received one
+    alone), plain for `org.zfsbackup:config`; `-r` goes first."""
+    flag = "-S " if prop.startswith((ANCHOR, INFLIGHT)) else ""
+    return f"zfs inherit {'-r ' if recursive else ''}{flag}{prop} {dataset}"
+
+
+def inherit_property(call: list) -> str:
+    """The property of one logged `zfs inherit` call (`["inherit", "-r", "-S", PROP, DS]`): libzfseasy
+    writes the options BEFORE the property, so it is the first word after `inherit` that is no option."""
+    return next(word for word in call[1:-1] if not word.startswith("-"))
 
 
 # --------------------------------------------------------------------------

@@ -840,6 +840,48 @@ class TestReaderRecords:
         (rec,) = self.records(sdir, {'kind': 'snapshot', 'dataset': 'a', 'last_error': text, 'detail': text})
         assert rec.last_error is None and rec.detail is None
 
+    def test_a_warning_is_read_like_the_detail(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'snapshot', 'dataset': 'a', 'result': 'ok', 'detail': 'autosnap_1',
+                                     'warning': '1 backup copy below was not snapshotted: a/bk'})
+        assert rec.warning == '1 backup copy below was not snapshotted: a/bk' and rec.detail == 'autosnap_1'
+
+    def test_an_old_file_without_a_warning_reads_as_none(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'snapshot', 'dataset': 'a', 'result': 'ok', 'detail': 'autosnap_1'})
+        assert rec.warning is None
+
+    def test_a_warning_is_clipped_and_flattened_on_read(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'snapshot', 'dataset': 'a', 'warning': 'x\ny\t' * 500})
+        assert len(rec.warning) <= STATUS_TEXT_LIMIT and '\n' not in rec.warning and '\t' not in rec.warning
+        (rec,) = self.records(sdir, {'kind': 'snapshot', 'dataset': 'a', 'warning': 'w' * 1000})
+        assert len(rec.warning) == STATUS_TEXT_LIMIT and rec.warning.endswith('...')
+
+    @pytest.mark.parametrize('odd', ['', None, 5, 1.5, True, [], {}, ['text']])
+    def test_an_empty_or_non_text_warning_is_none_and_the_record_survives(self, sdir, odd):
+        (rec,) = self.records(sdir, {'kind': 'snapshot', 'dataset': 'a', 'result': 'ok', 'warning': odd})
+        assert rec.warning is None and rec.result == RESULT_OK
+
+    def test_a_warning_does_not_touch_the_grade_inputs(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'snapshot', 'dataset': 'a', 'result': 'ok', 'warning': 'careful',
+                                     'consecutive_failures': 0})
+        assert (rec.result, rec.consecutive_failures, rec.last_error) == (RESULT_OK, 0, None)
+
+    def test_an_incomplete_success_is_read_as_incomplete(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'send', 'dataset': 'a', 'destination': 'd', 'result': 'ok',
+                                     'incomplete': True})
+        assert rec.incomplete is True and rec.result == RESULT_OK
+
+    def test_an_old_file_without_the_key_reads_as_complete(self, sdir):
+        (rec,) = self.records(sdir, {'kind': 'send', 'dataset': 'a', 'destination': 'd', 'result': 'ok'})
+        assert rec.incomplete is False
+
+    @pytest.mark.parametrize('odd', [False, None, 'true', 'yes', 1, 1.0, 0, '', [], [True], {}, {'a': True}])
+    def test_a_malformed_incomplete_is_complete_and_the_record_survives(self, sdir, odd):
+        """Only the JSON `true` counts: a value another writer might mean differently never makes a record
+        look unfinished (which would make a successor re-send the pair), and never costs the record."""
+        (rec,) = self.records(sdir, {'kind': 'send', 'dataset': 'a', 'destination': 'd', 'result': 'ok',
+                                     'incomplete': odd, 'consecutive_failures': 0})
+        assert rec.incomplete is False and rec.result == RESULT_OK and rec.consecutive_failures == 0
+
     def test_only_the_first_2048_records_are_read(self, sdir):
         raw = [{'kind': 'snapshot', 'dataset': f'pool/{i}'} for i in range(STATUS_MAX_RECORDS + 50)]
         recs = self.records(sdir, *raw)
@@ -923,6 +965,17 @@ class TestWriterDocument:
         (rec,) = written(sdir)['records']
         assert set(rec) == {'kind', 'dataset', 'result', 'last_attempt', 'last_success', 'consecutive_failures'}
 
+    def test_blank_text_after_clipping_is_none_and_a_blank_error_gets_the_fallback(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=False, error='  ', detail='\n', warning='  ')
+        (rec,) = w.records
+        assert rec.warning is None and rec.detail is None
+        assert rec.last_error == 'failed (see the journal)'
+        w.flush(force=True)
+        (doc,) = written(sdir)['records']
+        assert 'warning' not in doc and 'detail' not in doc
+        assert doc['last_error'] == 'failed (see the journal)'
+
     def test_failures_count_up_and_a_success_resets_them_but_keeps_the_last_error(self, make_writer, clocks):
         w = make_writer()
         for i in range(3):
@@ -944,6 +997,122 @@ class TestWriterDocument:
         assert w.records[0].detail == 'pruned 3'
         w.record(KIND_PRUNE, 'pool/a', ok=True)
         assert w.records[0].detail is None
+
+    def test_a_warning_is_in_the_file_only_when_set(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, detail='autosnap_1')
+        w.record(KIND_SNAPSHOT, 'pool/b', ok=True, detail='autosnap_1', warning='1 copy was left out')
+        w.flush(force=True)
+        a, b = written(sdir)['records']
+        assert 'warning' not in a
+        assert b['warning'] == '1 copy was left out' and b['detail'] == 'autosnap_1'
+
+    def test_the_warning_field_defaults_to_none(self):
+        from zfsbackup.health import OutcomeRecord
+        rec = OutcomeRecord(kind='snapshot', dataset='pool/a')
+        assert rec.warning is None
+
+    def test_a_warning_is_replaced_by_each_attempt(self, make_writer):
+        w = make_writer()
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, detail='s1', warning='first')
+        assert w.records[0].warning == 'first'
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, detail='s2', warning='second')
+        assert w.records[0].warning == 'second'
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, detail='s3')
+        assert w.records[0].warning is None and w.records[0].detail == 's3'
+
+    def test_a_failure_clears_the_warning_and_a_warning_is_no_failure(self, make_writer, clocks):
+        w = make_writer()
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, warning='careful')
+        (rec,) = w.records
+        assert (rec.result, rec.consecutive_failures, rec.last_error) == (RESULT_OK, 0, None)
+        clocks.advance(10)
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=False, error='boom')
+        (rec,) = w.records
+        assert rec.warning is None and rec.last_error == 'boom' and rec.consecutive_failures == 1
+
+    def test_a_warning_is_clipped_to_300_and_flattened_before_it_is_stored(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, warning='careful\n\t' + 'x' * 1000)
+        rec = w.records[0]
+        assert len(rec.warning) == 300 and '\n' not in rec.warning and '\t' not in rec.warning
+        assert rec.warning.endswith('...')
+        w.flush(force=True)
+        assert written(sdir)['records'][0]['warning'] == rec.warning
+
+    @pytest.mark.parametrize('empty', [None, ''])
+    def test_an_empty_warning_is_no_warning(self, make_writer, sdir, empty):
+        w = make_writer()
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, warning=empty)
+        w.flush(force=True)
+        assert w.records[0].warning is None and 'warning' not in written(sdir)['records'][0]
+
+    def test_the_incomplete_field_defaults_to_false(self):
+        from zfsbackup.health import OutcomeRecord
+        assert OutcomeRecord(kind='send', dataset='pool/a').incomplete is False
+
+    def test_an_incomplete_success_is_in_the_file_only_when_set(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True)
+        w.record(KIND_SEND, 'pool/b', 'off', ok=True, incomplete=True)
+        w.flush(force=True)
+        a, b = written(sdir)['records']
+        assert 'incomplete' not in a
+        assert b['incomplete'] is True and b['result'] == 'ok'
+
+    def test_incomplete_is_replaced_by_each_attempt(self, make_writer):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        assert w.records[0].incomplete is True
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True)
+        assert w.records[0].incomplete is False
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        assert w.records[0].incomplete is True
+
+    def test_a_failure_is_never_incomplete(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        w.record(KIND_SEND, 'pool/a', 'off', ok=False, error='boom')
+        (rec,) = w.records
+        assert rec.incomplete is False and rec.result == 'error' and rec.consecutive_failures == 1
+        w.record(KIND_SEND, 'pool/b', 'off', ok=False, error='boom', incomplete=True)
+        assert [r.incomplete for r in w.records] == [False, False]
+        w.flush(force=True)
+        assert all('incomplete' not in r for r in written(sdir)['records'])
+
+    def test_incomplete_does_not_touch_the_grade_inputs(self, make_writer):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=False, error='boom')
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        (rec,) = w.records
+        assert (rec.result, rec.consecutive_failures, rec.last_success is not None) == ('ok', 0, True)
+
+    def test_incomplete_round_trips_through_the_reader(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SEND, 'pool/a', 'off', ok=True, incomplete=True)
+        w.record(KIND_SEND, 'pool/b', 'off', ok=True)
+        w.flush(force=True)
+        res = read_status_dir(sdir)
+        assert res.problems == ()
+        a, b = res.statuses[0].records
+        assert (a.incomplete, b.incomplete) == (True, False)
+
+    def test_a_warning_round_trips_through_the_reader(self, make_writer, sdir):
+        w = make_writer()
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, detail='autosnap_1', warning='1 backup copy below was left out')
+        w.flush(force=True)
+        res = read_status_dir(sdir)
+        assert res.problems == ()
+        (rec,) = res.statuses[0].records
+        assert (rec.detail, rec.warning) == ('autosnap_1', '1 backup copy below was left out')
+
+    def test_the_schema_is_unchanged_by_the_warning(self, make_writer, sdir):
+        """Additive: the reader of an older release ignores an unknown key, so the schema stays 1."""
+        w = make_writer()
+        w.record(KIND_SNAPSHOT, 'pool/a', ok=True, warning='careful')
+        w.flush(force=True)
+        assert written(sdir)['schema'] == STATUS_SCHEMA == 1
 
     def test_a_failure_without_text_still_says_something(self, make_writer):
         w = make_writer()
@@ -1244,6 +1413,28 @@ class TestWriterLoad:
         assert data['pid'] == 2                                  # the new incarnation
         (a,) = [r for r in data['records'] if r['dataset'] == 'pool/a']
         assert a['consecutive_failures'] == 3
+
+    def test_load_keeps_the_warning_and_the_next_record_replaces_it(self, make_writer, clocks, sdir):
+        first = make_writer(pid=1)
+        first.record(KIND_SNAPSHOT, 'pool/a', ok=True, detail='autosnap_1', warning='1 copy was left out')
+        first.record(KIND_SNAPSHOT, 'pool/b', ok=True, detail='autosnap_1')
+        first.flush(force=True)
+
+        second = make_writer(pid=2)
+        second.load()
+        by_dataset = {r.dataset: r for r in second.records}
+        assert by_dataset['pool/a'].warning == '1 copy was left out' and by_dataset['pool/b'].warning is None
+        # an untouched record keeps its warning through the restart's first flush
+        clocks.advance(10)
+        second.record(KIND_SNAPSHOT, 'pool/b', ok=True, detail='autosnap_2', warning='another')
+        second.flush(force=True)
+        data = {r['dataset']: r for r in written(sdir)['records']}
+        assert data['pool/a']['warning'] == '1 copy was left out'
+        assert data['pool/b']['warning'] == 'another'
+        # and the next attempt on pool/a without one clears it
+        clocks.advance(10)
+        second.record(KIND_SNAPSHOT, 'pool/a', ok=True, detail='autosnap_3')
+        assert second.records[0].warning is None
 
     def test_load_with_no_file_starts_empty_quietly(self, make_writer, caplog):
         w = make_writer()

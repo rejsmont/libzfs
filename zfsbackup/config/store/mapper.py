@@ -845,24 +845,39 @@ def _validate_rules(
 
 
 _PROPERTY_NAME_CHARS = re.compile(r"[A-Za-z0-9_.:-]+")
+# The two per-destination user properties the daemon writes
+# (`backup_manager.PROP_ANCHOR_PREFIX` / `PROP_INFLIGHT_PREFIX`; not imported,
+# because the store must load on a host without `zfs`). The pin is the longer
+# of the two, so the name is measured against IT: a name that fits only the
+# anchor gets a storable anchor but a pin libzfseasy refuses to write
+# (`Validate.attribute`), and `check` then reports a permanent CRIT for it.
 _ANCHOR_PROPERTY_PREFIX = "org.zfsbackup:anchor."
-_MAX_PROPERTY_NAME = 256  # ZAP_MAXNAMELEN
+_INFLIGHT_PROPERTY_PREFIX = "org.zfsbackup:inflight."
+_LONGEST_PROPERTY_PREFIX = max(
+    _ANCHOR_PROPERTY_PREFIX, _INFLIGHT_PROPERTY_PREFIX, key=len
+)
+# A property name is at most 255 characters: OpenZFS refuses a user-property
+# name of ZAP_MAXNAMELEN (256) or more, which counts the NUL, and libzfseasy's
+# `Validate.attribute` enforces `Validate.max_name_len` (255). The bound used
+# to be 256, which let one name length through that libzfseasy then raised on.
+_MAX_PROPERTY_NAME = 255
 
 
 def destination_name_problem(name: str) -> Optional[str]:
-    """Why `name` cannot hold a ZFS anchor, or None if it can. Pure.
+    """Why `name` cannot hold a ZFS anchor and in-flight pin, or None if it
+    can. Pure.
 
-    A destination's name is part of a ZFS user-property name,
-    `org.zfsbackup:anchor.<name>`. OpenZFS accepts ASCII letters, digits and
-    `-` `_` `.` `:` in user-property names (`zprop_valid_char`; the manual
-    recommends lowercase) and at most 256 characters in all. This is the
-    conservative form of that rule. A name outside it can never have an
-    anchor stored, so the incremental base of every transfer to that
-    destination is unprotected from pruning.
+    A destination's name is part of two ZFS user-property names,
+    `org.zfsbackup:anchor.<name>` and `org.zfsbackup:inflight.<name>`.
+    OpenZFS accepts ASCII letters, digits and `-` `_` `.` `:` in user-property
+    names (`zprop_valid_char`; the manual recommends lowercase) and at most
+    255 characters in all; the longer `inflight.` property is the one that
+    bounds the name. This is the conservative form of that rule. A name
+    outside it can never have an anchor and/or pin stored, so the incremental
+    base of every transfer to that destination is unprotected from pruning.
 
-    Public: `validate_config` reports it as a WARNING (existing configs may
-    legitimately contain such names), and `zfsbackup-config rename
-    destination` uses it as a hard refusal for the NEW name.
+    Public: `validate_config` and `zfsbackup-config rename destination` both
+    use it as a hard refusal.
     """
     if not name:
         return "it is empty"
@@ -870,13 +885,14 @@ def destination_name_problem(name: str) -> Optional[str]:
         bad = sorted({c for c in name if not _PROPERTY_NAME_CHARS.fullmatch(c)})
         return (
             f"it contains {' '.join(repr(c) for c in bad)}; the name becomes part of the ZFS "
-            f"property {_ANCHOR_PROPERTY_PREFIX}<name>, which allows only letters, digits "
-            "and - _ . :"
+            f"properties {_ANCHOR_PROPERTY_PREFIX}<name> and {_INFLIGHT_PROPERTY_PREFIX}<name>, "
+            "which allow only letters, digits and - _ . :"
         )
-    if len(_ANCHOR_PROPERTY_PREFIX) + len(name) > _MAX_PROPERTY_NAME:
+    if len(_LONGEST_PROPERTY_PREFIX) + len(name) > _MAX_PROPERTY_NAME:
         return (
-            f"it is too long: {_ANCHOR_PROPERTY_PREFIX}<name> may be at most "
-            f"{_MAX_PROPERTY_NAME} characters"
+            f"it is too long: {_INFLIGHT_PROPERTY_PREFIX}<name> may be at most "
+            f"{_MAX_PROPERTY_NAME} characters, so the name may be at most "
+            f"{_MAX_PROPERTY_NAME - len(_LONGEST_PROPERTY_PREFIX)}"
         )
     return None
 
@@ -976,22 +992,37 @@ def _require_outside_receive_targets(
     by this host's own workers inside received data (the next incremental
     receive then fails, and an aligned `{prefix}_{ts}` name makes the prune
     destroy received snapshots); a `recursive` ancestor reaches the same
-    datasets through `zfs snapshot -r` and `zfs destroy -r`. Enabled or not,
-    so enabling a dataset later cannot open the hole.
+    datasets through `zfs snapshot -r` and `zfs destroy -r` (and, with
+    recursive sends, would SEND other clients' backups to this host's own
+    destinations). Enabled or not, so enabling a dataset later cannot open
+    the hole.
 
     Compared by path COMPONENTS, never by string prefix: `tank/b` is not an
     ancestor of `tank/backup`, and `tank/backup` is not the target
     `tank/backups`. A non-recursive ancestor only touches its own snapshots,
-    so it stays allowed. The remote target counts only while remote_backup
-    is enabled (disabled or unset: nothing is received, so nothing can
-    overlap); every declared local target counts always (`_local_targets`).
+    so it stays allowed. The remote target counts whenever
+    `remote_backup.target_dataset` is set, ENABLED OR NOT: a former server
+    that disabled remote_backup still has other clients' received copies on
+    disk under the target, and a snapshot, prune or (recursive) send over
+    them is exactly the hazard above. Only an unset remote_backup imposes
+    nothing. Every declared local target counts always (`_local_targets`).
     """
     d = _dataset_components(ds.name) if isinstance(ds.name, str) else None
     if d is None:
         return
-    if remote_backup is not None and getattr(remote_backup, "enabled", False):
+    if remote_backup is not None:
         target = getattr(remote_backup, "target_dataset", None)
         if isinstance(target, str) and target:
+            # Counted although remote_backup may be disabled: say so, or an
+            # operator with `enabled: false` cannot see why it is refused.
+            note = (
+                ""
+                if getattr(remote_backup, "enabled", False)
+                else " remote_backup is disabled, but the target still counts: "
+                "a former server's received backups stay on disk under it. "
+                "Remove or move remote_backup.target_dataset, or change the "
+                "dataset."
+            )
             t = _dataset_components(target)
             if _is_prefix(t, d):
                 where = "is" if len(d) == len(t) else "is below"
@@ -1000,15 +1031,16 @@ def _require_outside_receive_targets(
                     f"{target!r}. The server treats everything under the target as "
                     "received backups, so snapshotting or pruning a dataset there "
                     "would act on received data. Move the target to a dedicated "
-                    "dataset that no configured dataset is at or below."
+                    "dataset that no configured dataset is at or below." + note
                 )
             if ds.recursive is True and len(d) < len(t) and _is_prefix(d, t):
                 raise ValueError(
                     f"{key}: the dataset is recursive and is an ancestor of "
                     f"remote_backup.target_dataset {target!r}. Its recursive "
-                    "snapshots (zfs snapshot -r) and prunes (zfs destroy -r) would "
-                    "reach the received datasets under the target. Make the dataset "
-                    "non-recursive, or move the target outside it."
+                    "snapshots (zfs snapshot -r), sends and prunes (zfs destroy "
+                    "-r) would reach the received datasets under the target. Make "
+                    "the dataset non-recursive, or move the target outside it."
+                    + note
                 )
     for dest_name, target in _local_targets(destinations):
         t = _dataset_components(target)
@@ -1170,9 +1202,10 @@ def validate_config(config: BackupConfig) -> List[str]:
       path or is set without the other (`client_tls_files_problem`);
     - any retention rule with a non-positive `age`/`keep_for`, and any
       `validate_retention_uniqueness` collision, per scope.
-    - with remote backup ENABLED: a configured dataset (enabled or not) at or
-      below `remote_backup.target_dataset`, or a `recursive` one that is a
-      strict ancestor of it; likewise for the target of EVERY declared
+    - with `remote_backup.target_dataset` set (enabled OR NOT: a former
+      server's received copies stay on disk): a configured dataset (enabled
+      or not) at or below it, or a `recursive` one that is a strict ancestor
+      of it; likewise for the target of EVERY declared
       `zfs:` (local) destination, used or not
       (`_require_outside_receive_targets`);
     - receive targets that overlap one another: two local targets, equal or
@@ -1182,7 +1215,12 @@ def validate_config(config: BackupConfig) -> List[str]:
       own client id, which the server reserves)
       (`_require_disjoint_receive_targets`);
     - a `zfs:` destination that carries a `server_fingerprint`
-      (`destination_problem`).
+      (`destination_problem`);
+    - a destination name that cannot be a ZFS user-property suffix
+      (`destination_name_problem`: empty, a character outside letters, digits
+      and `- _ . :`, or longer than 232 characters): its
+      `org.zfsbackup:anchor.<name>` anchor and `org.zfsbackup:inflight.<name>`
+      pin can never be stored.
 
     Warns (returned, not raised):
 
@@ -1196,9 +1234,6 @@ def validate_config(config: BackupConfig) -> List[str]:
       full;
     - `api_port` 0 (the API binds an ephemeral port that changes on every
       start);
-    - a destination name that cannot be a ZFS user-property suffix
-      (`destination_name_problem`): its `org.zfsbackup:anchor.<name>` anchor
-      can never be stored;
     - exact `(age, keep_for)` duplicates within a scope, naming both
       literals -- `save_config` drops the later one because the DB's
       unique indexes cannot hold them.
@@ -1309,17 +1344,20 @@ def validate_config(config: BackupConfig) -> List[str]:
                     f"{dest.server_fingerprint!r} is not canonical; "
                     f"expected {canonical!r} (64 lowercase hex digits)"
                 )
-        # WARNING, not an error: configs that predate this check may already
-        # carry such names, and refusing to load/import them would strand
-        # the operator. The cost of the name is real but silent -- no anchor
-        # can ever be written for it, so the snapshot an incremental send
-        # depends on is not protected from pruning.
+        # A REFUSAL (user decision 2026-11-11), not a warning. The name is part
+        # of the ZFS properties `org.zfsbackup:anchor.<name>` and
+        # `org.zfsbackup:inflight.<name>`; a name that cannot form them can
+        # never have an anchor or a send pin stored, so the snapshot an
+        # incremental send depends on is not protected from pruning (and
+        # `check` reports a permanent CRIT for the pin). Raising here covers
+        # every path that validates: import, set/edit, a daemon (re)load.
         problem = destination_name_problem(name)
         if problem is not None:
-            warnings.append(
-                f"destinations[{name}]: the name cannot hold a ZFS anchor "
-                f"({problem}); anchors can never be stored for it, so the "
-                "incremental base for this destination is not protected "
+            raise ValueError(
+                f"destinations[{name}]: the name cannot form the ZFS properties "
+                f"{_ANCHOR_PROPERTY_PREFIX}<name> and {_INFLIGHT_PROPERTY_PREFIX}<name> "
+                f"({problem}); anchors and send pins can never be stored for it, so "
+                "the incremental base for this destination would not be protected "
                 "from pruning"
             )
 

@@ -127,7 +127,7 @@ class TestResumeTokenZfsTimeout:
         (warning,) = timeout_warnings(caplog)
         assert warning.levelname == 'WARNING'
         text = warning.getMessage()
-        assert DS in text and 'its zfs did not answer' in text and 'skipping this cycle' in text
+        assert DS in text and 'its zfs did not answer' in text and 'skipping this attempt' in text
         assert rig.skips() == 1
 
     def test_the_warning_is_not_the_reloading_info(self, rig, caplog):
@@ -304,7 +304,7 @@ class TestNegotiateZfsTimeout:
             h.rbm.backup_dataset(h.dsi, h.dsi.config.remote[0])
         (warning,) = negotiate_warnings(caplog)
         assert warning.levelname == 'WARNING' and 'pool/data' in warning.getMessage()
-        assert 'its zfs did not answer' in warning.getMessage() and 'skipping this cycle' in warning.getMessage()
+        assert 'its zfs did not answer' in warning.getMessage() and 'skipping this attempt' in warning.getMessage()
         assert not [r for r in caplog.records if 'is busy' in r.getMessage() or 'is reloading' in r.getMessage()]
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
@@ -364,7 +364,7 @@ class TestNegotiateZfsTimeout:
                     self.negotiate(h)
         assert negotiate_errors(caplog) == [error]
         assert 'pool/data -> offsite' in error.getMessage() and 'falling behind' in error.getMessage()
-        assert f'last {RESUME_TOKEN_SKIP_ERROR_AFTER} cycles' in error.getMessage()
+        assert f'last {RESUME_TOKEN_SKIP_ERROR_AFTER} attempts' in error.getMessage()
 
     def test_a_good_negotiate_re_arms_the_warning_and_the_error(self, h, caplog):
         from zfsbackup.remote import NegotiationFailed
@@ -448,7 +448,7 @@ class TestStreamZfsTimeout:
         assert not at_least_warning(caplog)
         infos = [r for r in caplog.records if r.levelname == 'INFO' and 'asks to retry' in r.getMessage()]
         assert len(infos) == 1
-        assert 'zfs timed out; retry later' in infos[0].getMessage() and 'skipping this cycle' in infos[0].getMessage()
+        assert 'zfs timed out; retry later' in infos[0].getMessage() and 'skipping this attempt' in infos[0].getMessage()
 
     def test_no_further_step_and_no_fresh_send(self, h5, refused):
         refused.run(common=S1)

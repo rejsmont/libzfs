@@ -500,6 +500,10 @@ def _restore_signal_handlers():
     future test that touches signal dispositions the same way, not only
     the ones that exist today.
     """
+    yield from _signal_dispositions_kept()
+
+
+def _signal_dispositions_kept():
     import signal
 
     # SIGHUP too (A-6.2): `BackupDaemon.__init__` installs the supervisor's
@@ -528,6 +532,10 @@ def _restore_logsetup_state():
     level, and pins the `werkzeug` logger. After every test: remove the
     handler `configure` installed (only that one: pytest's own capture handlers
     and any other test's are untouched) and put both levels back."""
+    yield from _logsetup_state_kept()
+
+
+def _logsetup_state_kept():
     import logging
 
     root = logging.getLogger()
@@ -537,6 +545,28 @@ def _restore_logsetup_state():
         root.removeHandler(handler)
     root.setLevel(levels[0])
     logging.getLogger("werkzeug").setLevel(levels[1])
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_process_state_per_module():
+    """The two fixtures above, around every test MODULE.
+
+    A function-scoped fixture cannot see what a module- or class-scoped fixture
+    does: pytest sets those up before it, so their changes are already in the
+    "saved" state. `tests/test_zfsbackup_check_many_pairs.py` builds its inputs
+    in module fixtures that run the real `RemoteBackupWorker.run()` in the pytest
+    process, whose `_init_child_process` sets SIGHUP to SIG_IGN; that leaked into
+    every later test of the xdist worker, and SIG_IGN survives exec, so
+    `test_zfsbackup_daemon_entry.py`'s subprocesses started with SIGHUP ignored.
+    Autouse fixtures are set up before the other fixtures of their scope, so this
+    one saves before and restores after any module fixture of the module."""
+    signals = _signal_dispositions_kept()
+    logs = _logsetup_state_kept()
+    next(signals)
+    next(logs)
+    yield
+    for gen in (logs, signals):
+        next(gen, None)
 
 
 @pytest.fixture

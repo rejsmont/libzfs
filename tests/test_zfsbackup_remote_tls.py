@@ -63,6 +63,7 @@ from zfsbackup.config import (
 )
 from zfsbackup.identity import PinMismatch
 from zfsbackup.protocol import protocol_headers
+from zfsbackup.sendmemory import IDENTITY_LOADED
 from zfsbackup.remote import (
     HTTP_TIMEOUT, NO_CLIENT_ID_MESSAGE, RemoteBackupManager, _alert_reason,
     _endpoint, _exc_chain, _is_reset, _json_body, _presented_fingerprint,
@@ -100,8 +101,9 @@ def _no_local_zfs_property_writes(mocker):
     harmless defaults, so no test here reaches even the stub `zfs`. Tests that assert on them patch
     the instance (which wins over these class patches)."""
     mocker.patch.object(DatasetManager, "get_anchor", return_value=None)
+    mocker.patch.object(DatasetManager, "get_own_anchor", return_value=None)
     mocker.patch.object(DatasetManager, "set_anchor", return_value=True)
-    mocker.patch.object(DatasetManager, "get_inflight", return_value=None)
+    mocker.patch.object(DatasetManager, "get_own_inflight", return_value=None)
     mocker.patch.object(DatasetManager, "set_inflight", return_value=True)
     mocker.patch.object(DatasetManager, "clear_inflight", return_value=True)
 
@@ -544,29 +546,48 @@ class TestContract:
         assert ".replace('http'" not in text and '.replace("http"' not in text
         assert "requests.post(" not in text and "requests.get(" not in text    # only the pinned sessions
 
-    def test_the_worker_starts_each_cycle_with_begin_cycle(self, mocker):
-        """`RemoteBackupWorker._get_datasets` is called once at the top of every cycle."""
+    def test_the_worker_never_calls_begin_cycle_the_scheduler_claims_the_certificate_reminder(self, monkeypatch):
+        """The serial worker called `begin_cycle` at the top of every cycle. The scheduler does not: it
+        claims the daily certificate reminder in the shared memory (once per incarnation and day) and has
+        a throwaway manager report it; the manager's own `begin_cycle` (kept for its direct callers) makes
+        the same claim, so exactly one of them reminds."""
+        from _sendloop_support import LoopRig
+
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="pool/a", remote=[RemoteDatasetConfig(destination="off")])],
+            destinations={"off": Destination(url="https://backup.example.com")},
+        )
+        rig = LoopRig(config, monkeypatch).run()
+        rig.remote.begin_cycle.assert_not_called()
+        rig.remote.report_client_cert_expiry.assert_called_once_with()
+        rig.run()                                  # the same worker again (a loop restart in one incarnation)
+        assert rig.remote.report_client_cert_expiry.call_count == 1, "claimed once per day in the memory"
+
+    def test_a_local_only_configuration_has_no_certificate_reminder(self, monkeypatch):
+        from _sendloop_support import LoopRig
+
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="pool/a", remote=[RemoteDatasetConfig(destination="usb")])],
+            destinations={"usb": Destination(url="zfs:bk")},
+        )
+        rig = LoopRig(config, monkeypatch).run()
+        rig.remote.report_client_cert_expiry.assert_not_called()
+
+    def test_the_worker_builds_a_sender_with_the_handed_over_id_tls_dir_and_memory(self, mocker, tmp_path):
         from zfsbackup.stopflag import StopFlag
         from zfsbackup.workers import RemoteBackupWorker
 
-        worker = RemoteBackupWorker(BackupConfig(datasets=[], destinations={}), StopFlag(), client_id="c")
-        worker._remote_manager = MagicMock()
-        manager = MagicMock(datasets=[types.SimpleNamespace(name="pool/a"), types.SimpleNamespace(name="pool/b")])
-        assert [d.name for d in worker._get_datasets(manager)] == ["pool/a", "pool/b"]
-        worker._remote_manager.begin_cycle.assert_called_once_with()
-        worker._get_datasets(manager)
-        assert worker._remote_manager.begin_cycle.call_count == 2
-
-    def test_the_worker_builds_the_manager_with_the_handed_over_id_and_tls_dir(self, mocker, tmp_path):
-        from zfsbackup.stopflag import StopFlag
-        from zfsbackup.workers import RemoteBackupWorker
-
-        config = BackupConfig(datasets=[], destinations={})
+        config = BackupConfig(
+            datasets=[DatasetConfig(name="pool/a", remote=[RemoteDatasetConfig(destination="off")])],
+            destinations={"off": Destination(url="https://backup.example.com")},
+        )
         worker = RemoteBackupWorker(config, StopFlag(), client_id="host-1", tls_dir=tmp_path)
         cls = mocker.patch("zfsbackup.remote.RemoteBackupManager")
-        manager = MagicMock()
+        cls.return_value._memory = worker._mem()
+        manager = DatasetManager(config, memory=worker._mem())
         worker._before_loop(config, manager)
-        cls.assert_called_once_with(config, manager, client_id="host-1", tls_dir=tmp_path)
+        worker._new_sender(manager, "off")
+        cls.assert_called_once_with(config, manager, client_id="host-1", tls_dir=tmp_path, memory=worker._mem())
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +627,39 @@ class TestHealthyPath:
         rig.cycle()
         loaded = [m for lv, m in own(caplog) if "client TLS identity" in m]
         assert len(loaded) == 1 and rig.client_fp in loaded[0]
+        assert levels(caplog, "client TLS identity") == ["INFO"]
+
+    def fresh_manager(self, rig):
+        """A manager built for another send: the worker's one memory, its own identity state."""
+        return RemoteBackupManager(
+            rig.config, rig.manager, client_id="client1", tls_dir=rig.tls_dir, memory=rig.mgr._memory,
+        )
+
+    def test_the_identity_is_announced_once_per_fingerprint_not_once_per_manager(self, rig, caplog):
+        """B3: a manager is built per send and loads its own identity every time; the INFO is latched in the
+        shared memory by fingerprint (`IDENTITY_LOADED`)."""
+        rig.cycle()
+        for _ in range(3):
+            other = self.fresh_manager(rig)
+            assert other._client_identity() is not None
+        assert levels(caplog, "client TLS identity") == ["INFO"]
+
+    def test_a_failed_load_makes_the_next_good_load_news_again(self, rig, caplog, mocker):
+        from zfsbackup.identity import IdentityError
+        rig.cycle()
+        broken = self.fresh_manager(rig)
+        patched = mocker.patch("zfsbackup.remote.load_identity", side_effect=IdentityError("unreadable"))
+        assert broken._client_identity() is None
+        mocker.stop(patched)
+        assert self.fresh_manager(rig)._client_identity() is not None
+        assert levels(caplog, "client TLS identity") == ["INFO", "ERROR", "INFO"], \
+            "loaded, failed, loaded again (the same fingerprint)"
+
+    def test_a_different_fingerprint_is_announced(self, rig, caplog, tmp_path):
+        rig.cycle()
+        rig.mgr._memory.note_value(IDENTITY_LOADED, "remote", "another-fingerprint")
+        del caplog.records[:]
+        self.fresh_manager(rig)._client_identity()
         assert levels(caplog, "client TLS identity") == ["INFO"]
 
     def test_a_dry_run_still_checks_the_destination_but_sends_nothing(self, make_rig):
@@ -1453,14 +1507,22 @@ class TestWhoamiAnswers:
         assert rig.cycle(0) is False
         (message,) = errors(caplog)
         assert message.startswith("unexpected /whoami answer from https://backup.example.com (destination offsite): HTTP")
-        assert message.endswith("; skipping it this cycle")
+        assert message.endswith("; not sending to it for now")
         count = rig.http_count
         assert rig.run(1) is False and rig.http_count == count          # skipped for the cycle
         assert rig.sends == [] and rig.requests("/negotiate") == []
 
-    def test_an_unusable_answer_is_not_deduplicated(self, rig, caplog):
+    def test_an_unusable_answer_is_an_error_once_per_episode(self, rig, caplog):
+        """B3: latched in the shared memory (`WHOAMI_UNEXPECTED`): ERROR once, DEBUG while it lasts, INFO when a
+        well-formed answer ends it, ERROR again for the next episode."""
         rig.route_whoami(status_code=500)
         rig.cycle()
+        rig.cycle()
+        assert len(errors(caplog)) == 1
+        rig.heal()
+        rig.cycle()
+        assert levels(caplog, "answers /whoami normally again") == ["INFO"]
+        rig.route_whoami(status_code=500)
         rig.cycle()
         assert len(errors(caplog)) == 2
 
@@ -1476,7 +1538,7 @@ class TestWhoamiAnswers:
         assert rig.cycle(0) is False
         assert own(caplog) and [lv for lv, m in own(caplog) if "reloading" in m] == ["INFO"]
         assert (
-            "INFO", "server https://backup.example.com is reloading; destination offsite skipped this cycle"
+            "INFO", "server https://backup.example.com is reloading; destination offsite skipped this attempt"
         ) in own(caplog)
         assert errors(caplog) == []
         count = rig.http_count
@@ -1881,20 +1943,58 @@ class TestOtherWhoamiFailures:
         requests.exceptions.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number"),
         requests.exceptions.ChunkedEncodingError("x"), requests.exceptions.InvalidURL("bad"),
     ], ids=["refused", "timeout", "connect-timeout", "ssl", "chunked", "invalid-url"])
-    def test_cannot_reach_every_cycle(self, make_rig, caplog, exc):
+    def test_cannot_reach_is_an_error_once_per_episode_and_debug_after(self, make_rig, caplog, exc):
+        """B3: the episode is latched in the shared `SendMemory` (`UNREACHABLE`, per destination): a manager
+        built per send must not log the same ERROR once per pair per cycle. The attempt itself is unchanged:
+        one `/whoami` per cycle, no retry, the cycle skipped."""
         rig = make_rig(datasets=("pool/a", "pool/b"))
         rig.route_whoami(exc=exc)
         for _ in range(3):
             assert rig.cycle(0) is False
         got = errors(caplog)
-        assert len(got) == 3                                           # not deduplicated
-        for message in got:
-            assert message.startswith("cannot reach https://backup.example.com (destination offsite): ")
-            assert message.endswith("; skipping it this cycle")
+        assert len(got) == 1                                           # once per episode
+        assert got[0].startswith("cannot reach https://backup.example.com (destination offsite): ")
+        assert got[0].endswith("; not sending to it for now")
+        later = [m for lv, m in own(caplog) if lv == "DEBUG" and m.startswith("cannot reach ")]
+        assert len(later) == 2                                         # the same line at DEBUG
         assert len(rig.requests("/whoami")) == 3                       # one attempt per cycle, no retry
         count = rig.http_count
         assert rig.run(1) is False and rig.http_count == count          # skipped within the cycle
         rig.assert_nothing_sent()
+
+    def test_a_manager_built_for_another_pair_shares_the_episode(self, make_rig, caplog):
+        """The point of the latch: a fresh manager per send over the worker's one memory logs nothing more."""
+        rig = make_rig(datasets=("pool/a", "pool/b"))
+        rig.route_whoami(exc=requests.exceptions.Timeout("slow"))
+        rig.cycle(0)
+        other = RemoteBackupManager(
+            rig.config, rig.manager, client_id="client1", tls_dir=rig.tls_dir, memory=rig.mgr._memory,
+        )
+        other.begin_cycle()
+        assert other.backup_dataset(rig.manager.datasets[1], rig.rcfg()) is False
+        assert len(errors(caplog)) == 1
+
+    def test_the_episode_ends_with_an_info_when_the_server_answers_and_a_new_one_logs_again(self, make_rig, caplog):
+        rig = make_rig()
+        rig.route_whoami(exc=requests.exceptions.Timeout("slow"))
+        rig.cycle()
+        rig.heal()
+        rig.cycle()
+        assert levels(caplog, "(destination offsite) is reachable again") == ["INFO"]
+        rig.route_whoami(exc=requests.exceptions.Timeout("slow"))
+        rig.cycle()
+        assert len(errors(caplog)) == 2
+
+    def test_each_destination_has_its_own_episode(self, make_rig, caplog):
+        rig = make_rig(destinations={
+            "one": Destination(url="https://one.example.com", server_fingerprint=SERVER_FP),
+            "two": Destination(url="https://two.example.com", server_fingerprint=SERVER_FP),
+        })
+        for base in ("https://one.example.com", "https://two.example.com"):
+            rig.route_whoami(base=base, exc=requests.exceptions.Timeout("slow"))
+        rig.cycle(0, "one")
+        rig.run(0, "two")
+        assert len(errors(caplog)) == 2
 
     def test_it_does_not_arm_the_deduplication_of_the_refusals(self, rig, caplog):
         rig.route_whoami(exc=requests.exceptions.Timeout("slow"))
@@ -1916,7 +2016,7 @@ class TestReloadingAndBusyStaysPerDataset:
         rig.rm.post(NEGOTIATE, [{"status_code": 503, "json": self.RELOADING},
                                 {"json": {"common_snapshot": None}}])
         assert rig.cycle(0) is False
-        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this cycle") in own(caplog)
+        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this attempt") in own(caplog)
         assert errors(caplog) == []
         assert rig.run(1) is True                                       # the destination is still usable
         assert len(rig.requests("/negotiate")) == 2 and len(rig.requests("/whoami")) == 1
@@ -1926,7 +2026,7 @@ class TestReloadingAndBusyStaysPerDataset:
         rig.rm.get(RESUME_TOKEN, [{"status_code": 503, "json": self.RELOADING},
                                   {"json": {"resume_token": None}}])
         assert rig.cycle(0) is False
-        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this cycle") in own(caplog)
+        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this attempt") in own(caplog)
         assert errors(caplog) == [] and rig.sends == []
         assert rig.run(1) is True
         assert len(rig.sends) == 1
@@ -1943,7 +2043,7 @@ class TestReloadingAndBusyStaysPerDataset:
         rig = make_rig(datasets=("pool/a", "pool/b"))
         rig.ws.recv.side_effect = [json.dumps(self.RELOADING), json.dumps({"status": "ok"})]
         assert rig.cycle(0) is False
-        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this cycle") in own(caplog)
+        assert ("INFO", "server https://backup.example.com is reloading; skipping pool/a this attempt") in own(caplog)
         assert errors(caplog) == []
         rig.set_anchor.assert_not_called()
         assert rig.run(1) is True
@@ -2753,6 +2853,9 @@ class _LocalManager:
     def get_anchor(self, dsi, dest):
         return self.anchors.get(dest)
 
+    def get_own_anchor(self, dsi, dest):
+        return self.anchors.get(dest)
+
     def get_local_anchor(self, dsi, dest):
         return self.anchors.get(dest)
 
@@ -2770,7 +2873,7 @@ class _LocalManager:
     def clear_inflight(self, *a):
         return True
 
-    def get_inflight(self, *a):
+    def get_own_inflight(self, *a):
         return None
 
 

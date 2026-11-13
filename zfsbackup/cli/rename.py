@@ -28,6 +28,14 @@ written.
   names the real copy path (`<target>/<client id>/<old>` -> `.../<new>`) and,
   when the parent is unchanged, the exact `zfs rename` that moves it; this tool
   does not run it. A copy left behind is still pruned to its last stamped rules;
+- renaming an enabled recursive dataset is checked like any change that makes a
+  name recursive (`copies.enforce_copies`, plan item A2d): backup copies found
+  below NEW refuse the rename (exit 1, nothing written) unless `--force-copies`.
+  A separate flag because `--force` already means "rename a dataset that has
+  remote destinations"; one flag for both would turn a deliberate acceptance of
+  a full send into a silent acceptance of snapshots into backup copies. A NEW
+  that does not exist in ZFS yet (the operator is about to `zfs rename`) holds
+  nothing to find; a failed look only warns;
 - `--clear-stale-props` removes `org.zfsbackup:config` and every
   `org.zfsbackup:anchor.*` and `org.zfsbackup:inflight.*` from the old dataset
   (an `inflight.*` pin is an anchor-like pin on the two snapshots of a send in
@@ -78,30 +86,46 @@ written.
   generation is still the snapshot's (else exit 75 before ZFS is touched),
   copy, then write with the lock handed to `write_config(lock=...)`. If
   anything fails after a copy, the exact commands that put each previous
-  value back (`zfs set` / `zfs inherit`) are printed. `inflight.OLD` (the pin on
+  value back (`zfs set` / `zfs inherit -S`) are printed. `inflight.OLD` (the pin on
   the two snapshots of a send to OLD that may still be resumed) is treated the
   same way: copied to `inflight.NEW`, overwriting a differing value, the old one
   left for the operator to clear. A referencing dataset
   that does not exist in ZFS aborts before anything is copied, unless
   `--skip-missing`; the new name must be usable in a ZFS property name.
+  Only LOCAL values are copied (and only a local `anchor.NEW`/`inflight.NEW`
+  counts as "differing"): a received anchor is another host's progress, and
+  copying it would make it this host's own evidence.
+- the descendants of an enabled `recursive` dataset that sends to OLD are sent
+  as copies of their own and carry their own local `anchor.OLD`/`inflight.OLD`
+  (`DatasetManager.expand_recursive`, name-only, no daemon), so they are
+  copied exactly like a configured dataset, under the same lock, ordering and
+  undo commands. A parent whose descendants cannot be listed is reported with
+  the commands to move its subtree's properties by hand; that never fails the
+  rename.
 - the stale `anchor.OLD` and `inflight.OLD` properties are listed afterwards and
   left in place;
 - no `--force`: the server path does not depend on the destination's name (nor
   does a local copy's: `<target>/<client id>/<dataset>`), so a local destination
   needs nothing beyond the anchor copy above.
 
+`rename dataset` of an enabled recursive dataset also says that its descendants'
+copies are below the parent copy (so the parent copy's `zfs rename` moves them)
+and that each records its own `org.zfsbackup:source_dataset`, to re-label.
+
 `--dry-run` for both prints the ZFS property actions and the configuration
 change and does neither (it only reads).
 """
 
 import contextlib
+import dataclasses
+import logging
 import shlex
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import click
 
 from zfsbackup import daemonlock
-from zfsbackup.cli import dotpath
+from zfsbackup.cli import copies, dotpath
 from zfsbackup.cli.errors import (
     EXIT_BUSY,
     EXIT_CONFIG,
@@ -164,26 +188,146 @@ def _inspect(bm: Any, name: str) -> Tuple[bool, Dict[str, str]]:
     return True, bm.read_zfsbackup_properties(ds)
 
 
+def _local_value(bm: Any, ds: Any, prop: str) -> Optional[str]:
+    """The LOCAL value of user property `prop` on `ds`, or None when it has no
+    local value (unset, inherited or only received). One exact `zfs get -s
+    local` of one property. A received or inherited anchor is another host's or
+    another dataset's progress, never this dataset's own evidence (A1), so it is
+    neither copied nor counted as the value being replaced."""
+    return bm.zfs.get.value(ds, prop, sources="local")
+
+
 def _copy_inflight_property(
     bm: Any, ds: Any, old: str, new: str, *, dry_run: bool = False
 ) -> str:
     """`bm.copy_anchor_property` for `inflight.<old>` -> `inflight.<new>` on
     `ds`: the same outcomes (`'no-source'`, `'same'`, `'dry-run'`,
     `'overwritten'`, `'copied'`), always overwriting a differing value, never
-    deleting the old property. `backup_manager` has no copier for `inflight.*`
-    (only for anchors), so this repeats that logic over the CLI's own prefix."""
+    deleting the old property. Only LOCAL values count, on both sides: a received
+    pin is not copied (that would turn another host's progress into this host's
+    own), and a non-local `inflight.<new>` is not an overwrite. `backup_manager`
+    has no copier for `inflight.*` (only for anchors), so this repeats that
+    logic over the CLI's own prefix."""
     old_prop, new_prop = f"{_PROP_INFLIGHT}{old}", f"{_PROP_INFLIGHT}{new}"
-    props = bm.read_zfsbackup_properties(ds)
-    if old_prop not in props:
+    value = _local_value(bm, ds, old_prop)
+    if value is None:
         return "no-source"
-    value = props[old_prop]
-    exists = new_prop in props
-    if exists and props[new_prop] == value:
+    current = _local_value(bm, ds, new_prop)
+    exists = current is not None
+    if exists and current == value:
         return "same"
     if dry_run:
         return "dry-run"
     bm.zfs.set(ds, {new_prop: value})
     return "overwritten" if exists else "copied"
+
+
+_LISTING_FAILED = "Cannot list the descendants of "
+
+
+@contextlib.contextmanager
+def _expansion_records_as_warnings(
+    bm: Any, old: str, new: str, warn: Optional[Callable[[str], None]]
+):
+    """Re-voice `DatasetManager.expand_recursive`'s log records for this command.
+
+    The records are worded for the daemon ("... are not sent until this passes")
+    and `install_logging`'s handler would print each as `error: ...`. While this
+    block runs a `logging.Filter` sits on the backup manager's own logger (the
+    one `expand_recursive` logs to; removed in `finally`, so no other call is
+    affected): a WARNING-or-worse record never reaches the handler. The filter
+    hides ANY WARNING-or-worse record that `zfsbackup.backup_manager` logs while
+    the block runs, not only `expand_recursive`'s own (only `expand_recursive`
+    runs inside it, so today that is the same set). A logger filter is
+    process-global, not scoped to this call; that is safe here because the CLI
+    is single-threaded at this point (no worker, no other thread logs to that
+    logger meanwhile). Of what it hides, the
+    listing-failure ERROR is dropped (`_sending_descendants` returns it in
+    `failed` and `_unlisted_text` already reports it, with the commands to do by
+    hand); any other one (a receive target or backup copy inside the recursive
+    dataset) is passed to `warn` as a `warning:` with what it means for the
+    rename (any unrelated record would be re-voiced the same way, so the
+    wording says "while looking for the descendants"). Lower levels pass through untouched. `warn=None` changes nothing."""
+    if warn is None:
+        yield
+        return
+    logger = logging.getLogger(getattr(bm, "__name__", "zfsbackup.backup_manager"))
+
+    class _Revoice(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.levelno < logging.WARNING:
+                return True
+            message = record.getMessage()
+            if not message.startswith(_LISTING_FAILED):
+                warn(
+                    f"while looking for the descendants that send to {old!r}: {message}. "
+                    f"this rename copies no anchor.{old} or inflight.{old} (to {new!r}) for "
+                    "the datasets skipped this way"
+                )
+            return False
+
+    revoice = _Revoice()
+    logger.addFilter(revoice)
+    try:
+        yield
+    finally:
+        logger.removeFilter(revoice)
+
+
+def _sending_descendants(
+    bm: Any, config: BackupConfig, old: str, skip: Sequence[str] = (),
+    *, new: str = "", warn: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
+    """`([(parent, child), ...], {parent: error})`: the descendants that are sent
+    to destination `old` because an enabled `recursive` dataset sends to it
+    (`DatasetManager.expand_recursive`: name-only listing, no daemon, untimed),
+    and the parents whose listing failed. A child's local `anchor.<dest>` /
+    `inflight.<dest>` live on the child itself, so they move like a configured
+    dataset's. Recursive datasets that do not send to `old` (and the `skip`ped
+    ones) keep their place in the configuration but get `remote: []`, which makes
+    `expand_recursive` leave them out without changing who owns which name."""
+    roots = {
+        d.name for d in config.datasets
+        if d.enabled and d.recursive and d.name not in skip
+        and any(r.destination == old for r in d.remote)
+    }
+    if not roots:
+        return [], {}
+    datasets = [
+        dataclasses.replace(d, remote=[]) if d.enabled and d.recursive and d.name not in roots else d
+        for d in config.datasets
+    ]
+    try:
+        with _expansion_records_as_warnings(bm, old, new, warn):
+            expansion = bm.DatasetManager(
+                dataclasses.replace(config, datasets=datasets)
+            ).expand_recursive()
+    except Exception as exc:  # noqa: BLE001 - expand_recursive itself never raises
+        reason = f"{type(exc).__name__}: {str(exc).strip()}"
+        return [], {name: reason for name in sorted(roots)}
+    pairs = [(c.expanded_from, c.name) for c in expansion.children if c.expanded_from in roots]
+    return pairs, {p: e for p, e in expansion.failed.items() if p in roots}
+
+
+def _unlisted_text(old: str, new: str, parent: str, error: str) -> str:
+    """What the operator must do for the descendants of `parent` whose listing
+    failed: their anchors were not copied."""
+    a_old, a_new = f"{_PROP_ANCHOR}{old}", f"{_PROP_ANCHOR}{new}"
+    i_old, i_new = f"{_PROP_INFLIGHT}{old}", f"{_PROP_INFLIGHT}{new}"
+    return (
+        f"the descendants of {parent!r} could not be listed ({error}), so the anchor.{old} and "
+        f"inflight.{old} of every dataset below {parent!r} were NOT copied to anchor.{new} and "
+        f"inflight.{new} (the properties of {parent!r} itself were). Without them a descendant "
+        f"counts as due and the next send to {new!r} negotiates its base afresh. To carry them "
+        f"over by hand, list them with:\n"
+        f"  zfs get -r -H -s local -o name,property,value {a_old},{i_old} {shlex.quote(parent)}\n"
+        f"then, for each dataset <ds> and value <value> it prints, run `zfs set "
+        f"{a_new}=<value> <ds>` (or `{i_new}=<value>` for an inflight line), and once a send to "
+        f"{new!r} has succeeded `zfs inherit -S {a_old} <ds>` (`-S {i_old}`; `-S` clears only a "
+        f"local value and leaves a received one alone). The listing also shows the backup copies "
+        f"below {parent!r}: skip any dataset that is a backup copy, i.e. one that carries "
+        f"org.zfsbackup:client_id or org.zfsbackup:source_dataset"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -288,16 +432,47 @@ def _copy_notes(snapshot: ConfigSnapshot, ds: Any, old: str, new: str) -> str:
     (as ever) and one per local destination (the real path and the exact
     `zfs rename`)."""
     destinations = snapshot.config.destinations
+    cid = _client_id(snapshot)
+    recursive = bool(ds.enabled and ds.recursive)
     notes: List[str] = []
     if any(not _is_local(destinations, r.destination) for r in ds.remote):
         notes.append(_server_note(snapshot, old, new))
+        if recursive:
+            notes.append(
+                "its descendants are sent as copies of their own, below "
+                f"{_server_path(cid, old)}/, so on the receiver they move with the parent "
+                "copy's `zfs rename` (they are below it); each descendant's copy also records "
+                f"org.zfsbackup:source_dataset={old}/<child>, which must read {new}/<child> "
+                "there or the receiver refuses it"
+            )
     for remote in ds.remote:
         if _is_local(destinations, remote.destination):
-            notes.append(_local_note(
-                snapshot, remote.destination, destinations[remote.destination].target_dataset,
-                old, new,
-            ))
+            target = destinations[remote.destination].target_dataset
+            notes.append(_local_note(snapshot, remote.destination, target, old, new))
+            if recursive:
+                notes.append(_local_children_note(
+                    remote.destination, target, cid, old, new,
+                ))
     return "; ".join(notes)
+
+
+def _local_children_note(destination: str, target: str, cid: str, old: str, new: str) -> str:
+    """The recursive dataset's descendants under local destination
+    `destination`: their copies are below the parent's, so the parent copy's
+    `zfs rename` moves them; each one also records its own `source_dataset`."""
+    old_path, new_path = _local_copy_path(target, cid, old), _local_copy_path(target, cid, new)
+    if old.rpartition("/")[0] != new.rpartition("/")[0]:
+        return (
+            f"its descendants are sent to {destination!r} as copies of their own, below "
+            f"{old_path}/; they are sent in full into {new_path}/ and the copies below "
+            f"{old_path}/ stay with the orphaned parent copy"
+        )
+    return (
+        f"its descendants are sent to {destination!r} as copies of their own, below "
+        f"{old_path}/, so they move with the parent copy's `zfs rename` (they are below it); "
+        "then re-label each one, for every descendant <child> (the part of its name after "
+        f"{new}/): `zfs set org.zfsbackup:source_dataset={new}/<child> {new_path}/<child>`"
+    )
 
 
 def _is_local(destinations: Dict[str, Any], name: str) -> bool:
@@ -488,8 +663,19 @@ def _applied_problem(info: daemonlock.DaemonInfo, stored: Tuple[int, int]) -> Op
     )
 
 
+def _inherit_flag(prop: str) -> str:
+    """`-S ` for an anchor or pin, else nothing. Plain `zfs inherit` HIDES a
+    received value (the property then reads as inherited or default), whereas
+    `-S` reverts to the received value when there is one and otherwise acts like
+    a plain inherit: it clears only a LOCAL value and leaves a received anchor,
+    which the pruner protects, in place."""
+    return "-S " if prop.startswith((_PROP_ANCHOR, _PROP_INFLIGHT)) else ""
+
+
 def _inherit_commands(dataset: str, props: Sequence[str]) -> str:
-    return "\n".join(f"  zfs inherit {p} {shlex.quote(dataset)}" for p in props)
+    return "\n".join(
+        f"  zfs inherit {_inherit_flag(p)}{p} {shlex.quote(dataset)}" for p in props
+    )
 
 
 def _clear_stale(
@@ -498,24 +684,37 @@ def _clear_stale(
     request: Optional[daemonlock.ReloadRequest] = None,
     key: Optional[Tuple[int, int]] = None,
     progress: Optional[Dict[str, Any]] = None,
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
     """Clear `props` (`org.zfsbackup:config` / `anchor.*` / `inflight.*`) on the old dataset,
-    one `zfs inherit` at a time, behind `_clear_gate`. Raises `CliError`, always
-    saying which were cleared and which `zfs inherit` commands are left
-    (`ConfigBusy`, exit 75, when the writer lock is held by another writer:
-    it carries the same commands as a note)."""
+    one `zfs inherit` at a time, behind `_clear_gate`; returns `(cleared, kept)`.
+    `anchor.*`/`inflight.*` go through `zfs inherit -S`, which clears only a
+    LOCAL value and leaves a received one in place (it is another host's
+    progress, and the pruner protects it): `cleared` holds exactly the names
+    that had a local value (read first, one exact `zfs get -s local` each) and
+    `kept` the names that were left because they are only received. Raises
+    `CliError`, always saying which were cleared and which `zfs inherit`
+    commands are left (`ConfigBusy`, exit 75, when the writer lock is held by
+    another writer: it carries the same commands as a note)."""
     ordered = sorted(props)
     cleared: List[str] = []
+    kept: List[str] = []
     try:
         with _clear_gate(resolved, old, request=request, key=key, progress=progress):
             ds = bm.Dataset(old)
             for prop in ordered:
                 if prop == _PROP_CONFIG:
                     bm.clear_zfsbackup_properties(ds, config=True, anchors=False)
-                elif prop.startswith(_PROP_INFLIGHT):
+                    cleared.append(prop)
+                    continue
+                if _local_value(bm, ds, prop) is None:
+                    # Listed as set, but not locally: received only. `-S` would
+                    # leave it, so do not call it cleared (nor run the command).
+                    kept.append(prop)
+                    continue
+                if prop.startswith(_PROP_INFLIGHT):
                     # `clear_zfsbackup_properties` clears `inflight.*` only as
-                    # part of "every anchor"; one at a time it is a plain inherit.
-                    bm.zfs.inherit(ds, prop)
+                    # part of "every anchor"; one at a time: `inherit -S`.
+                    bm.zfs.inherit(ds, prop, received=True)
                 else:
                     bm.clear_zfsbackup_properties(
                         ds, config=False, anchors=[prop[len(_PROP_ANCHOR):]]
@@ -528,7 +727,7 @@ def _clear_stale(
             + _inherit_commands(old, ordered)
         ) from None
     except ConfigBusy as exc:
-        left = [p for p in ordered if p not in cleared]
+        left = [p for p in ordered if p not in cleared and p not in kept]
         exc.add_note(
             f"the configuration was renamed, but the stale properties on {old!r} were NOT "
             "cleared (the writer lock was not free). Re-running the rename "
@@ -539,7 +738,8 @@ def _clear_stale(
         )
         raise
     except Exception as exc:  # noqa: BLE001
-        left = [p for p in ordered if p not in cleared]
+        # `kept` (received only: `inherit -S` would leave them) get no command.
+        left = [p for p in ordered if p not in cleared and p not in kept]
         # An unusable config database (path/schema/damaged file, read by the
         # gate) keeps its own wording and its exit code (78).
         code = exit_code_for(exc)
@@ -552,8 +752,11 @@ def _clear_stale(
         raise (ConfigUnusable if unusable else ConfigBusy if busy_store else CliError)(
             "the configuration was renamed, but clearing the stale properties on "
             f"{old!r} failed: {reason}. "
-            f"Cleared so far: {', '.join(cleared) or 'none'}. Still set, to clear by hand:\n"
-            + _inherit_commands(old, left)
+            f"Cleared so far: {', '.join(cleared) or 'none'}. "
+            + (
+                f"Still set, to clear by hand:\n{_inherit_commands(old, left)}"
+                if left else "Nothing else needs a command."
+            )
         ) from exc
     except BaseException as exc:
         exc.add_note(
@@ -562,7 +765,7 @@ def _clear_stale(
             f"{', '.join(p for p in ordered if p not in cleared)}"
         )
         raise
-    return cleared
+    return cleared, kept
 
 
 def _anchor_message(
@@ -589,7 +792,9 @@ def _anchor_message(
 
 
 def _inherit_commands_for(datasets: Sequence[str], prop: str) -> str:
-    return "\n".join(f"  zfs inherit {prop} {shlex.quote(d)}" for d in datasets)
+    return "\n".join(
+        f"  zfs inherit {_inherit_flag(prop)}{prop} {shlex.quote(d)}" for d in datasets
+    )
 
 
 def _require_generation(resolved: ResolvedConfigPath, snapshot: ConfigSnapshot) -> None:
@@ -644,6 +849,13 @@ def _interrupted_write(exc: BaseException, resolved: ResolvedConfigPath, what: s
 # rename dataset
 # --------------------------------------------------------------------------
 
+_RENAME_COPIES_HINT = (
+    "Move the copies out, keep the dataset non-recursive, or re-run with --force-copies to "
+    "rename anyway (the daemon then keeps the copies out of its snapshots itself, which are "
+    "no longer one `zfs snapshot -r`; it logs one ERROR per copy and `check` shows a "
+    "standing warning on the dataset until they are moved)."
+)
+
 
 def rename_dataset(
     resolved: ResolvedConfigPath,
@@ -652,6 +864,7 @@ def rename_dataset(
     new: str,
     *,
     force: bool = False,
+    force_copies: bool = False,
     clear_stale_props: bool = False,
     dry_run: bool = False,
     warn: Callable[[str], None],
@@ -712,6 +925,14 @@ def rename_dataset(
 
     new_config = _renamed_dataset_config(config, old, new)
     prefix = "[dry run] " if dry_run else ""
+
+    # An enabled recursive dataset renamed in the configuration is a newly
+    # recursive NAME (plan item A2d): look for backup copies below NEW, before the
+    # write (a read-only ZFS look; a failed look only warns). `--force` here is
+    # taken (remote destinations), so the override is its own flag.
+    copies.enforce_copies(
+        config, new_config, force=force_copies, warn=warn, hint=_RENAME_COPIES_HINT
+    )
 
     if unavailable is not None:
         warn(
@@ -779,7 +1000,7 @@ def rename_dataset(
             # The daemon check is made HERE, after the write (`_clear_gate`).
             progress: Dict[str, Any] = {}
             try:
-                cleared = _clear_stale(
+                cleared, kept = _clear_stale(
                     resolved, bm, old, to_clear, request=request,
                     key=(result.store_id, result.generation), progress=progress,
                 )
@@ -791,6 +1012,11 @@ def rename_dataset(
                 )
                 raise
             click.echo(f"Cleared on {old!r}: {', '.join(cleared) or '(nothing set)'}")
+            if kept:
+                click.echo(
+                    f"Left in place on {old!r} because they are received (another host's "
+                    f"values, which the pruner still honours): {', '.join(kept)}"
+                )
         notify_daemon(resolved, result.generation, result.store_id, request=request)
     except BaseException as exc:
         _interrupted_after_write(
@@ -829,6 +1055,21 @@ def rename_destination(
     referencing = [
         d.name for d in config.datasets if any(r.destination == old for r in d.remote)
     ]
+    # A stored name that cannot form `org.zfsbackup:anchor.<name>` /
+    # `inflight.<name>` (a database written before `validate_config` refused such
+    # names) never had an anchor or a pin: no property of that name exists, and
+    # libzfseasy refuses to even read one. The rename is the way out for exactly
+    # these names, so nothing is read, copied or cleared for `old`, and no ZFS
+    # access is needed at all.
+    old_problem = destination_name_problem(old)
+    unusable_note = (
+        f"note: the old name {old!r} could not hold anchors or send pins ({old_problem}), so "
+        f"there is nothing to copy; the first send to {new!r} negotiates its base"
+        if old_problem else ""
+    )
+    senders = referencing
+    if old_problem:
+        referencing = []
     new_config = _renamed_destination_config(config, old, new)
     # Pure and cheap: a configuration the store would refuse must be found
     # BEFORE any anchor is copied, so that the only failures left after a copy
@@ -840,6 +1081,11 @@ def rename_destination(
     outcomes: Dict[str, str] = {}
     to_copy: List[str] = []
     bm: Any = None
+    # Descendants of enabled recursive datasets that send to `old`: each is its
+    # own sending pair with its own LOCAL anchor/pin (`expand_recursive`), so it
+    # is copied like a configured dataset. child -> its recursive parent.
+    child_of: Dict[str, str] = {}
+    unlisted: Dict[str, str] = {}
     if referencing:
         bm, unavailable = _load_backup_manager()
         if bm is None:
@@ -874,6 +1120,12 @@ def rename_destination(
                 "(--skip-missing)"
             )
         to_copy = [n for n in referencing if n not in missing]
+        pairs, unlisted = _sending_descendants(bm, config, old, skip=missing, new=new, warn=warn)
+        for parent, child in pairs:
+            child_of[child] = parent
+            to_copy.append(child)
+        for parent, error in unlisted.items():
+            warn(_unlisted_text(old, new, parent, error))
 
     old_prop, new_prop = f"{_PROP_ANCHOR}{old}", f"{_PROP_ANCHOR}{new}"
     # Properties copied, anchors first: (kind, old name, new name). `inflight.*`
@@ -908,7 +1160,9 @@ def rename_destination(
             mine = {n: v for (n, k), v in pending.items() if k == kind}
             for name, previous in mine.items():
                 if previous is None:
-                    lines.append(f"  zfs inherit {new_p} {shlex.quote(name)}")
+                    # `-S`: a previously RECEIVED anchor.NEW comes back (plain
+                    # inherit would hide it); with none it is a plain inherit.
+                    lines.append(f"  zfs inherit -S {new_p} {shlex.quote(name)}")
                 else:
                     lines.append(f"  zfs set {shlex.quote(f'{new_p}={previous}')} {shlex.quote(name)}")
             replaced = {n: v for n, v in mine.items() if v is not None}
@@ -938,8 +1192,9 @@ def rename_destination(
             ds = bm.Dataset(name)
             for kind, old_p, new_p in kinds:
                 try:
-                    before = bm.read_zfsbackup_properties(ds)
-                    values[(name, kind)] = (before.get(old_p), before.get(new_p))
+                    values[(name, kind)] = (
+                        _local_value(bm, ds, old_p), _local_value(bm, ds, new_p)
+                    )
                     results[kind][name] = copy_property(kind, ds)
                 except Exception as exc:  # noqa: BLE001
                     tail = restore_text()
@@ -967,6 +1222,9 @@ def rename_destination(
                 elif outcome == "overwritten":
                     restore[(name, kind)] = values[(name, kind)][1]
         for name, outcome in outcomes.items():
+            pin = inflight_outcomes.get(name, "no-source")
+            if name in child_of and outcome == "no-source" and pin == "no-source":
+                continue  # a descendant that never sent: nothing to say (summarised below)
             click.echo(
                 f"{prefix}{name}: "
                 + _anchor_message(
@@ -974,7 +1232,6 @@ def rename_destination(
                 )
             )
             # Most datasets have no pin; say nothing about those.
-            pin = inflight_outcomes.get(name, "no-source")
             if pin != "no-source":
                 click.echo(
                     f"{prefix}{name}: "
@@ -983,14 +1240,32 @@ def rename_destination(
                         dry_run, "inflight",
                     )
                 )
+        for parent in dict.fromkeys(child_of.values()):
+            below = [c for c, p in child_of.items() if p == parent]
+            carried = [
+                c for c in below
+                if outcomes.get(c, "no-source") != "no-source"
+                or inflight_outcomes.get(c, "no-source") != "no-source"
+            ]
+            click.echo(
+                f"{prefix}{len(below)} descendant(s) of {parent!r} send to {old!r}; "
+                f"{len(carried)} had an anchor.{old} or inflight.{old} to copy"
+            )
 
     if dry_run:
         if to_copy:
             copy_anchors()
+        if unusable_note:
+            click.echo(f"{prefix}{unusable_note}")
         click.echo(
             f"{prefix}would rename destination {old!r} -> {new!r} in the configuration"
-            + (f" and in the remote: lists of {', '.join(referencing)}" if referencing else "")
+            + (f" and in the remote: lists of {', '.join(senders)}" if senders else "")
         )
+        for parent in unlisted:
+            warn(
+                f"{prefix}NOT handled: the anchors of the descendants of {parent!r} (listing "
+                "failed); see the warning above"
+            )
         return
 
     def commit(lock: Any = None):
@@ -1019,6 +1294,14 @@ def rename_destination(
     request = begin_reload(resolved, result.generation, result.store_id)
     try:
         click.echo(f"Renamed destination {old!r} -> {new!r} in the configuration.")
+        if unusable_note:
+            click.echo(unusable_note)
+        for parent in unlisted:
+            warn(
+                f"NOT handled: the anchors of the descendants of {parent!r} (its listing "
+                f"failed); the warning above has the commands to carry anchor.{old} and "
+                f"inflight.{old} to anchor.{new} and inflight.{new} on them"
+            )
         stale = [n for n, o in outcomes.items() if o != "no-source"]
         if stale:
             commands = _inherit_commands_for(stale, old_prop)

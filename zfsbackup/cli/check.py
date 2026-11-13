@@ -13,7 +13,15 @@ What it does, in order:
 2. Lazily imports `zfsbackup.health_collect` (which imports `libzfseasy`, so a
    host without ZFS can still run every other command: the `rename.py`
    precedent) and `zfsbackup.health` (stdlib only). `health_collect.collect`
-   makes the read-only `zfs list` / `zfs get` calls; `health.evaluate` grades them.
+   makes the read-only `zfs list` / `zfs get` calls (per enabled dataset, the
+   anchors of the descendants of its recursive datasets, and the received
+   datasets on a server; also one WARN per backup copy it finds below a
+   recursive dataset); `health.evaluate` grades them. The reads are bounded by
+   `--time-limit` in all and `--per-call-timeout` per command, except the batched
+   reads of a large tree (the descendants' listing and backup-copy marker read,
+   their snapshot and property reads, the received datasets' listing and
+   property read), which may use all the time left of `--time-limit`; what was
+   not checked in time is one WARN `(time limit)` entry.
 3. Adds this command's own entries as `health.CheckEntry`s, so every serialiser
    handles them: the daemon (not running = CRIT; running but not on the stored
    generation = WARN; draining for an upgrade = WARN `daemon/upgrade`), the client certificate (expired = CRIT, expiring
@@ -32,7 +40,11 @@ a failed attempt counts like one missed interval, so `consecutive_failures`
 below `--warn-factor` (default 2) is OK (one failure in a row is noted in the
 reason but not a verdict: the next cycle may fix it), from `--warn-factor` WARN,
 from `--crit-factor` (default 4) CRIT. A last attempt that succeeded is OK
-whatever happened before. NO DATA IS NEVER A FAILURE: a missing status
+whatever happened before, unless the record carries a `warning` (a standing note
+about that attempt, e.g. a recursive snapshot that left backup copies below it
+out): then the entry is WARN, with the warning in the reason (never CRIT; the
+next attempt replaces the warning, so a clean one clears it; a failing record
+keeps its failure grading). NO DATA IS NEVER A FAILURE: a missing status
 directory (an older daemon, or nothing written yet) or a worker with no file
 adds no entry at all. A file the reader refuses (a symlink, writable by
 group/others, an untrusted owner, too big, not JSON, a newer schema) is one
@@ -45,9 +57,10 @@ file was not updated for `max(4 x check_interval, 24 h)` (a backstop: a worker m
 without writing during one long transfer). Staleness is never OK
 and never CRIT on its own (a stopped daemon is already the daemon entry's CRIT).
 In the JSON each such entry also carries `kind`, `consecutive_failures`,
-`last_attempt` and `last_success`; the Prometheus form adds
+`last_attempt`, `last_success` and `warning` (null when none); the Prometheus form adds
 `zfsbackup_worker_consecutive_failures`; `--nagios` adds a perfdata item per
-record (failures with the two thresholds).
+record (failures with the two thresholds; the whole `--nagios` output is capped at
+`--nagios-max-bytes`, default 4000, see `render_nagios`).
 
 Exit codes:
 
@@ -123,6 +136,7 @@ class OutcomeEntry(_health.CheckEntry):
     last_success: Optional[float] = None
     warn_failures: float = 0.0
     crit_failures: float = 0.0
+    warning: Optional[str] = None
 
 
 # --------------------------------------------------------------------------
@@ -232,6 +246,7 @@ def _outcome_entry(health: Any, rec: Any, now: float, warn: float, crit: float) 
         state = health.STATE_WARN
     else:
         state = health.STATE_OK
+    warning = getattr(rec, "warning", None) or None
     error = f": {rec.last_error}" if rec.last_error else ""
     if failures == 0:
         if rec.result is None and rec.last_attempt is None:
@@ -240,6 +255,12 @@ def _outcome_entry(health: Any, rec: Any, now: float, warn: float, crit: float) 
             reason = f"last attempt succeeded {_ago(health, now, rec.last_attempt)}"
             if rec.detail:
                 reason += f" ({rec.detail})"
+            if warning:
+                # The attempt succeeded but said something is not right (e.g. a
+                # recursive snapshot that left backup copies out): WARN, never CRIT,
+                # and cleared by the next attempt. A failing record keeps its grading.
+                state = health.STATE_WARN
+                reason += f", but: {_one_line(warning)}"
     elif state == health.STATE_OK:
         reason = (
             f"last attempt failed {_ago(health, now, rec.last_error_at or rec.last_attempt)} "
@@ -256,6 +277,7 @@ def _outcome_entry(health: Any, rec: Any, now: float, warn: float, crit: float) 
         kind=rec.kind, consecutive_failures=failures,
         last_attempt=rec.last_attempt, last_success=rec.last_success,
         warn_failures=warn, crit_failures=crit,
+        warning=warning if failures == 0 else None,
     )
 
 
@@ -307,10 +329,49 @@ def worker_entries(
     return entries
 
 
+#: `--time-limit` default: seconds for the whole ZFS collection. The systemd unit
+#: `packaging/systemd/zfsbackup-check.service` sets `TimeoutStartSec=150`, i.e.
+#: 2 x this + 30 s, so it assumes this default.
+DEFAULT_TIME_LIMIT = 60.0
+#: `--per-call-timeout` default: seconds one `zfs` command may run (the same
+#: value as `health_collect.DEFAULT_PER_CALL_SECONDS`), except the batched reads
+#: of a large tree, which may use all the time left of `--time-limit`.
+DEFAULT_PER_CALL_TIMEOUT = 10.0
+
+
+def _seconds_option(name: str) -> Callable[[click.Context, click.Parameter, Any], Optional[float]]:
+    """A click callback for a seconds option: a positive finite number, or `0`
+    or `none` (any case) for no limit (-> `None`). Anything else is a usage
+    error (so `--nagios` reports it as UNKNOWN)."""
+
+    def callback(ctx: click.Context, param: click.Parameter, value: Any) -> Optional[float]:
+        text = str(value).strip().lower()
+        if text in ("none", "off", "unlimited"):
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            raise click.BadParameter(
+                f"{value!r} is not a number of seconds (use 0 or none for no limit)") from None
+        if number != number or number in (float("inf"), float("-inf")) or number < 0:
+            raise click.BadParameter(
+                f"{value!r} must be a positive number of seconds (use 0 or none for no limit)")
+        return None if number == 0 else number
+
+    callback.__name__ = f"_check_{name}"
+    return callback
+
+
 def gather(
-    resolved: Any, now: datetime, warn_factor: float, crit_factor: float
+    resolved: Any, now: datetime, warn_factor: float, crit_factor: float,
+    time_limit: Optional[float] = DEFAULT_TIME_LIMIT,
+    per_call: Optional[float] = DEFAULT_PER_CALL_TIMEOUT,
 ) -> Tuple[Any, List[Any]]:
-    """Everything `check` reports: -> `(health module, entries)`. Read-only."""
+    """Everything `check` reports: -> `(health module, entries)`. Read-only.
+    `time_limit` bounds the whole ZFS collection and `per_call` each `zfs`
+    command (seconds; `None` = unbounded), except the batched reads of a large
+    tree, which get the time left of `time_limit`; what a passed limit left
+    unchecked is one WARN entry."""
     from zfsbackup import health
 
     # Validate the factors before any ZFS or database work.
@@ -335,7 +396,7 @@ def gather(
 
     from zfsbackup import health_collect
 
-    observations = health_collect.collect(config)
+    observations = health_collect.collect(config, deadline=time_limit, per_call=per_call)
     entries = list(health.evaluate(observations, now, warn_factor, crit_factor))
     entries.extend(daemon)
     cert = client_certificate_entry(health, config, resolved, now)
@@ -385,10 +446,71 @@ def _num(value: Optional[float]) -> str:
     return "" if value is None else f"{value:.0f}"
 
 
-def render_nagios(health: Any, entries: List[Any]) -> str:
+#: Default for `--nagios-max-bytes`: the whole `--nagios` output (status line,
+#: perfdata and the newline) stays within this many bytes. What is known:
+#: Nagios Core 4 reads about 8 KiB of plugin output, and a configuration with
+#: recursive datasets easily has hundreds of entries (~47 bytes of perfdata
+#: each). What is assumed (from memory, not checked against each release): NRPE
+#: v2 carries only about 1 KiB of output per packet, NRPE 3 and later much more,
+#: and Icinga 2 has no small limit. 4000 is therefore a middle value that fits
+#: Nagios Core 4 and NRPE 3+ with a margin; a site behind NRPE v2 should pass
+#: `--nagios-max-bytes 1000` or so. The perfdata is capped, never the verdict.
+NAGIOS_OUTPUT_LIMIT = 4000
+
+#: The smallest accepted `--nagios-max-bytes`: room for a short status line and
+#: the `omitted=N` item. Below it the status line is what gets clipped.
+NAGIOS_MIN_OUTPUT_LIMIT = 64
+
+
+def _nagios_perfdata(entries: List[Any], severity: Callable[[Any], int]) -> List[Tuple[int, str]]:
+    """One `(severity, perfdata item)` per lag entry and per worker-outcome
+    record, in the order of `entries` (the order consumers that map perfdata by
+    position rely on; `render_nagios` sorts by severity only to choose which
+    items to keep)."""
+    items: List[Tuple[int, str]] = []
+    for e in entries:
+        if getattr(e, "age_seconds", None) is not None:
+            items.append((
+                severity(e),
+                f"'{_perf_label(e)}'={_num(e.age_seconds)}s;{_num(e.warn_seconds)};{_num(e.crit_seconds)};0",
+            ))
+        if isinstance(e, OutcomeEntry):
+            items.append((
+                severity(e),
+                f"'{_perf_label(e)}'={e.consecutive_failures};{e.warn_failures:g};{e.crit_failures:g};0",
+            ))
+    return items
+
+
+def _fit_bytes(text: str, limit: int) -> str:
+    """`text` cut at a character boundary to at most `limit` UTF-8 bytes (with
+    an ellipsis when something was cut)."""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    marker = "..."
+    room = max(limit - len(marker), 0)
+    return text.encode("utf-8")[:room].decode("utf-8", "ignore") + marker
+
+
+def render_nagios(health: Any, entries: List[Any], max_bytes: int = NAGIOS_OUTPUT_LIMIT) -> str:
     """One line: `ZFSBACKUP <STATE> - <summary> | <perfdata>`. The summary names
-    the entries that are not OK (or counts them if all are); the perfdata is the
-    age of each lag entry with its warn/crit thresholds."""
+    the first three entries that are not OK, then `and N more` (or counts the
+    entries if all are OK); the perfdata is the age of each lag entry with its
+    warn/crit thresholds, and the failure count of each worker-outcome record.
+
+    The whole output is capped at `max_bytes` (default `NAGIOS_OUTPUT_LIMIT`,
+    4000; `--nagios-max-bytes`), newline included, because a longer perfdata
+    would be cut mid-item by the transport and mis-parsed. When everything fits,
+    the perfdata is in the entries' own order, exactly as without a cap. When it
+    does not, the most severe items (CRIT, then WARN, then OK; in the entries'
+    order within a state) are chosen whole until the next one would not fit, and
+    those are emitted in the entries' original order, followed by one last item
+    `omitted=N`, N being the number of items left out. (Severity decides only
+    which items are kept: consumers that map perfdata by position must see a
+    stable order.) The status line and the exit code (from the overall state)
+    are never affected; the status line is clipped only if it alone could not
+    leave room for that item. `--json` and `--prometheus` have no size limit and
+    list every entry."""
     overall = health.overall_state(entries)
     bad = [e for e in entries if e.state != health.STATE_OK]
     if bad:
@@ -397,18 +519,34 @@ def render_nagios(health: Any, entries: List[Any]) -> str:
             shown += f"; and {len(bad) - 3} more"
     else:
         shown = f"{len(entries)} checks OK"
-    perf = [
-        f"'{_perf_label(e)}'={_num(e.age_seconds)}s;{_num(e.warn_seconds)};{_num(e.crit_seconds)};0"
-        for e in entries
-        if getattr(e, "age_seconds", None) is not None
-    ]
-    perf.extend(
-        f"'{_perf_label(e)}'={e.consecutive_failures};{e.warn_failures:g};{e.crit_failures:g};0"
-        for e in entries
-        if isinstance(e, OutcomeEntry)
-    )
+    perf = _nagios_perfdata(
+        entries, lambda e: health.STATE_VALUES.get(e.state, 2))
     line = f"{_NAGIOS_NAME} {overall} - {shown}"
-    return line + (" | " + " ".join(perf) if perf else "") + "\n"
+    budget = max_bytes - 1                               # the trailing newline
+    if not perf:
+        return _fit_bytes(line, budget) + "\n"
+
+    def size(text: str) -> int:
+        return len(text.encode("utf-8"))
+
+    separator = " | "
+    if size(line) + size(separator) + sum(size(text) + 1 for _, text in perf) - 1 <= budget:
+        return line + separator + " ".join(text for _, text in perf) + "\n"
+    # Not everything fits: always leave room for the `omitted=N` item.
+    reserve = size(f" omitted={len(perf)}")
+    line = _fit_bytes(line, max(budget - size(separator) - reserve + 1, 0))
+    used = size(line) + size(separator) + reserve - 1    # line, " | " and `omitted=N`
+    kept: List[int] = []
+    # Most severe first; `sorted` is stable, so the entries' order breaks ties.
+    for index in sorted(range(len(perf)), key=lambda i: -perf[i][0]):
+        cost = size(perf[index][1]) + 1                  # the item and the space after it
+        if used + cost > budget:
+            break
+        kept.append(index)
+        used += cost
+    items = [perf[i][1] for i in sorted(kept)]           # back in the entries' own order
+    items.append(f"omitted={len(perf) - len(kept)}")
+    return line + separator + " ".join(items) + "\n"
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -427,6 +565,7 @@ def render_json(health: Any, entries: List[Any], now: float, version: Optional[s
             data["consecutive_failures"] = entry.consecutive_failures
             data["last_attempt"] = _iso(entry.last_attempt)
             data["last_success"] = _iso(entry.last_success)
+            data["warning"] = entry.warning
     return json.dumps(document, indent=2, ensure_ascii=True)
 
 
@@ -482,6 +621,14 @@ class _CheckCommand(click.Command):
             ctx.exit(EXIT_NAGIOS_UNKNOWN)
 
 
+def _check_nagios_max_bytes(ctx: click.Context, param: click.Parameter, value: int) -> int:
+    if value < NAGIOS_MIN_OUTPUT_LIMIT:
+        raise click.BadParameter(
+            f"{value} is too small: it must be at least {NAGIOS_MIN_OUTPUT_LIMIT} bytes "
+            "(room for the status line and omitted=N)")
+    return value
+
+
 def register(
     cli: click.Group,
     common: Callable[[Callable], Callable],
@@ -494,7 +641,8 @@ def register(
         cls=_CheckCommand,
         help=(
             "Is this host's backup healthy? Grades, per enabled dataset, the newest "
-            "snapshot, the snapshot last sent to each destination and (on a server) "
+            "snapshot, the snapshot last sent to each destination (for a recursive "
+            "dataset, also of each of its descendants) and (on a server) "
             "each received client dataset against how often they should be taken: "
             "WARN from --warn-factor times that interval, CRIT from --crit-factor "
             "times it. Also checks that a daemon is running on the stored "
@@ -502,12 +650,35 @@ def register(
             "(30 days). Once the daemon's workers have written their status files "
             "(<db>.status/), also grades each worker's last attempts: failures in a row "
             "count like missed intervals (WARN from --warn-factor, CRIT from "
-            "--crit-factor); no status files is no data, never a failure. "
+            "--crit-factor); a last attempt that succeeded but recorded a warning (for "
+            "example a recursive snapshot that left backup copies out) is WARN until the "
+            "next attempt is clean; no status files is no data, never a failure. "
+            "A backup copy found below a recursive dataset is one WARN: it is not "
+            "snapshotted, sent or pruned with the tree. "
             "Read-only: it runs only `zfs list`/`zfs get`, takes no lock "
             "and never signals the daemon.\n\n"
             "Output: text by default; --json; --prometheus (text exposition format); "
-            "--nagios (one plugin line). --output FILE writes that output to FILE "
-            "atomically instead of stdout (for node_exporter's textfile collector).\n\n"
+            "--nagios (one plugin line, at most --nagios-max-bytes bytes in all, 4000 by "
+            "default: when the perfdata does not fit, the most severe items are kept, in their "
+            "usual order, and the last item is omitted=N; the verdict and the exit code are "
+            "unaffected; --json and --prometheus list every entry). --output FILE writes that "
+            "output to FILE atomically instead of stdout (for node_exporter's textfile "
+            "collector).\n\n"
+            "Time bound: the ZFS reads stop after --time-limit seconds (default 60) in all, "
+            "and any one zfs command after --per-call-timeout seconds (default 10), except "
+            "the batched reads of a large tree (a recursive dataset's descendant listing and "
+            "backup-copy marker read, its descendants' snapshot and property reads, the "
+            "received datasets' listing and property read), which may use all the "
+            "time left of --time-limit; what was not checked in time is reported as one WARN "
+            "entry '(time limit)', never as OK. A slow pool, or a hung one whose zfs can still "
+            "be killed, can spend all the time left on one batched read, and the items not "
+            "reached are then that WARN. --time-limit may be overshot by a few seconds "
+            "at most (a timed-out zfs child needs up to about 6 s to be killed). "
+            "0 or none turns a limit off. A caller's own timeout must exceed --time-limit "
+            "plus a few seconds: NRPE's -t (command_timeout) must be larger than it, or NRPE "
+            "kills the check and reports a timeout instead. The systemd unit "
+            "zfsbackup-check.service sets TimeoutStartSec=150, which assumes the default 60 s "
+            "limit: if you raise --time-limit, raise it too (2 x the limit + 30 s).\n\n"
             "Exit 0 healthy, 1 any WARN or CRIT, 78 the config database is unusable. "
             "With --output FILE: 0 whenever the file was written, whatever the verdict "
             "(it is in the file); any other code means the check could not run or the "
@@ -519,7 +690,33 @@ def register(
     @click.option("--prometheus", "as_prometheus", is_flag=True, default=False,
                   help="Prometheus text exposition format.")
     @click.option("--nagios", "as_nagios", is_flag=True, default=False,
-                  help="One Nagios-plugin line with perfdata; exit 0/1/2/3 (OK/WARN/CRIT/UNKNOWN).")
+                  help="One Nagios-plugin line with perfdata; exit 0/1/2/3 (OK/WARN/CRIT/UNKNOWN). "
+                       "The whole output is capped (see --nagios-max-bytes): when the perfdata "
+                       "does not fit, failing entries are kept first, then OK ones, and the last "
+                       "item is omitted=N; the kept items stay in their usual order.")
+    @click.option("--nagios-max-bytes", "nagios_max_bytes", type=int, default=NAGIOS_OUTPUT_LIMIT,
+                  show_default=True, metavar="N", callback=_check_nagios_max_bytes,
+                  help="With --nagios: cap the whole output (status line, perfdata, newline) at N "
+                       f"bytes; at least {NAGIOS_MIN_OUTPUT_LIMIT}. Nagios Core 4 reads about 8 KiB; "
+                       "NRPE v2 carries only about 1 KiB of output per packet (use 1000 there), "
+                       "NRPE 3+ much more, Icinga 2 has no small limit. The status line and the "
+                       "exit code are never cut for the perfdata.")
+    @click.option("--time-limit", "time_limit", default=str(int(DEFAULT_TIME_LIMIT)),
+                  show_default=True, metavar="SECONDS",
+                  callback=_seconds_option("time_limit"),
+                  help="Stop reading ZFS after SECONDS in all; whatever was not checked in time "
+                       "is one WARN entry '(time limit)'. 0 or none: no limit. A caller's timeout "
+                       "(NRPE's -t, systemd's TimeoutStartSec) must exceed this: the shipped "
+                       "zfsbackup-check.service assumes the default of 60.")
+    @click.option("--per-call-timeout", "per_call_timeout", default=str(int(DEFAULT_PER_CALL_TIMEOUT)),
+                  show_default=True, metavar="SECONDS",
+                  callback=_seconds_option("per_call_timeout"),
+                  help="Give up on one single-dataset zfs command after SECONDS (a hung pool "
+                       "costs this per such read). The batched reads of a large tree (a "
+                       "recursive dataset's descendant listing and backup-copy marker read, its "
+                       "descendants' snapshot and property reads, the received datasets' listing "
+                       "and property read) may use all the time left of --time-limit (or SECONDS "
+                       "if --time-limit is off). 0 or none: no per-command limit.")
     @click.option("--output", "-o", "output", default=None, metavar="FILE",
                   help="Write the output to FILE (atomically) instead of stdout.")
     @click.option("--warn-factor", type=float, default=2.0, show_default=True, metavar="N",
@@ -529,13 +726,20 @@ def register(
     @common
     def check_cmd(
         as_json: bool, as_prometheus: bool, as_nagios: bool, output: Optional[str],
-        warn_factor: float, crit_factor: float, config_path: Optional[str], verbose: bool,
+        warn_factor: float, crit_factor: float, nagios_max_bytes: int,
+        time_limit: Optional[float], per_call_timeout: Optional[float],
+        config_path: Optional[str], verbose: bool,
     ) -> None:
         state = get_state(config_path, verbose)
         state.quiet()
         ctx = click.get_current_context()
         try:
-            code = _run(state, as_json, as_prometheus, as_nagios, output, warn_factor, crit_factor)
+            if not as_nagios and (
+                ctx.get_parameter_source("nagios_max_bytes") is not click.core.ParameterSource.DEFAULT
+            ):
+                raise click.UsageError("--nagios-max-bytes only applies with --nagios")
+            code = _run(state, as_json, as_prometheus, as_nagios, output, warn_factor, crit_factor,
+                        nagios_max_bytes, time_limit, per_call_timeout)
         except Exception as exc:  # noqa: BLE001 - nagios mode never fails otherwise than UNKNOWN
             if not as_nagios:
                 raise
@@ -548,7 +752,9 @@ def register(
 
 def _run(
     state: Any, as_json: bool, as_prometheus: bool, as_nagios: bool, output: Optional[str],
-    warn_factor: float, crit_factor: float,
+    warn_factor: float, crit_factor: float, nagios_max_bytes: int = NAGIOS_OUTPUT_LIMIT,
+    time_limit: Optional[float] = DEFAULT_TIME_LIMIT,
+    per_call_timeout: Optional[float] = DEFAULT_PER_CALL_TIMEOUT,
 ) -> int:
     if as_json and as_prometheus:
         raise click.UsageError("--json and --prometheus are exclusive")
@@ -557,13 +763,13 @@ def _run(
                                "--json, --prometheus or --output")
     resolved = state.resolve()
     now_dt = datetime.now(timezone.utc)
-    health, entries = gather(resolved, now_dt, warn_factor, crit_factor)
+    health, entries = gather(resolved, now_dt, warn_factor, crit_factor, time_limit, per_call_timeout)
     from zfsbackup.version import installed_version
 
     overall = health.overall_state(entries)
     now = now_dt.timestamp()
     if as_nagios:
-        click.echo(render_nagios(health, entries), nl=False)
+        click.echo(render_nagios(health, entries, nagios_max_bytes), nl=False)
         return health.STATE_VALUES[overall]  # 0 OK, 1 WARN, 2 CRIT
     if as_json:
         text = render_json(health, entries, now, installed_version()) + "\n"

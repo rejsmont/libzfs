@@ -26,11 +26,11 @@ without importing Flask.
 import shlex
 import struct
 from datetime import timedelta
-from typing import Callable, List, Mapping, NamedTuple, Optional, Tuple
+from typing import Callable, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
 import libzfseasy as zfs
 from libzfseasy import ZFSTimeoutError
-from libzfseasy.types import Dataset, Filesystem
+from libzfseasy.types import Dataset, Filesystem, Validate
 
 from zfsbackup.backup_manager import (
     PROP_CONFIG, PROP_CLIENT_ID, PROP_SOURCE_DATASET, property_int, read_zfsbackup_properties,
@@ -45,7 +45,7 @@ __all__ = [
     'RECEIVE_PROPERTIES_VOLUME', 'ReceiveDecision', 'SERVER_OWNED_PROPERTIES', 'ServerSnapshot',
     'StreamBase', 'StreamHeader', 'StreamHeaderError', 'ZFS_USER_PROPERTY_MAXLEN',
     'abort_partial_receive', 'ancestor_holds_partial_receive', 'canonical_dataset_config',
-    'client_dataset_problem', 'create_ancestors', 'decide_receive', 'enforce_receive_properties',
+    'client_dataset_problem', 'copy_snapshot_name_problem', 'create_ancestors', 'decide_receive', 'enforce_receive_properties',
     'format_horizon',
     'local_client_id', 'may_force', 'owner_verdict', 'ownership_conflict', 'parse_stream_header',
     'receive_properties', 'resume_token', 'retention_horizon', 'retention_shrink',
@@ -172,6 +172,36 @@ def server_dataset(target: str, client_id: str, client_dataset: str) -> str:
     except Exception as e:
         raise BadDatasetName(f"invalid dataset name {name!r}: {e}") from None
     return name
+
+
+def _name_bytes(name: str) -> int:
+    """The length ZFS counts: BYTES, not characters (`surrogateescape` so a
+    name that came off the wire as bytes is counted as those bytes)."""
+    return len(name.encode('utf-8', 'surrogateescape'))
+
+
+def copy_snapshot_name_problem(copy: str, snapshot_names: Iterable[str]) -> Optional[str]:
+    """Why a snapshot of the copy `copy` (`server_dataset`'s result) cannot
+    exist, or `None`: ZFS refuses a full name `<copy>@<snapshot>` over
+    `Validate.max_name_len` (255) BYTES, and `server_dataset` only checks
+    the dataset's own name. Checked from the LONGEST of `snapshot_names` (short
+    names), before anything is created, so a stream that could only fail at
+    the very end of its transfer is never started. Counted in UTF-8 bytes (a
+    name libzfseasy accepts is ASCII, where bytes are characters, but the
+    names the server sees come from the client). The message says
+    "characters" (the same for every ASCII name). The names are not quoted:
+    on the server they come from the client."""
+    longest = max((_name_bytes(n) for n in snapshot_names), default=0)
+    copy_len = _name_bytes(copy)
+    full = copy_len + 1 + longest
+    if longest and full > Validate.max_name_len:
+        return (
+            f"a snapshot of {copy!r} would have a {full}-character name ({copy_len} for the "
+            f"copy, {longest} for the snapshot), over the {Validate.max_name_len} ZFS allows; "
+            "shorten the dataset name or the snapshot prefix, or use a shorter backup target "
+            "or client id"
+        )
+    return None
 
 
 def server_copy_kind(zfs_call: Callable, server_fs, *, lib=None) -> str:

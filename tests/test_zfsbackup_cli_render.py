@@ -305,6 +305,13 @@ _NAMES = [
 ]
 
 
+#: Destination names: `validate_config` refuses a name that cannot form the ZFS
+#: properties `org.zfsbackup:anchor.<name>`/`inflight.<name>` (letters, digits
+#: and `- _ . :` only), so these are valid ones that are still YAML-hostile
+#: (null/bool/number look-alikes, a colon, upper case).
+_DEST_NAMES = ["null", "123", "yes", "c:d", "x-y_z", "b.c", "UPPER", "nas"]
+
+
 def _zfs_valid(name: str) -> bool:
     """Would libzfseasy accept `name` as a dataset name? (Independent of the
     store's own check: this is the validator the daemon builds datasets with.)"""
@@ -362,7 +369,7 @@ def random_config(rng: random.Random) -> BackupConfig:
         out = [RetentionRule(D(a), D(k)) for a, k in zip(ages, keeps)]
         return sorted(out, key=lambda r: r.age)
 
-    dest_names = rng.sample(_NAMES, rng.randint(0, 4))
+    dest_names = rng.sample(_DEST_NAMES, rng.randint(0, 4))
     destinations = {
         n: Destination(f"https://h{i}:{8000 + i}", rng.choice(_FINGERPRINTS))
         for i, n in enumerate(dest_names)

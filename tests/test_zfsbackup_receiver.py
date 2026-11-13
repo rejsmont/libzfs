@@ -398,6 +398,74 @@ class TestClientDatasetProblem:
         assert client_dataset_problem('tank//x') == 'invalid client dataset name'
 
 
+class TestCopySnapshotNameProblem:
+    """A2: `<copy>@<snapshot>` must fit ZFS's 255 characters; checked from the longest snapshot."""
+
+    COPY = 'bk/srv/client-1/tank/' + 'x' * 100          # 121 characters
+
+    def test_the_limit_is_255(self):
+        assert receiver.Validate.max_name_len == 255
+
+    def test_exactly_255_is_fine_and_256_is_refused(self):
+        room = 255 - len(self.COPY) - 1
+        assert receiver.copy_snapshot_name_problem(self.COPY, ['s' * room]) is None
+        problem = receiver.copy_snapshot_name_problem(self.COPY, ['s' * (room + 1)])
+        assert problem is not None and '256-character' in problem
+        assert f'{len(self.COPY)} for the copy, {room + 1} for the snapshot' in problem
+
+    def test_only_the_longest_name_counts(self):
+        room = 255 - len(self.COPY) - 1
+        assert receiver.copy_snapshot_name_problem(self.COPY, ['a', 'b' * room, 'c']) is None
+        assert receiver.copy_snapshot_name_problem(self.COPY, ['a', 'b' * (room + 1), 'c']) is not None
+
+    @pytest.mark.parametrize('names', [[], ()])
+    def test_no_snapshots_is_fine_even_for_a_copy_name_at_the_limit(self, names):
+        assert receiver.copy_snapshot_name_problem('c' * 255, names) is None
+
+    def test_an_iterator_is_accepted(self):
+        room = 255 - len(self.COPY) - 1
+        assert receiver.copy_snapshot_name_problem(self.COPY, iter(['s' * (room + 1)])) is not None
+        assert receiver.copy_snapshot_name_problem(self.COPY, (n for n in ['s'])) is None
+
+    def test_no_snapshot_name_is_echoed(self):
+        # on the server the names come from the client: only lengths appear in the message
+        hostile = 'EVIL-SNAPSHOT-' + 'z' * 200
+        problem = receiver.copy_snapshot_name_problem(self.COPY, [hostile])
+        assert problem is not None and 'EVIL' not in problem and 'zzzz' not in problem
+        assert repr(self.COPY) in problem
+
+    def test_the_limit_counts_utf8_bytes_not_characters(self):
+        copy = 'bk/' + '\u00e9' * 100                                  # 103 characters, 203 bytes
+        room = 255 - 203 - 1                                           # 51 bytes of snapshot name
+        assert receiver.copy_snapshot_name_problem(copy, ['s' * room]) is None
+        problem = receiver.copy_snapshot_name_problem(copy, ['s' * (room + 1)])
+        assert problem is not None and '256-character' in problem and '203 for the copy' in problem
+        assert len(copy) + 1 + room + 1 < 255, 'well under the limit as characters'
+
+    def test_a_multibyte_snapshot_name_counts_its_bytes(self):
+        copy = 'bk/srv/c/tank/data'                                    # 18 bytes
+        assert receiver.copy_snapshot_name_problem(copy, ['\u20ac' * 78]) is None          # 234 bytes: 253 total
+        problem = receiver.copy_snapshot_name_problem(copy, ['\u20ac' * 79])               # 237 bytes: 256 total
+        assert problem is not None and '237 for the snapshot' in problem
+        assert 78 + 18 + 1 < 255 and 79 + 18 + 1 < 255, 'both are short as characters'
+
+    def test_a_name_that_came_off_the_wire_as_raw_bytes_counts_those_bytes(self):
+        # invalid UTF-8 kept by surrogateescape: one lone surrogate is the one byte it came from
+        # (booleans only: a failure must not print a lone surrogate into the report)
+        def refused(count):
+            name = (b'\xff' * count).decode('utf-8', 'surrogateescape')
+            return receiver.copy_snapshot_name_problem('bk/x', [name]) is not None
+        assert (refused(250), refused(251)) == (False, True)           # 4 + 1 + 250 == 255
+
+    def test_it_logs_nothing(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            receiver.copy_snapshot_name_problem(self.COPY, ['s' * 300])
+        assert caplog.records == []
+
+    def test_the_helper_is_exported(self):
+        assert 'copy_snapshot_name_problem' in receiver.__all__
+
+
 # ---------------------------------------------------------------------------
 # server_copy_kind
 # ---------------------------------------------------------------------------

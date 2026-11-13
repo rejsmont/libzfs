@@ -1348,3 +1348,81 @@ class TestRealPropertySources:
         assert {r.property for r in got} >= {'type', 'used', 'org.t:v'}
         assert all(r.source in ('local', 'default', 'received', 'temporary', '-') or r.source.startswith('inherited from ')
                    for r in got)
+
+
+class TestRealSnapshotMany:
+    """`zfs.snapshot.many` runs one `zfs snapshot a@s b@s` against a real pool: atomic, all or nothing."""
+
+    @staticmethod
+    def _txg(snapshot):
+        return zfs.get.value(snapshot, 'createtxg')
+
+    def test_two_datasets_in_one_pool_get_the_same_createtxg(self, test_pool):
+        a, b = f'{test_pool}/test_many_a', f'{test_pool}/test_many_b'
+        zfs.create.filesystem(a)
+        zfs.create.filesystem(b)
+        try:
+            result = zfs.snapshot.many([Filesystem(a), Filesystem(b)], 'm1', properties={'org.t:tag': 'x'})
+            assert [s.name for s in result] == [f'{a}@m1', f'{b}@m1']
+            assert all(isinstance(s, Snapshot) for s in result)
+            txgs = [self._txg(s) for s in result]
+            assert txgs[0] and txgs[0] == txgs[1]
+            assert [zfs.get.value(s, 'org.t:tag') for s in result] == ['x', 'x']
+            listed = zfs.list(roots=[Filesystem(a), Filesystem(b)], types=['snapshot'])
+            assert sorted(s.name for s in listed) == [f'{a}@m1', f'{b}@m1']
+        finally:
+            zfs.destroy(Filesystem(a), destroy=True, recursive=True)
+            zfs.destroy(Filesystem(b), destroy=True, recursive=True)
+
+    def test_a_single_dataset(self, test_pool):
+        a = f'{test_pool}/test_many_one'
+        zfs.create.filesystem(a)
+        try:
+            result = zfs.snapshot.many([Filesystem(a)], 'm1')
+            assert [s.name for s in result] == [f'{a}@m1']
+            assert self._txg(result[0])
+        finally:
+            zfs.destroy(Filesystem(a), destroy=True, recursive=True)
+
+    def test_a_cross_pool_call_is_refused_before_zfs_runs(self, test_pool):
+        a = f'{test_pool}/test_many_xp'
+        zfs.create.filesystem(a)
+        try:
+            with pytest.raises(ValueError, match='An atomic snapshot cannot span pools'):
+                zfs.snapshot.many([Filesystem(a), Filesystem(f'{test_pool}_other/test_many_xp')], 'm1')
+            assert zfs.list(roots=Filesystem(a), types=['snapshot']) == []     # nothing was created, not even for a
+        finally:
+            zfs.destroy(Filesystem(a), destroy=True, recursive=True)
+
+    def test_a_collision_leaves_no_snapshots(self, test_pool):
+        a, b, c = (f'{test_pool}/test_many_{x}' for x in 'abc')
+        for name in (a, b, c):
+            zfs.create.filesystem(name)
+        try:
+            zfs.snapshot(Filesystem(b), 'm1')                                  # b already has the name
+            with pytest.raises(Exception) as excinfo:
+                zfs.snapshot.many([Filesystem(a), Filesystem(b), Filesystem(c)], 'm1')
+            assert type(excinfo.value) is Exception
+            assert 'already exists' in str(excinfo.value)
+            left = zfs.list(roots=[Filesystem(a), Filesystem(b), Filesystem(c)], types=['snapshot'])
+            assert [s.name for s in left] == [f'{b}@m1']                       # only the one that was there before
+        finally:
+            for name in (a, b, c):
+                zfs.destroy(Filesystem(name), destroy=True, recursive=True)
+
+
+class TestRealPropertySourcesExplicit:
+    """`property_sources(properties=[...])` against what this OpenZFS prints for a user property that is not set."""
+
+    def test_an_unset_user_property_is_printed_as_dash_and_dropped(self, test_pool):
+        ds = f'{test_pool}/test_psexp'
+        zfs.create.filesystem(ds)
+        try:
+            _raw_zfs_ok('set', 'org.t:set=v', ds)
+            raw = _raw_zfs_ok('get', '-H', '-o', 'name,property,source', 'org.t:set,org.t:unset,used', ds).stdout
+            rows = [tuple(line.split('\t')) for line in raw.decode().split('\n') if line]
+            assert (ds, 'org.t:unset', '-') in rows and (ds, 'org.t:set', 'local') in rows
+            got = zfs.get.property_sources(Filesystem(ds), properties=['org.t:set', 'org.t:unset', 'used'])
+            assert got == [zfs.PropertySource(ds, 'org.t:set', 'local'), zfs.PropertySource(ds, 'used', '-')]
+        finally:
+            zfs.destroy(Filesystem(ds), destroy=True, recursive=True)

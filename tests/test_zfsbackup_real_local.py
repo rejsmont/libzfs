@@ -54,6 +54,7 @@ import libzfseasy as zfs
 from libzfseasy.types import Filesystem, Snapshot
 from libzfseasy.zfs import _zfs_cmd, _zpool_cmd
 
+from _sendloop_support import run_worker_until_sent
 from zfsbackup import local as local_module
 from zfsbackup.backup_manager import (
     PROP_CLIENT_ID,
@@ -493,7 +494,7 @@ class _SharedTests(_RigTests):
         assert list(rig.copy_snaps()) == [old[-1]]                  # no backfill of the older ones
         assert rig.copy_snaps()[old[-1]] == rig.local_snaps()[old[-1]]
         assert rig.manager.get_anchor(rig.dsi, DEST) == old[-1]
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         assert any(f'Sending full snapshot {rig.src}@{old[-1]}' in m for m in rig.log_lines())
         self.assert_copy_state(rig)
 
@@ -503,7 +504,7 @@ class _SharedTests(_RigTests):
         assert set(rig.copy_snaps()) == {old[-1]} | set(more)
         self.assert_on_the_copy(rig, [old[-1]] + more)
         assert rig.manager.get_anchor(rig.dsi, DEST) == more[-1]
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         lines = rig.log_lines()
         assert any(f'Sending 3 snapshots of {rig.src} to {DEST}' in m for m in lines)
         for prev, name in zip([old[-1]] + more, more):
@@ -541,7 +542,7 @@ class _SharedTests(_RigTests):
         assert rig.copy_snaps() == {}
         self.assert_owned_locally(rig)
         assert rig.manager.get_anchor(rig.dsi, DEST) is None
-        assert rig.manager.get_inflight(rig.dsi, DEST) == ('', s1)   # the pin of the cut step stays
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) == ('', s1)   # the pin of the cut step stays
         assert rig.errors()                                          # and the failure was reported
 
     def test_the_next_cycle_resumes_the_cut_stream_into_the_same_copy(self, rig):
@@ -555,7 +556,7 @@ class _SharedTests(_RigTests):
         assert list(rig.copy_snaps()) == [s1]
         assert rig.copy_snaps()[s1] == rig.local_snaps()[s1]
         assert rig.manager.get_anchor(rig.dsi, DEST) == s1
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         self.assert_copy_state(rig)
         assert rig.errors()[mark:] == []
 
@@ -587,7 +588,7 @@ class _SharedTests(_RigTests):
         assert cut.done
         assert set(rig.copy_snaps()) == {first, more[0]}
         assert rig.manager.get_anchor(rig.dsi, DEST) == more[0]       # the last good step
-        assert rig.manager.get_inflight(rig.dsi, DEST) == (more[0], more[1])
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) == (more[0], more[1])
         assert rig.wait_for_resume_token() not in ('-', '')
 
         assert rig.cycle() is True                                    # resumes step 2, then step 3
@@ -596,7 +597,7 @@ class _SharedTests(_RigTests):
         assert set(rig.copy_snaps()) == {first} | set(more)
         self.assert_on_the_copy(rig, [first] + more)
         assert rig.manager.get_anchor(rig.dsi, DEST) == more[2]
-        assert rig.manager.get_inflight(rig.dsi, DEST) is None
+        assert rig.manager.get_own_inflight(rig.dsi, DEST) is None
         self.assert_copy_state(rig)
 
 
@@ -702,14 +703,15 @@ class TestRealLocalPlain(_SharedTests):
 
     # -- the workers ----------------------------------------------------------------------------
     def test_a_remote_backup_worker_cycle_sends_to_the_local_destination_and_records_it(
-            self, rig, sdir, mocker):
+            self, rig, sdir, monkeypatch):
         """The real worker loop: `RemoteBackupWorker` dispatches a `zfs:` destination to the local
         manager and records the outcome under the destination's name."""
         old = self.snapshots(rig, [9, 7, 5])
         worker = RemoteBackupWorker(rig.config, StopFlag(), status_dir=sdir, client_id=CLIENT_ID)
-        mocker.patch.object(worker, '_wait', return_value=ExitReason.STOP)
 
-        worker.run()
+        # the loop is the parallel scheduler (`sendloop.SendLoop`): it returns only when its exit reason says
+        # stop, which `run_worker_until_sent` makes it once the pair has been sent
+        run_worker_until_sent(worker, monkeypatch, [(rig.src, DEST)])
 
         assert list(rig.copy_snaps()) == [old[-1]]
         assert rig.copy_snaps()[old[-1]] == rig.local_snaps()[old[-1]]

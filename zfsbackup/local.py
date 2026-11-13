@@ -34,7 +34,7 @@ import os
 import selectors
 import shlex
 import time
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import libzfseasy as zfs
 from libzfseasy import ZFSTimeoutError
@@ -46,6 +46,7 @@ from zfsbackup.backup_manager import (
 )
 from zfsbackup.chain import ChainSender, NegotiationFailed, _FAILED, _OK, _STOP, _SendStream
 from zfsbackup.config import BackupConfig, Destination
+from zfsbackup.sendmemory import PENDING, REFUSALS, SendMemory
 
 
 logger = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ _LOCAL_REFUSAL_HINTS = {
     ),
     'type_mismatch': (
         " (this host holds a dataset of the other kind under that name: `zfs rename` it "
-        "to a name outside the local target; the next cycle sends a full stream)"
+        "to a name outside the local target; the next attempt sends a full stream)"
     ),
 }
 
@@ -544,9 +545,13 @@ class LocalBackupManager(ChainSender):
 
     `client_id` is this host's id from the supervisor's config snapshot
     (`daemon.Handoff.client_id`); without one nothing is sent (the layout
-    needs it). A worker calls `begin_cycle()` once per pass over its
-    datasets: the target dataset's existence is then checked once per cycle
-    per destination."""
+    needs it). The parallel remote worker builds a FRESH manager for every
+    send (one pair, one thread) and never calls `begin_cycle()`: the target's
+    existence is checked on every `backup_dataset` call, and what must outlive
+    a send (log latches, skip counters, the pending map, the missing-ancestor
+    claims) lives in the shared `memory`. `begin_cycle()` remains for a
+    manager used over a pass of several datasets: the target dataset's
+    existence is then checked once per pass per destination."""
 
     _logger = logger
 
@@ -570,17 +575,23 @@ class LocalBackupManager(ChainSender):
         local_manager: DatasetManager,
         *,
         client_id: Optional[str],
+        memory: Optional[SendMemory] = None,
     ):
-        super().__init__(config, local_manager, client_id=client_id)
+        super().__init__(config, local_manager, client_id=client_id, memory=memory)
         # destination name -> target dataset found to exist this cycle.
         self._checked: Dict[str, str] = {}
         # destinations whose target was found gone mid-cycle: skipped (silently,
         # it was logged) for the rest of the cycle.
         self._unavailable: set = set()
         self._per_cycle = False
-        # copy name -> `time.monotonic()` of the negotiate that found it
-        # missing (`LOCAL_PENDING_TTL`).
-        self._pending: Dict[str, float] = {}
+
+    # copy name -> `time.monotonic()` of the negotiate that found it missing
+    # (`LOCAL_PENDING_TTL`): in the shared `SendMemory`, so that a sender built
+    # for a child sees the parent's negotiate. The LIVE dict, for tests; the
+    # code uses `SendMemory.pending_put` / `pending_active` / `pending_clear`.
+    @property
+    def _pending(self) -> Dict[str, float]:
+        return self._memory.value_view(PENDING)
 
     # ----------------------------------------------------------- the cycle
 
@@ -614,13 +625,13 @@ class LocalBackupManager(ChainSender):
         self._log_warning_once(
             (f"{dsi.name} [local zfs timeout]", destination),
             f"{dsi.name} -> {destination}: zfs did not answer within {LOCAL_ZFS_BUDGET:g} s on "
-            "this host; skipping this destination this cycle (a hung or suspended pool leaves "
+            "this host; skipping this destination this attempt (a hung or suspended pool leaves "
             "zfs processes in uninterruptible sleep)",
         )
         self._logger.debug(f"{dsi.name} -> {destination}: zfs timed out {where}: {exc}")
 
     def _zfs_recovered(self, dsi: DatasetInfo, destination: str) -> None:
-        if self._refusal_logged.pop((f"{dsi.name} [local zfs timeout]", destination), None):
+        if self._forget_refusal((f"{dsi.name} [local zfs timeout]", destination)):
             self._logger.info(f"{dsi.name} -> {destination}: zfs answers again on this host")
 
     @staticmethod
@@ -663,7 +674,7 @@ class LocalBackupManager(ChainSender):
                 "container made when a dataset below it was backed up first (back the parent "
                 "up first, or rename the container aside; that moves the copies of its "
                 "children too, so they are sent in full again), or a copy of the other kind "
-                "(plain vs raw): `zfs rename` it aside; the next cycle sends a full stream. "
+                "(plain vs raw): `zfs rename` it aside; the next attempt sends a full stream. "
                 + text
             )
         return text
@@ -702,14 +713,14 @@ class LocalBackupManager(ChainSender):
                 self._log_warning_once(key, (
                     f"local backup to {destination} skipped: zfs did not answer within "
                     f"{LOCAL_ZFS_BUDGET:g} s on this host while checking the target {target} "
-                    "(a hung or suspended pool?); the next cycle retries"
+                    "(a hung or suspended pool?); the next attempt retries"
                 ))
                 self._logger.debug(f"local target {target}: {e}")
                 return None
             except Exception as e:
                 self._log_refusal_once(key, (
                     f"local backup to {destination} skipped: cannot check the target {target}"
-                    " (see the DEBUG line); the next cycle retries"
+                    " (see the DEBUG line); the next attempt retries"
                 ))
                 self._logger.debug(f"local target {target}: {e}")
                 return None
@@ -723,7 +734,7 @@ class LocalBackupManager(ChainSender):
                 return None
             if self._per_cycle:
                 self._checked[destination] = target
-        if self._refusal_logged.pop(key, None) is not None:
+        if self._forget_refusal(key) is not None:
             self._logger.info(f"local destination {destination} ({target}) is usable again")
         return _LocalTarget(target, self.client_id)
 
@@ -747,7 +758,7 @@ class LocalBackupManager(ChainSender):
         self._call_note[(dsi.name, destination)] = f"skipped: the target dataset {target} is gone"
         self._log_refusal_once((None, destination), (
             f"local destination {destination}: the target dataset {target} is gone (its pool "
-            "exported or destroyed?); skipping this destination for the rest of this cycle. "
+            "exported or destroyed?); skipping this destination for the rest of this attempt. "
             f"Import the pool, or recreate the target (`zfs create -o canmount=off {target}`)"
         ))
         return True
@@ -762,24 +773,36 @@ class LocalBackupManager(ChainSender):
             return None
 
     def _ancestors_state(
-        self, call, copy: str, base: str, client_id: str,
+        self, call, copy: str, base: str, client_id: str, held: Sequence[str] = (),
     ) -> Tuple[Optional[Tuple[str, str]], list, Optional[str]]:
         """`(unsettled, missing, conflict)` for the ancestors of `copy` up to
         `base` (`<target>/<id>`), as the server's `_ancestors_state` without
         claims: `unsettled` is `(ancestor, 'partial')` for an existing one
         holding a new first receive's partial state, or `(ancestor,
         'pending')` for a missing one whose own first backup has not completed
-        (`LOCAL_PENDING_TTL`); `missing` lists the missing ancestors nearest
-        first; `conflict` is the refusal for the nearest existing one that is
-        not this host's container. Raises if zfs fails."""
+        (`LOCAL_PENDING_TTL`), or `(ancestor, 'creating')` for an existing one
+        with no local client id that another sender of this worker holds in
+        the shared claims (it is creating it right now: `zfs create -u -o
+        client_id=...` shows the dataset to `zfs list` before `zfs get -s
+        local` returns the property); `missing` lists the missing ancestors
+        nearest first; `conflict` is the refusal for the nearest existing one
+        that is not this host's container. An ancestor that looks unowned is
+        never refused on the first look: it is re-read under its claim
+        (`_recheck_unowned`); `held` are the names this call has claimed
+        itself. Raises if zfs fails."""
         ancestor = copy.rsplit('/', 1)[0]
         missing: list = []
         while ancestor == base or ancestor.startswith(base + '/'):
             ds = Dataset(ancestor)
-            if call(zfs.exists, ds):
-                verdict = receiver.owner_verdict(
-                    ancestor, receiver.local_client_id(call, ds, lib=zfs), client_id
-                )
+            exists = call(zfs.exists, ds)
+            if exists:
+                local_id = receiver.local_client_id(call, ds, lib=zfs)
+                if local_id is None:
+                    busy, exists, local_id = self._recheck_unowned(call, ds, ancestor, held)
+                    if busy:
+                        return (ancestor, 'creating'), missing, None
+            if exists:
+                verdict = receiver.owner_verdict(ancestor, local_id, client_id)
                 if verdict.message is not None:
                     return None, missing, self._owner_message(ancestor, '', client_id, verdict)
                 if receiver.ancestor_holds_partial_receive(call, ds, lib=zfs):
@@ -793,14 +816,36 @@ class LocalBackupManager(ChainSender):
             ancestor = ancestor.rsplit('/', 1)[0]
         return None, missing, None
 
+    def _recheck_unowned(
+        self, call, ds: Dataset, ancestor: str, held: Sequence[str],
+    ) -> Tuple[bool, bool, Optional[str]]:
+        """`(busy, exists, local_id)` for an existing ancestor whose first read
+        showed no local client id. Another sender of this worker may be
+        creating it (`zfs create -u -o client_id=...`: the dataset is listed
+        before the property reads back), or may have just finished and released
+        its claim between our `zfs list` and our `zfs get`. So: `busy` when
+        someone else holds the claim (retry, as the server's 503); otherwise
+        the claim is taken (non-blocking) and the owner is read ONCE more under
+        it, so a creator that has finished is seen and one that has not
+        started cannot begin. Only what that read still shows is judged by the
+        caller: no id is the real refusal, a dataset gone is a missing one.
+        A name in `held` is this call's own claim (not reentrant): read
+        directly. Raises if zfs fails; the claim is released on every path."""
+        if ancestor in held:
+            if not call(zfs.exists, ds):
+                return False, False, None
+            return False, True, receiver.local_client_id(call, ds, lib=zfs)
+        if not self._memory.claim([ancestor]):
+            return True, True, None
+        try:
+            if not call(zfs.exists, ds):
+                return False, False, None
+            return False, True, receiver.local_client_id(call, ds, lib=zfs)
+        finally:
+            self._memory.release([ancestor])
+
     def _is_pending(self, copy: str) -> bool:
-        since = self._pending.get(copy)
-        if since is None:
-            return False
-        if time.monotonic() - since < LOCAL_PENDING_TTL:
-            return True
-        del self._pending[copy]
-        return False
+        return self._memory.pending_active(copy, LOCAL_PENDING_TTL, time.monotonic())
 
     def _negotiate(
         self, transport: _LocalTarget, client_id: str, dsi: DatasetInfo, snapshots,
@@ -817,6 +862,12 @@ class LocalBackupManager(ChainSender):
         copy = self._copy_name(transport, client_id, dsi, destination)
         if copy is None:
             raise NegotiationFailed(f"invalid dataset name {dsi.name!r}")
+        # Before anything is created: a copy whose snapshots could never exist
+        # (the full name is over ZFS's limit) is refused, one ERROR per episode.
+        too_long = receiver.copy_snapshot_name_problem(copy, (s.name for s in snapshots))
+        if too_long is not None:
+            self._log_refusal_once(key, f"{dsi.name} -> {destination}: {too_long}; nothing is sent")
+            raise NegotiationFailed(too_long)
         try:
             canonical = receiver.canonical_dataset_config(dsi.config.to_property(destination))
         except ValueError as e:
@@ -828,6 +879,11 @@ class LocalBackupManager(ChainSender):
         copy_fs = Filesystem(copy)
         call = _Budget()
         dry_run = self.config.dry_run
+        #: The missing ancestors this call has claimed (`SendMemory.claim`): two
+        #: senders of unrelated datasets under one target can both find the same
+        #: container missing, and the second `zfs create` would fail with "dataset
+        #: already exists" (an ERROR, not retryable). Released in the `finally`.
+        claimed: list = []
         try:
             exists = call(zfs.exists, copy_fs)
             if exists:
@@ -836,18 +892,27 @@ class LocalBackupManager(ChainSender):
                     message = self._owner_message(copy, dsi.name, client_id, verdict)
                     self._log_refusal_once(key, f"{dsi.name} -> {destination}: {message}")
                     raise NegotiationFailed(message)
-                self._pending.pop(copy, None)
+                self._memory.pending_clear(copy)
 
             missing: list = []
-            if not exists and not dry_run:
-                unsettled, missing, conflict = self._ancestors_state(
-                    call, copy, transport.base, client_id
+
+            def settled_ancestors() -> list:
+                """The missing ancestors, or a refusal / retryable wait."""
+                unsettled, absent, conflict = self._ancestors_state(
+                    call, copy, transport.base, client_id, claimed
                 )
                 if conflict is not None:
                     self._log_refusal_once(key, f"{dsi.name} -> {destination}: {conflict}")
                     raise NegotiationFailed(conflict)
                 if unsettled is not None:
                     ancestor, kind = unsettled
+                    if kind == 'creating':
+                        # Another sender of this worker is creating it: no
+                        # warning, as for a lost claim.
+                        raise NegotiationFailed(
+                            f"{self._busy_prefix}: another send is creating {ancestor}",
+                            reloading=True,
+                        )
                     why = (
                         "it holds the partial state of a first receive (it completes with its "
                         f"next stream, or discard it with `zfs receive -A {ancestor}`)"
@@ -861,6 +926,25 @@ class LocalBackupManager(ChainSender):
                     raise NegotiationFailed(
                         f"{self._busy_prefix}: waiting for {ancestor}", reloading=True
                     )
+                return absent
+
+            if not exists and not dry_run:
+                missing = settled_ancestors()
+                if missing:
+                    # Claim the containers about to be created, all or nothing;
+                    # another sender that holds one of them is creating it right
+                    # now: retry soon, as for the server's 503 for an unsettled
+                    # ancestor. Then look again UNDER the claim: the other
+                    # sender may have created and released a container since the
+                    # look above, and what is still missing is a subset of the
+                    # claimed names.
+                    if not self._memory.claim(missing):
+                        raise NegotiationFailed(
+                            f"{self._busy_prefix}: another send is creating {missing[-1]}",
+                            reloading=True,
+                        )
+                    claimed.extend(missing)
+                    missing = settled_ancestors()
 
             if not dry_run:
                 if exists:
@@ -876,7 +960,7 @@ class LocalBackupManager(ChainSender):
                     # one under an encrypted target, onto an existing
                     # dataset), outermost first, no `-p`.
                     receiver.create_ancestors(call, missing, client_id, lib=zfs)
-                    self._pending[copy] = time.monotonic()
+                    self._memory.pending_put(copy, time.monotonic())
 
             common = None
             copy_kind = 'none'
@@ -919,9 +1003,12 @@ class LocalBackupManager(ChainSender):
                 f"Negotiation failed for {dsi.name} at {self._where(transport)}: {e}"
             )
             raise NegotiationFailed(str(e)) from e
+        finally:
+            if claimed:
+                self._memory.release(claimed)
 
-        self._refusal_logged.pop(key, None)
-        self._refusal_logged.pop((f"{dsi.name} [unsettled]", destination), None)
+        self._forget_refusal(key)
+        self._forget_refusal((f"{dsi.name} [unsettled]", destination))
         self._zfs_recovered(dsi, destination)
         # Every field, always (a missing one would read as a server that does
         # not report it, and fail open): `known` with nothing newer when there
@@ -985,7 +1072,7 @@ class LocalBackupManager(ChainSender):
             if self._target_vanished(transport, dsi, destination):
                 return 'skip', None
             self._logger.warning(
-                f"cannot read the resume token of {copy}: {e}; skipping this cycle rather than "
+                f"cannot read the resume token of {copy}: {e}; skipping this attempt rather than "
                 "risk discarding its partial progress with a fresh send"
             )
             self._token_skipped(dsi, destination, f"cannot read the resume token of {copy}: {e}")
@@ -1211,7 +1298,7 @@ class LocalBackupManager(ChainSender):
             ))
             self._logger.debug(f"{dsi.name} -> {destination}: enforcement error: {e}")
             return
-        if self._refusal_logged.pop(key, None):
+        if self._forget_refusal(key):
             self._logger.info(
                 f"{dsi.name} -> {destination}: the forced properties of {copy_fs} are local again"
             )
@@ -1250,7 +1337,7 @@ class LocalBackupManager(ChainSender):
                 f"Transfer of {dsi.name} -> {where}: zfs receive into {copy} did not finish "
                 f"committing within {LOCAL_COMMIT_TIMEOUT:g} s after the end of the stream; it "
                 "was stopped, but its final commit cannot be interrupted, so it may still "
-                "complete. The next cycle settles it: it finds the snapshot in the copy, or "
+                "complete. The next attempt settles it: it finds the snapshot in the copy, or "
                 f"resumes the partial receive{stuck}"
             )
             return _FAILED
@@ -1273,7 +1360,7 @@ class LocalBackupManager(ChainSender):
                     f"({send_error}); zfs receive committed {copy}, so the step counts as done"
                     f"{stuck}"
                 )
-            self._pending.pop(copy, None)
+            self._memory.pending_clear(copy)
             return _OK
         if send_error is not None and outcome != PUMP_RECEIVE_GONE:
             self._logger.error(

@@ -18,13 +18,21 @@ from `crit_factor` x it (defaults 2 and 4), both inclusive:
 * `anchor`: the snapshot last sent to one destination, against
   `max(dataset frequency, destination frequency)`. A destination with no anchor
   yet is WARN ("not yet sent") until the oldest managed snapshot is itself
-  older than the CRIT threshold, then CRIT.
+  older than the CRIT threshold, then CRIT. For a `recursive: true` dataset the
+  same entry exists for every descendant (its own LOCAL anchor, against the
+  parent's expectation); a descendant created after the parent's last
+  snapshot is "not yet sent" until the parent's next slot. An anchor that
+  cannot be READ (a failed read, or a batch that cannot be trusted) is CRIT
+  "cannot read", never "not yet sent"; an unreadable send pin does not hide a
+  readable anchor, it is only noted in the detail.
 * `received`: on a server, the newest snapshot of a received client dataset,
   against the largest of that client's frequencies. The same "nothing yet" rule
   as `anchor` applies.
 * A newest snapshot dated further in the future than the observation's
   `tolerance_seconds` is CRIT, "clock behind newest snapshot".
-* Anything the collector could not read (`error`) is CRIT.
+* Anything the collector could not read (`error`) is CRIT, a read that timed
+  out included. A part of the check that ran out of the collector's time limit
+  is not CRIT but one WARN `check` entry naming what was not checked.
 
 **Output contract (C13, and S-7's additions).**
 
@@ -491,6 +499,10 @@ def write_text_atomic(path: Union[str, 'os.PathLike[str]'], text: str, mode: int
 #         "last_error": "resume token check failed: ...",
 #         "last_error_at": "2026-10-25T10:05:12Z", "consecutive_failures": 3}]}
 #
+# A record may also carry `"incomplete": true`: a success whose send chain was
+# cut with work left (see `OutcomeRecord.incomplete`); a reader that does not
+# know the key ignores it, and it never grades worse than OK.
+#
 # Keys with no value are left out. Timestamps are UTC, whole seconds. Free
 # text is clipped to `STATUS_TEXT_LIMIT` characters and carries no secrets
 # (destination *names*, never URLs or tokens, identify a destination).
@@ -582,7 +594,23 @@ class OutcomeRecord:
     Times are epoch seconds. `result` is the last attempt's (`ok`/`error`);
     `last_error` is kept after a later success (when it happened is
     `last_error_at`). `detail` is a short note about the last attempt (the
-    snapshot created, how many were pruned)."""
+    snapshot created, how many were pruned). `warning` is a standing warning
+    about the last attempt that succeeded all the same (a snapshot of a
+    recursive dataset that left backup copies below it out): a plain string,
+    `None` when the last attempt had none (it is replaced by every attempt, so
+    a later clean one clears it). It is a hint for `check`, never an error: it
+    does not touch `result` or the failure count.
+
+    `incomplete` marks a success that left work behind: a send chain stopped
+    between steps, after at least one step was acknowledged, because the worker
+    is exiting (a reload, an upgrade drain or a stop). A transient refusal (a
+    busy or reloading server, a connect failure) is never this: it is a failed
+    attempt, recorded only when its retries are spent. It is progress, not a
+    failure (`result` stays `ok`, `check` grades it like any success), but the
+    attempt did not finish its job: the successor worker continues the chain.
+    It must NOT count the slot as attempted (or a reload would delay the rest
+    of the chain by a period). Like `warning`, every attempt replaces it (a failed attempt clears
+    it)."""
 
     kind: str
     dataset: str
@@ -594,6 +622,8 @@ class OutcomeRecord:
     last_error_at: Optional[float] = None
     consecutive_failures: int = 0
     detail: Optional[str] = None
+    warning: Optional[str] = None
+    incomplete: bool = False
 
     @property
     def key(self) -> Tuple[str, str, Optional[str]]:
@@ -640,6 +670,10 @@ def _record_to_json(rec: OutcomeRecord) -> dict:
     data['consecutive_failures'] = rec.consecutive_failures
     if rec.detail is not None:
         data['detail'] = rec.detail
+    if rec.warning is not None:
+        data['warning'] = rec.warning
+    if rec.incomplete:
+        data['incomplete'] = True
     return data
 
 
@@ -671,6 +705,8 @@ def _record_from_json(obj: object) -> Optional[OutcomeRecord]:
         last_error_at=_parse_iso(obj.get('last_error_at')),
         consecutive_failures=min(failures, 10**9),
         detail=_opt_text(obj.get('detail')),
+        warning=_opt_text(obj.get('warning')),
+        incomplete=obj.get('incomplete') is True,
     )
 
 
@@ -1177,10 +1213,16 @@ class StatusWriter:
         ok: bool,
         error: Optional[str] = None,
         detail: Optional[str] = None,
+        warning: Optional[str] = None,
+        incomplete: bool = False,
     ) -> None:
         """One attempt finished. Success: `last_success` moves, the failure
         count goes to 0. Failure: the count goes up and `error` (clipped)
-        becomes `last_error`. Either way `last_attempt` moves."""
+        becomes `last_error`. Either way `last_attempt` moves. `detail` and
+        `warning` (clipped) describe THIS attempt: each replaces the previous
+        one, so an attempt without them clears them. `incomplete` (a success
+        whose chain was cut with work left; `OutcomeRecord.incomplete`) is
+        replaced the same way."""
         if not self.enabled:
             return
         now = self._clock()
@@ -1190,14 +1232,18 @@ class StatusWriter:
                 kind=kind, dataset=dataset, destination=destination,
             )
         rec.last_attempt = now
-        rec.detail = clip_text(detail) if detail else None
+        # `clip_text` flattens whitespace and control characters, so a value
+        # that is blank after it is "none", not an empty string.
+        rec.detail = clip_text(detail) or None if detail else None
+        rec.warning = clip_text(warning) or None if warning else None
+        rec.incomplete = bool(incomplete) and ok
         if ok:
             rec.result = RESULT_OK
             rec.last_success = now
             rec.consecutive_failures = 0
         else:
             rec.result = RESULT_ERROR
-            rec.last_error = clip_text(error) if error else 'failed (see the journal)'
+            rec.last_error = (clip_text(error) if error else '') or 'failed (see the journal)'
             rec.last_error_at = now
             rec.consecutive_failures = min(rec.consecutive_failures + 1, 10**9)
         self._dirty = True
